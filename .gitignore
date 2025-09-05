@@ -1,0 +1,69 @@
+# ================================
+# capyAD .gitignore
+# ================================
+
+# --- CMake / Build Artifacts ---
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+CTestTestfile.cmake
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+# --- Compiled Libraries / Binaries ---
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.obj
+*.o
+*.pyc
+*.pyo
+*.pyd
+
+# --- Python Packaging ---
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+__pycache__/
+*.manifest
+*.spec
+
+# --- Logs / Reports ---
+*.log
+*.coverage
+*.prof
+*.gcda
+*.gcno
+*.gcov
+
+# --- IDE / Editor Files ---
+.vscode/
+.idea/
+*.iml
+*.sublime-workspace
+*.sublime-project
+
+# --- OS Files ---
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+Desktop.ini
+
+# --- Misc ---
+.env
+*.swp
+*.bak
+*.tmp
+*.lock
+*.ipynb
