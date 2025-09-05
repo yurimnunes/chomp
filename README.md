@@ -65,7 +65,28 @@ print(expr)  # (sin(x) + (x * y))
 
 **Graph structure:**
 
-![Expression Graph](./docs/expression_graph.svg)
+graph LR
+  subgraph Vars
+    X["x : Var"]
+    Y["y : Var"]
+  end
+
+  S["sin(·)"]
+  M["(· * ·)"]
+  P["+"]
+
+  X --> S
+  X --> M
+  Y --> M
+
+  S --> P
+  M --> P
+
+  classDef var fill:#eef,stroke:#446,stroke-width:1px,color:#223;
+  classDef op fill:#f7f7f7,stroke:#555,stroke-width:1px,color:#222;
+
+  class X,Y var;
+  class S,M,P op;
 
 ---
 
@@ -90,7 +111,21 @@ print(Hv)  # vector of size = number of variables
 
 Dataflow:
 
-![HVP Flow](./docs/hvp_flow.svg)
+flowchart TD
+  A["Inputs x, seed v"] --> B["Forward pass<br/>(values)"]
+  B --> C["Build/Reuse reverse tape<br/>(graph edges, op adjoints)"]
+  C --> D["Forward-over-reverse sweep<br/>(propagate dot through tape)"]
+  D --> E["Output Hv"]
+
+  %% Notes on caching/epochs
+  B -. uses .-> F["Epoch-cached node values"]
+  D -. uses .-> G["Epoch-cached dot/grad states"]
+
+  classDef step fill:#f7f7f7,stroke:#555,stroke-width:1px,color:#222;
+  classDef meta fill:#eef,stroke:#446,stroke-width:1px,color:#223,stroke-dasharray: 3 3;
+
+  class A,B,C,D,E step;
+  class F,G meta;
 
 ### Dense Hessian
 
