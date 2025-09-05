@@ -1,5 +1,7 @@
 # capyAD 🦫
 
+![logo](logo.png)
+
 **capyAD** is a lightweight, C++/Python automatic differentiation library built around **expression graphs** with full support for gradients, Hessians, and efficient Hessian–vector products (HVP).
 It is designed for **optimization, scientific computing, and machine learning research** — offering clean abstractions, high performance, and extensibility.
 
