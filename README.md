@@ -65,6 +65,7 @@ print(expr)  # (sin(x) + (x * y))
 
 **Graph structure:**
 
+```mermaid
 graph LR
   subgraph Vars
     X["x : Var"]
@@ -87,6 +88,7 @@ graph LR
 
   class X,Y var;
   class S,M,P op;
+```
 
 ---
 
@@ -111,6 +113,7 @@ print(Hv)  # vector of size = number of variables
 
 Dataflow:
 
+```mermaid
 flowchart TD
   A["Inputs x, seed v"] --> B["Forward pass<br/>(values)"]
   B --> C["Build/Reuse reverse tape<br/>(graph edges, op adjoints)"]
@@ -126,6 +129,7 @@ flowchart TD
 
   class A,B,C,D,E step;
   class F,G meta;
+```
 
 ### Dense Hessian
 
