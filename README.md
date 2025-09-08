@@ -1,177 +1,130 @@
-# capyAD 🦫
-
 <img src="logo.png" alt="logo" width="200"/>
 
-**capyAD** is a lightweight, C++/Python automatic differentiation library built around **expression graphs** with full support for gradients, Hessians, and efficient Hessian–vector products (HVP).
-It is designed for **optimization, scientific computing, and machine learning research** — offering clean abstractions, high performance, and extensibility.
+# 🦖 CHOMP — *CHOMP Handles Optimization of Many Problems*
+
+**CHOMP** is a modular **Nonlinear Programming (NLP) solver** that can *chomp through tough constrained problems* using multiple state-of-the-art strategies:
+
+* **SQP (Sequential Quadratic Programming)** — Newton-type steps with globalization (line search, trust region, filter/funnel acceptance).
+* **IP (Interior Point)** — log-barrier primal-dual method with slack variables, inspired by **IPOPT**, for smooth handling of inequalities.
+* **AUTO** — automatic mode selection depending on problem structure.
+
+CHOMP combines **automatic differentiation**, **sparse linear algebra**, and **advanced regularization** to solve nonlinear constrained optimization problems reliably and efficiently.
 
 ---
 
 ## ✨ Features
 
-* **Expression Graph Engine**
+* **Multiple solving strategies**
 
-  * Nodes for variables, constants, unary/binary/n-ary operations
-  * Cycle detection, deduplication, and canonical variable mapping
-* **Automatic Differentiation**
+  * `sqp`: Sequential Quadratic Programming with advanced globalization.
+  * `ip`: Interior Point method with slack + log-barrier.
+  * `auto`: Automatic mode selection.
 
-  * Reverse-mode (backpropagation) for efficient gradients
-  * Forward-over-reverse for Hessian–vector products
-  * Full dense Hessian reconstruction
-* **Epoch-based Caching**
+* **Constraint handling**
 
-  * Safe reuse of node values/gradients across calls
-  * Avoids recomputation with robust invalidation
-* **Introspection Tools**
+  * Equalities and inequalities.
+  * Automatic slack transformation for inequalities in IP mode.
 
-  * Expression pretty-printing
-  * Graph visualization utilities (`printTree`, SVG diagrams)
-* **Python Bindings**
+* **Linear algebra backends**
 
-  * Seamless integration into scientific workflows
-  * `gradient`, `hessian`, and `hvp` APIs from Python
+  * Sparse LDLᵀ factorizations via **QDLDL**.
+  * Dense/sparse fallbacks using **SciPy**.
+
+* **Robust regularization**
+
+  * Adaptive handling of indefinite or rank-deficient Hessians.
+  * Sparsity-preserving regularization strategies.
+
+* **Extensible design**
+
+  * Modular components: `Model`, `Regularizer`, `Stepper`, `KKT`.
+  * Easy to plug in new globalization, regularization, or solver backends.
 
 ---
 
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/your-org/capyAD.git
-cd capyAD
-pip install .
+git clone https://github.com/your-org/chomp.git
+cd chomp
+pip install -e .
 ```
 
-Requirements:
+**Dependencies:**
 
 * Python ≥ 3.9
-* C++17 compiler
-* `pybind11`, `numpy`
+* NumPy, SciPy
+* [qdldl-cpp](https://github.com/oxfordcontrol/qdldl) (exposed via pybind11)
 
 ---
 
-## 🧩 Expression Graph
+## 🚀 Usage
 
-Expressions are represented as **graphs**, not trees. Shared subexpressions are automatically unified.
-
-Example:
+### Define a model
 
 ```python
-import capyAD as ad
+import numpy as np
+from chomp import NLPSolver, SQPConfig
 
-x = ad.Var("x")
-y = ad.Var("y")
+# Rosenbrock objective
+def rosenbrock(x):
+    return (1 - x[0])**2 + 100 * (x[1] - x[0]**2)**2
 
-expr = ad.sin(x) + x * y
-print(expr)  # (sin(x) + (x * y))
+# Circle inequality: x1² + x2² ≤ 25
+c_ineq = [lambda x: x[0]**2 + x[1]**2 - 25]
+
+x0 = np.array([3.0, 2.0])
+
+solver = NLPSolver(rosenbrock, c_ineq=c_ineq, x0=x0, config=SQPConfig())
 ```
 
-**Graph structure:**
-
-```mermaid
-graph LR
-  subgraph Vars
-    X["x : Var"]
-    Y["y : Var"]
-  end
-
-  S["sin(·)"]
-  M["(· * ·)"]
-  P["+"]
-
-  X --> S
-  X --> M
-  Y --> M
-
-  S --> P
-  M --> P
-
-  classDef var fill:#eef,stroke:#446,stroke-width:1px,color:#223;
-  classDef op fill:#f7f7f7,stroke:#555,stroke-width:1px,color:#222;
-
-  class X,Y var;
-  class S,M,P op;
-```
-
----
-
-## 🔢 Differentiation
-
-### Gradient
+### Run SQP
 
 ```python
-f = ad.sin(x) + x * y
-grad = ad.gradient(f, {"x": 1.0, "y": 2.0})
-print(grad)  # {'x': cos(x) + y, 'y': x}
+x_opt, lam, info = solver.solve(mode="sqp")
+print("Optimal solution (SQP):", x_opt)
 ```
 
-### Hessian–Vector Product (HVP)
-
-Efficiently compute $H v$ without building the full Hessian:
+### Run Interior Point
 
 ```python
-Hv = ad.hvp(f, {"x": 1.0, "y": 2.0}, v=[1.0, 0.5])
-print(Hv)  # vector of size = number of variables
+x_opt, lam, info = solver.solve(mode="ip")
+print("Optimal solution (IP):", x_opt)
 ```
 
-Dataflow:
-
-```mermaid
-flowchart TD
-  A["Inputs x, seed v"] --> B["Forward pass<br/>(values)"]
-  B --> C["Build/Reuse reverse tape<br/>(graph edges, op adjoints)"]
-  C --> D["Forward-over-reverse sweep<br/>(propagate dot through tape)"]
-  D --> E["Output Hv"]
-
-  %% Notes on caching/epochs
-  B -. uses .-> F["Epoch-cached node values"]
-  D -. uses .-> G["Epoch-cached dot/grad states"]
-
-  classDef step fill:#f7f7f7,stroke:#555,stroke-width:1px,color:#222;
-  classDef meta fill:#eef,stroke:#446,stroke-width:1px,color:#223,stroke-dasharray: 3 3;
-
-  class A,B,C,D,E step;
-  class F,G meta;
-```
-
-### Dense Hessian
+### Let CHOMP decide (auto mode)
 
 ```python
-H = ad.hessian(f, {"x": 1.0, "y": 2.0})
-print(H)  # full 2x2 matrix
+x_opt, lam, info = solver.solve(mode="auto")
 ```
 
 ---
 
-## ⚙️ Internals
+## 🔬 Examples
 
-* **Forward Pass**
+* **Unconstrained**: Rosenbrock minimization
+* **Inequality-constrained**: Branin function + circular constraint
+* **Equality-constrained**: Quadratic programming with linear equalities
 
-  * Computes node values (`value`) and tangents (`dot`)
-* **Reverse Pass**
-
-  * Propagates gradients (`gradient`) and second-order terms (`grad_dot`)
-* **Epoch Counters**
-
-  * Ensure fresh state without zeroing arrays
-  * `cur_val_epoch`, `cur_grad_epoch`, `cur_dot_epoch`, `cur_gdot_epoch`
+See [`examples/`](./examples) for runnable demos.
 
 ---
 
-## 📖 Citation
+## 📖 References
 
-If you use **capyAD** in research, please cite:
-
-```bibtex
-@misc{capyad2025,
-  title  = {capyAD: A Lightweight Expression Graph AD Library},
-  author = {Laio O. Seman},
-  year   = {2025},
-  url    = {https://github.com/lseman/capyAD}
-}
-```
+* Nocedal & Wright (2006), *Numerical Optimization*
+* Wächter & Biegler (2006), *Primal-Dual Interior Point Filter Line Search Algorithm* (IPOPT)
+* Gill, Murray & Wright (1981), *Practical Optimization*
 
 ---
 
-## 🦫 Why "capyAD"?
+## 🛠️ Development Notes
 
-Because capybaras are **friendly, efficient, and love groups** — just like our expression graphs.
+* **Bindings**: `pybind11` exposes **C++ LDLᵀ factorizations** (`qdldl_cpp`) to Python.
+* **Modules**:
+
+  * `Model`: automatic differentiation wrapper for objectives/constraints.
+  * `Regularizer`: Hessian conditioning and inertia correction.
+  * `SQPStepper`: globalization via trust region, line search, filter, funnel.
+  * `InteriorPointStepper`: slack/barrier-based primal-dual IPM.
+  * `KKT`: sparse KKT system assembly and factorization.

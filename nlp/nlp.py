@@ -25,8 +25,9 @@ from .blocks.qp import *
 from .blocks.reg import Regularizer, make_psd_advanced
 from .blocks.soc import *
 from .blocks.tr import *
+from .dfo import *
+from .dfo_model import *
 from .ip import *
-from .sqp_model import *
 
 
 # =============================================================================
@@ -869,6 +870,17 @@ class NLPSolver:
             ls=self.ls,
             soc=self.soc,
         )
+        mI = len(c_ineq) if c_ineq else 0
+        mE = len(c_eq) if c_eq else 0
+        self.dfo_state = DFOExactState(self.n, mI, mE, self.cfg)
+        self.dfo_stepper = DFOExactPenaltyStepper(
+            self.cfg,
+            regularizer = self.regularizer,
+            n=self.n,
+            mI=mI,
+            mE=mE,
+            tr=self.tr,
+        )
 
         _ensure_cfg_fields(self.cfg)  # add missing fields if needed
 
@@ -878,7 +890,7 @@ class NLPSolver:
 
         # Initial mode
         self.mode = self.cfg.mode
-        if self.mode not in ("ip", "sqp", "auto"):
+        if self.mode not in ("ip", "sqp", "auto", "dfo"):
             self.mode = "auto"
 
         if self.mode == "auto":
@@ -920,6 +932,18 @@ class NLPSolver:
                 info = self._ip_step(k)
             elif self.mode == "sqp":
                 info = self._sqp_step(k)
+            elif self.mode == "dfo":
+                x_out, lam_out, nu_out, info = self.dfo_stepper.step(
+                    self.model, self.x, self.dfo_state, k
+                )
+                # Update streaks / stats
+                self._update_streaks(info)
+
+                if info["accepted"]:
+                    if self.cfg.use_watchdog:
+                        self._watchdog_update(x_out)
+                    self.x = x_out
+                    self.lam, self.nu = lam_out, nu_out
             else:
                 # should not happen; fallback to SQP
                 info = self._sqp_step(k)
