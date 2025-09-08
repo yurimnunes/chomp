@@ -224,6 +224,7 @@ class SQPConfig:
     rho_max: float = 1e6
     rho_inc: float = 10.0
     # verbose already defined above
+    
 
 
 # ======================================

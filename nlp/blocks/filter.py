@@ -49,9 +49,10 @@ Notes
 
 from __future__ import annotations
 
+import heapq
 import logging
 from heapq import heappop, heappush
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -59,7 +60,6 @@ import numpy as np
 class Filter:
     """
     Fletcher–Leyffer-style filter for SQP/IP globalization.
-
     The filter stores pairs (θ, f) and rejects trial points that lie in the
     forbidden region induced by any stored pair, with adaptive margins on both
     infeasibility and objective. This yields a robust globalization strategy that
@@ -87,11 +87,10 @@ class Filter:
 
     def __init__(self, cfg: 'SQPConfig'):
         self.cfg = cfg
-        self.entries: List[Tuple[float, float]] = []  # stores (-theta, f)
-        self.iter: int = 0
-        self.initial_theta: Optional[float] = None
-        self.initial_f: Optional[float] = None
-
+        self.entries = [(-cfg.filter_theta_min * 10, -np.inf)]  # Initial pair (θ_max, -∞) per IPOPT (21)
+        self.iter = 0
+        self.initial_theta = None
+        self.initial_f = None
         # -- basic config validation
         required_attrs = [
             'filter_theta_min', 'filter_gamma_theta', 'filter_gamma_f',
@@ -111,10 +110,10 @@ class Filter:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
+
     def _margins(self, trust_radius: Optional[float] = None) -> Tuple[float, float]:
         """
         Compute adaptive margins (g_θ, g_f) for infeasibility and objective tests.
-
         The margins decay with the current θ scale (via θ_max and filter_theta_min)
         and with iterations (via iter_scale_factor). Optionally, they scale up with
         the trust-region radius to avoid over-pruning when larger steps are allowed.
@@ -130,33 +129,30 @@ class Filter:
         g_theta, g_f : float
             Positive margins applied in dominance tests (lower-bounded by 1e-8).
         """
-        theta_max = -self.entries[0][0] if self.entries else 1.0  # because heap stores -θ
-        # decay in [0.1, 1.0] depending on θ scale
+        theta_max = -self.entries[0][0] if self.entries else 1.0  # Largest θ from heap top
+        # Decay in [0.1, 1.0] based on θ scale
         decay = min(1.0, max(0.1, theta_max / self.cfg.filter_theta_min))
-        # iteration-based decay factor
+        # Iteration-based decay factor
         iter_scale = 1.0 / (1.0 + self.iter / self.cfg.iter_scale_factor)
-
         g_theta = max(self.cfg.filter_margin_min, self.cfg.filter_gamma_theta * decay * iter_scale)
-        g_f     = max(self.cfg.filter_margin_min, self.cfg.filter_gamma_f     * decay * iter_scale)
-
+        g_f = max(self.cfg.filter_margin_min, self.cfg.filter_gamma_f * decay * iter_scale)
         if trust_radius is not None:
             scale = max(1.0, float(trust_radius) / self.cfg.tr_delta0)
             g_theta *= scale
-            g_f     *= scale
-
-        # numerical floor
+            g_f *= scale
+        # Numerical floor
         g_theta = max(g_theta, 1e-8)
-        g_f     = max(g_f,     1e-8)
+        g_f = max(g_f, 1e-8)
         logging.debug(f"[Filter] margins: gθ={g_theta:.3e}, gƒ={g_f:.3e}, θ_max={theta_max:.3e}, iter={self.iter}")
         return g_theta, g_f
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
+
     def is_acceptable(self, theta: float, f: float, trust_radius: Optional[float] = None) -> bool:
         """
         Check if (θ, f) is acceptable w.r.t. the current filter.
-
         A point is rejected if it falls inside the forbidden region of any stored
         pair (θ_i, f_i), after applying adaptive margins and a switching rule that
         can still allow acceptance when there is clear progress predominantly in
@@ -182,24 +178,22 @@ class Filter:
         if theta < 0:
             logging.warning(f"[Filter] negative θ: {theta}")
             return False
-
         gθ, gƒ = self._margins(trust_radius)
-
-        # Scale tolerances based on the first point; if not set yet, use current
+        # Scale tolerances based on the first point
         theta_scale = self.initial_theta if self.initial_theta is not None else max(theta, 1.0)
-        f_scale     = self.initial_f     if self.initial_f     is not None else max(abs(f), 1.0)
+        f_scale = self.initial_f if self.initial_f is not None else max(abs(f), 1.0)
         epsilon = 1e-8 * max(theta_scale, f_scale)
-
-        # Forbidden region test with a switching condition
+        # Forbidden region test with switching condition
         for t_i_heap, f_i in self.entries:
-            t_i = -t_i_heap  # convert back from heap key
+            t_i = -t_i_heap  # Convert back from heap key
             in_forbidden = (theta >= (1.0 - gθ) * t_i - epsilon) and (f >= f_i - gƒ * theta - epsilon)
             if in_forbidden:
-                # Switching condition: accept if *clearly* better in one metric
-                switch_theta = self.cfg.switch_theta * max(theta_scale, t_i)
-                switch_f     = self.cfg.switch_f     * max(f_scale, abs(f_i))
-                if theta < switch_theta * t_i or f < f_i - switch_f * theta:
-                    continue  # allow acceptance despite forbidden test
+                # Switching condition: accept if clear progress in one metric
+                switch_theta = self.cfg.switch_theta * theta_scale
+                switch_f = self.cfg.switch_f * f_scale
+                if theta < switch_theta or f < f_i - switch_f:  # Simplified switching
+                    logging.debug(f"[Filter] accept via switching: (θ={theta:.3e}, f={f:.3e}) vs (θ={t_i:.3e}, f={f_i:.3e})")
+                    continue
                 logging.debug(f"[Filter] reject (θ={theta:.3e}, f={f:.3e}) dominated by (θ={t_i:.3e}, f={f_i:.3e})")
                 return False
         return True
@@ -207,7 +201,6 @@ class Filter:
     def add_if_acceptable(self, theta: float, f: float, trust_radius: Optional[float] = None) -> bool:
         """
         Try to insert (θ, f) into the filter, removing dominated entries.
-
         If acceptable, the new point is inserted and any existing entries that are
         dominated by (θ, f) under the current margins are discarded. If the filter
         is full, the worst entry is removed first (largest θ, then larger f tie-break).
@@ -232,63 +225,41 @@ class Filter:
         if theta < 0:
             logging.warning(f"[Filter] negative θ: {theta}")
             return False
-
         # Initialize scales from first accepted point
         if self.initial_theta is None:
             self.initial_theta = max(theta, 1e-8)
         if self.initial_f is None:
             self.initial_f = max(abs(f), 1e-8)
-
-        # Ensure capacity; evict worst if needed
-        if len(self.entries) >= self.cfg.filter_max_size:
-            # Remove the entry with largest θ; tie-break on worse f
-            max_idx = 0
-            max_theta = -self.entries[0][0]
-            worst_f = self.entries[0][1]
-            for i, (t_i_heap, f_i) in enumerate(self.entries):
-                t_i = -t_i_heap
-                if (t_i > max_theta) or (np.isclose(t_i, max_theta) and f_i > worst_f):
-                    max_idx, max_theta, worst_f = i, t_i, f_i
-            removed = self.entries.pop(max_idx)
-            logging.info(f"[Filter] capacity reached, evicted (θ={-removed[0]:.3e}, f={removed[1]:.3e})")
-
         gθ, gƒ = self._margins(trust_radius)
-        theta_scale = self.initial_theta
-        f_scale = self.initial_f
-        epsilon = 1e-8 * max(theta_scale, f_scale)
-
-        kept: List[Tuple[float, float]] = []
+        epsilon = 1e-8 * max(self.initial_theta, self.initial_f)
+        # Check acceptability and build new heap
+        temp_entries = []
         acceptable = True
         for t_i_heap, f_i in self.entries:
             t_i = -t_i_heap
-            # Forbidden region: new point is worse → reject
-            in_forbidden = (theta >= (1.0 - gθ) * t_i - epsilon) and (f >= f_i - gƒ * theta - epsilon)
-            if in_forbidden:
-                logging.debug(f"[Filter] reject (θ={theta:.3e}, f={f:.3e}) dominated by (θ={t_i:.3e}, f={f_i:.3e})")
+            if (theta < (1.0 - gθ) * t_i + epsilon) or (f < f_i - gƒ * theta + epsilon):
+                heapq.heappush(temp_entries, (t_i_heap, f_i))
+            else:
                 acceptable = False
                 break
-
-            # Dominance: new point strictly better → drop existing entry
-            dominated = (theta <= (1.0 - gθ) * t_i + epsilon) and (f <= f_i - gƒ * theta + epsilon)
-            if not dominated:
-                heappush(kept, (-t_i, f_i))  # keep existing (re-store as heap key)
-
         if acceptable:
-            heappush(kept, (-theta, f))
-            self.entries = kept
+            heapq.heappush(temp_entries, (-theta, f))
+            if len(temp_entries) > self.cfg.filter_max_size:
+                heapq.heappop(temp_entries)  # Remove worst (largest θ)
+            self.entries = temp_entries
             self.iter += 1
-            logging.info(f"[Filter] accept (θ={theta:.3e}, f={f:.3e}); size={len(self.entries)}")
-        return acceptable
+            logging.debug(f"[Filter] accept (θ={theta:.3e}, f={f:.3e}); size={len(self.entries)}")
+            return True
+        return False
 
     def reset(self) -> None:
         """Clear all entries, reset counters and initial scales."""
-        self.entries.clear()
+        self.entries = [(-self.cfg.filter_theta_min * 10, -np.inf)]  # Reinitialize with θ_max
         self.iter = 0
         self.initial_theta = None
         self.initial_f = None
         logging.info("[Filter] reset")
-
-
+    
 class Funnel:
     """
     Scalar funnel mechanism for globalization with separate f- and h-type steps.

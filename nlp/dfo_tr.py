@@ -125,41 +125,23 @@ class TRModel:
         except Exception:
             return False
         
-    def ensure_improvement(self, call_fn: Callable[[np.ndarray], Tuple[np.ndarray, bool]], 
-                          arg1, arg2, opts) -> None:
-        """
-        Add a new point to improve the trust region model using an acquisition function or distance-based selection.
-
-        Args:
-            call_fn (Callable): Function to evaluate candidate points, returning (fvec, success).
-            arg1, arg2: Additional arguments for call_fn (not used in this implementation).
-            opts: Options for the trust region algorithm (not used in this implementation).
-
-        Raises:
-            ValueError: If the model has too many points or inputs are invalid.
-        """
+    def ensure_improvement(self, call_fn: Callable[[np.ndarray], Tuple[np.ndarray, bool]],
+                        arg1, arg2, opts) -> None:
         if self.pointsAbs.shape[0] >= self.max_pts:
             return
-
-        # Generate candidate points
-        num_cand = max(50, 10 * self.n)
+        num_cand = max(self.cfg.min_cand, 5 * self.n * int(np.log(self.pointsAbs.shape[0] + 1)))
         cand = []
-
-        # Axis-aligned points
         for i in range(self.n):
             e = np.zeros(self.n, dtype=np.float64)
             e[i] = 1.0
             cand.append(self.center + self.radius * e)
             cand.append(self.center - self.radius * e)
-
-        # Quasi-Monte Carlo points (Sobol sequence)
         sampler = qmc.Sobol(d=self.n, scramble=True, seed=np.random.randint(0, 10000))
         sobol_points = sampler.random(num_cand - 2 * self.n)
-        # Scale to trust region ball
         sobol_points = qmc.scale(sobol_points, -self.radius, self.radius) + self.center
         cand.extend(sobol_points)
         cand = np.unique(np.array(cand, dtype=np.float64), axis=0)
-
+        # Rest of the method remains the same
         # Select new point
         if self.interp and hasattr(self.interp, "get_acquisition"):
             # Use Expected Improvement (EI) with exploration-exploitation trade-off
@@ -211,3 +193,11 @@ class TRModel:
         self.center = np.asarray(x_new, dtype=np.float64).ravel()
         self.append_raw_sample(x_new, fvec)
         self.rebuild_interp()
+            
+    def update_radius(self, success: bool, ratio: float, opts: Any) -> None:
+        """Update trust region radius based on optimization progress."""
+        if success:
+            self.radius *= max(1.5, min(2.0, ratio))
+        else:
+            self.radius *= 0.5
+        self.radius = max(self.cfg.min_radius, min(self.radius, self.cfg.max_radius))

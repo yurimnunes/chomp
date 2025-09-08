@@ -18,6 +18,7 @@ class DFOConfig:
     max_pts: int = 200
     model_radius_mult: float = 2.0
     use_quadratic_if: int = 25
+    use_full_quadratic_if: int = 40
     mu: float = 10.0
     eps_active: float = 1e-6
     tr_inc: float = 1.6
@@ -39,6 +40,7 @@ class DFOConfig:
     use_multiplier_step: bool = True
     mult_sigma_thresh: float = 1e-3
     mult_project_lambda: bool = True
+    capu_enabled: bool = True
     mult_newton_clip_inf: bool = True
     fl_tol: float = 1e-3
     gp_noise: float = 1e-2  # Noise level for GP likelihood
@@ -56,6 +58,10 @@ class DFOConfig:
         2  # after this many successful fit rounds, stop re-optimizing
     )
     gp_hess_mode: str = "autograd"  # "diag_from_lengthscale" | "autograd"
+    min_cand: int = 100  # min candidate points for acquisition optimization
+    capu_history_len: int = 6  # length of history for CAPU
+    capu_viol_eps: float = 1e-3  # tolerance for CAPU violation
+    capu_persist_thresh: int = 3  # iters of violation before CAPU triggers
 
 
 # Existing FitResult and CriticalityState (unchanged)

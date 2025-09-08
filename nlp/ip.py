@@ -11,6 +11,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 
 from .blocks.aux import HessianManager, Model, SQPConfig
+from .blocks.filter import Filter
 from .blocks.reg import Regularizer, make_psd_advanced
 
 
@@ -45,6 +46,7 @@ class IPState:
     s: np.ndarray
     lam: np.ndarray
     nu: np.ndarray
+    z: np.ndarray  # duals for bounds x >= 0 (new: primal-dual for bounds)
     mu: float
     initialized: bool = False
 
@@ -59,7 +61,11 @@ class IPState:
         lam = np.ones_like(s0)
         nu = np.zeros(mE)
         mu0 = max(getattr(cfg, "ip_mu_init", 1e-1), 1e-12)
-        return IPState(mI=mI, mE=mE, s=s0, lam=lam, nu=nu, mu=mu0, initialized=True)
+        z0 = np.ones_like(x)  # new: initialize z for bounds
+        return IPState(
+            mI=mI, mE=mE, s=s0, z=z0, lam=lam, nu=nu, mu=mu0, initialized=True
+        )
+
 
 def _upper_csc(A):
     """Ensure upper-triangular CSC with int64/float64 dtypes."""
@@ -91,6 +97,9 @@ def _ordering_perm(A_csc):
         except Exception:
             return None
 
+def safe_inf_norm(v: np.ndarray) -> float:
+    """Compute infinity norm safely, handling empty arrays."""
+    return np.linalg.norm(v, np.inf) if v.size > 0 else 0.0
 
 # ------------------ stepper ------------------
 # ------------------ stepper ------------------
@@ -121,7 +130,7 @@ class InteriorPointStepper:
         self.hess = hess
         self.reg = regularizer
         self.tr = tr
-        self.filter = flt
+        self.filter = Filter(self.cfg)
         self.funnel = funnel
         self.ls = ls  # may be None; if None we fall back to internal LS
         self.soc = soc  # may be None; if None we skip SOC rescue
@@ -133,13 +142,13 @@ class InteriorPointStepper:
                 setattr(self.cfg, name, val)
 
         # algebra / hessian mode
-        add("ip_match_ref_form", True)
-        add("ip_exact_hessian", True)
+        add("ip_match_ref_form", False)
+        add("ip_exact_hessian", False)
         add("ip_hess_reg0", 1e-4)
         add("ip_eq_reg", 1e-4)
 
         # barrier & predictor-corrector (used only if ip_match_ref_form=False)
-        add("ip_mu_init", 1e-1)
+        add("ip_mu_init", 1e-2)
         add("ip_mu_min", 1e-12)
         add("ip_sigma_power", 3.0)
         add("ip_tau", 0.995)
@@ -159,6 +168,28 @@ class InteriorPointStepper:
         add("ip_rho_init", 1.0)
         add("ip_rho_inc", 10.0)
         add("ip_rho_max", 1e6)
+
+        add("ip_kappa_eps", 10.0)  # kappa_epsilon
+        add("ip_kappa_mu", 0.2)
+        add("ip_theta_mu", 1.5)
+        add("ip_tau_min", 0.99)
+        add("ip_gamma_theta", 1e-5)
+        add("ip_gamma_phi", 1e-5)
+        add("ip_delta", 1.0)
+        add("ip_s_theta", 1.1)
+        add("ip_s_phi", 2.3)
+        add("ip_eta_phi", 1e-4)
+        add("ip_kappa_soc", 0.99)
+        add("ip_pmax_soc", 4)
+        add("ip_kappa_sigma", 1e10)  # kappa_Sigma for z correction
+        add("ip_delta_w_min", 1e-20)  # for inertia correction
+        add("ip_delta_w_0", 1e-4)
+        add("ip_delta_w_max", 1e40)
+        add("ip_kappa_w_plus_bar", 100.0)
+        add("ip_kappa_w_plus", 8.0)
+        add("ip_kappa_w_minus", 1 / 3)
+        add("ip_kappa_c", 0.25)
+        add("ip_delta_c_bar", 1e-8)
 
         # --------- bridge legacy ip_* to generic ls_* if missing ---------
         # (we don't overwrite ls_* if you already set them elsewhere)
@@ -185,104 +216,115 @@ class InteriorPointStepper:
         reuse_symbolic=True,
         refine_iters=0,
     ):
-        """
-        Solve:
-            [ W   J^T ] [dx] = [rhs_x]
-            [ J   B22 ] [λ ]   [-rpE ]
-        where B22 = ip_eq_reg * I (usually small, > 0).  If mE == 0, solves W dx = rhs_x.
-
-        Internally:
-        - Converts to upper CSC
-        - (Optionally) orders with AMD/RCM
-        - Uses qd.analyze / qd.refactorize for speed on repeated solves
-        """
+        # Modified for inertia correction (Algorithm IC)
         n = Wmat.shape[0]
         mE = 0 if JE_mat is None else JE_mat.shape[0]
-
-        if mE > 0:
-            # Assemble KKT in sparse blocks
-            Wcsr = Wmat if sp.isspmatrix_csr(Wmat) else sp.csr_matrix(Wmat)
-            JEcsr = JE_mat if sp.isspmatrix_csr(JE_mat) else sp.csr_matrix(JE_mat)
-            ip_eq = float(getattr(self.cfg, "ip_eq_reg", 1e-4))
-            B22 = ip_eq * sp.eye(mE, format="csr")
-
-            K = sp.vstack(
-                [
-                    sp.hstack([Wcsr, JEcsr.T], format="csr"),
-                    sp.hstack([JEcsr, B22], format="csr"),
-                ],
-                format="csc",
-            )
-            rhs = np.concatenate([rhs_x, -rpE])
-        else:
-            # No equality constraints: just W
-            K = sp.csc_matrix(Wmat)  # may be dense → sparse
-            rhs = np.asarray(rhs_x)
-
-        # QDLDL expects *upper* CSC (including diagonal)
-        K_upper = _upper_csc(K)
-        nsys = K_upper.shape[0]
-
-        # Optional ordering
-        perm = _ordering_perm(K_upper) if use_ordering else None
-
-        # Cache symbolic to reuse between calls if pattern is unchanged
-        # You can keep these attributes on `self` (or another long-lived object)
-        have_cache = (
-            reuse_symbolic
-            and hasattr(self, "_qd_sym")
-            and getattr(self, "_qd_sym_n", None) == nsys
-        )
-        try:
-            if reuse_symbolic:
-                if not have_cache:
-                    self._qd_sym = qd.analyze(
-                        K_upper.indptr,
-                        K_upper.indices,
-                        K_upper.data,
-                        np.int64(nsys),
-                        perm=perm,
-                    )
-                    self._qd_sym_n = nsys
-                fac = qd.refactorize(
-                    self._qd_sym,
-                    K_upper.indptr,
-                    K_upper.indices,
-                    K_upper.data,
-                    np.int64(nsys),
-                )
-            else:
-                fac = qd.factorize(
-                    K_upper.indptr,
-                    K_upper.indices,
-                    K_upper.data,
-                    np.int64(nsys),
-                    perm=perm,
-                )
-
-            x = qd.solve(fac, rhs.astype(np.float64, copy=False))
-            if refine_iters and refine_iters > 0:
-                x = qd.solve_refine(
-                    fac, rhs.astype(np.float64, copy=False), int(refine_iters)
-                )
-
+        delta_w_last = getattr(self, "_delta_w_last", 0.0)  # persist across calls
+        delta_w = 0.0
+        delta_c = 0.0
+        attempts = 0
+        max_attempts = 10  # limit
+        while attempts < max_attempts:
+            # Assemble KKT as before, but with delta_w I in W, -delta_c I in bottom-right
             if mE > 0:
-                return x[:n], x[n:]
+                Wcsr = _csr(Wmat + delta_w * sp.eye(n))
+                JEcsr = _csr(JE_mat)
+                B22 = -delta_c * sp.eye(mE) if delta_c > 0 else sp.csr_matrix((mE, mE))
+                K = sp.vstack(
+                    [sp.hstack([Wcsr, JEcsr.T]), sp.hstack([JEcsr, B22])], format="csc"
+                )
+                rhs = np.concatenate([rhs_x, -rpE])
             else:
-                return x, np.zeros(0, dtype=x.dtype)
-
-        except Exception as e:
-            print(f"[QDLDL] KKT solve failed: {e}")
-            # Fall back to SciPy if factorization fails
-            # (use LU or dense solve depending on structure)
+                K = _csr(Wmat + delta_w * sp.eye(n))
+                rhs = rhs_x
+            K_upper = _upper_csc(K)
+            nsys = K_upper.shape[0]
+            perm = _ordering_perm(K_upper) if use_ordering else None
+            # Factorize and check inertia (QDLDL provides D values for inertia count)
             try:
-                sol = spla.spsolve(K.tocsc(), rhs)
+                fac = qd.factorize(
+                    K_upper.indptr, K_upper.indices, K_upper.data, nsys, perm=perm
+                )
+                # Get inertia: count positive/negative in D (diagonal of L D L^T)
+                D = fac.D  # assume qdldl exposes D
+                num_pos = np.sum(D > 0)
+                num_neg = np.sum(D < 0)
+                num_zero = np.sum(np.abs(D) < 1e-12)  # approx zero
+                if num_pos == n and num_neg == mE and num_zero == 0:
+                    # Correct inertia
+                    self._delta_w_last = delta_w
+                    x = qd.solve(fac, rhs)
+                    if refine_iters > 0:
+                        x = qd.solve_refine(fac, rhs, refine_iters)
+                    return x[:n], x[n:] if mE > 0 else (x, np.zeros(0))
+                # Adjust deltas per IC
+                if num_zero > 0:
+                    delta_c = self.cfg.ip_delta_c_bar * self.mu**self.cfg.ip_kappa_c
+                if delta_w_last == 0:
+                    delta_w = (
+                        self.cfg.ip_delta_w_0
+                        if attempts == 0
+                        else self.cfg.ip_kappa_w_plus_bar * delta_w
+                    )
+                else:
+                    delta_w = (
+                        max(
+                            self.cfg.ip_delta_w_min,
+                            self.cfg.ip_kappa_w_minus * delta_w_last,
+                        )
+                        if attempts == 0
+                        else self.cfg.ip_kappa_w_plus * delta_w
+                    )
+                if delta_w > self.cfg.ip_delta_w_max:
+                    raise ValueError("Inertia correction failed: too large delta_w")
+                attempts += 1
             except Exception:
-                sol = np.linalg.solve(K.toarray(), rhs)
-            if mE > 0:
-                return sol[:n], sol[n:]
-            else:
-                return sol, np.zeros(0, dtype=sol.dtype)
+                print("KKT factorization failed, adjusting deltas")
+                # Fallback to SciPy as before
+                sol = spla.spsolve(K.tocsc(), rhs)
+                return sol[:n], sol[n:] if mE > 0 else (sol, np.zeros(0))
+        raise ValueError(
+            "Inertia correction failed after max attempts - switch to restoration"
+        )
+
+    def _compute_error(self, model: Model, x, lam, nu, z, mu: float = 0.0) -> float:
+        # IPOPT's E_mu or E_0 (5)
+        data = model.eval_all(x, components=["f", "g", "cI", "JI", "cE", "JE"])
+        g = np.asarray(data["g"], float)
+        cI = np.asarray(data["cI"], float) if data["cI"] is not None else np.zeros(0)
+        cE = np.asarray(data["cE"], float) if data["cE"] is not None else np.zeros(0)
+        JI = data["JI"]
+        JE = data["JE"]
+        r_d = (
+            g
+            + (JI.T @ lam if JI is not None else 0)
+            + (JE.T @ nu if JE is not None else 0)
+            - z
+        )  # new: -z for bounds
+        r_cI = cI
+        r_cE = cE
+        r_comp_bounds = x * z - mu * np.ones_like(x)  # new: comp for bounds
+        r_comp_slacks = (
+            self.s * lam - mu * np.ones_like(self.s) if self.mI > 0 else np.zeros(0)
+        )
+        s_max = getattr(self.cfg, "ip_s_max", 100.0)
+        s_d = (
+            max(
+                s_max,
+                (np.sum(np.abs(lam)) + np.sum(np.abs(nu)) + np.sum(np.abs(z)))
+                / (self.mI + self.mE + len(x)),
+            )
+            / s_max
+        )
+        s_c = max(s_max, np.sum(np.abs(z)) / len(x)) / s_max
+        err = max(
+            np.linalg.norm(r_d, np.inf) / s_d,
+            np.linalg.norm(r_cE, np.inf) if self.mE > 0 else 0.0,
+            np.linalg.norm(r_cI, np.inf) if self.mI > 0 else 0.0,
+            np.linalg.norm(r_comp_bounds, np.inf) / s_c,
+            np.linalg.norm(r_comp_slacks, np.inf) / s_c,
+        )
+        return err
 
     # -------------- one iteration --------------
     def step(
@@ -294,520 +336,286 @@ class InteriorPointStepper:
         it: int,
         ip_state: Optional[IPState] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
-        # -------------------- setup & state --------------------
-        n = model.n
+        """
+        Perform one iteration of the primal-dual interior-point method with filter line-search.
+        Follows IPOPT's Algorithm A, integrating primal-dual equations, filter method,
+        second-order corrections, and feasibility restoration.
+        """
+        # Initialize or retrieve state
         st = (
             ip_state
             if (ip_state and ip_state.initialized)
             else IPState.from_model(model, x, self.cfg)
         )
+        n = model.n
         mI, mE = st.mI, st.mE
-        s, lmb, nuv, mu = st.s.copy(), st.lam.copy(), st.nu.copy(), float(st.mu)
-        rho = float(getattr(self.cfg, "ip_rho_init", 1.0))
-        use_soc = bool(getattr(self.cfg, "use_soc", False))
-        soc_when = str(getattr(self.cfg, "soc_when", "after_ls_accept"))
-        allow_null_accept = bool(getattr(self.cfg, "ip_allow_null_accept", True))
-        # optional TR radius for SOC cap
-        Delta = None
-        if getattr(self, "tr", None) is not None and hasattr(self.tr, "radius"):
-            try:
-                Delta = float(self.tr.radius)
-                if not np.isfinite(Delta) or Delta <= 0.0:
-                    Delta = None
-            except Exception:
-                Delta = None
+        s, lmb, nuv, z, mu = (
+            st.s.copy(),
+            st.lam.copy(),
+            st.nu.copy(),
+            st.z.copy(),
+            float(st.mu),
+        )
+        tau = max(self.cfg.ip_tau_min, 1 - mu)  # Fraction-to-boundary parameter (8)
 
-        # -------------------- evaluate base point --------------------
+        # Evaluate model at current point
         data = model.eval_all(x, components=["f", "g", "cI", "JI", "cE", "JE"])
-        f, g = float(data["f"]), np.asarray(data["g"], float)
-        cI = (
-            np.zeros(mI)
-            if (mI == 0 or data["cI"] is None)
-            else np.asarray(data["cI"], float)
-        )
-        cE = (
-            np.zeros(mE)
-            if (mE == 0 or data["cE"] is None)
-            else np.asarray(data["cE"], float)
-        )
-        JI = None if mI == 0 else data["JI"]
-        JE = None if mE == 0 else data["JE"]
+        f = float(data["f"])
+        g = np.asarray(data["g"], float)
+        cI = np.zeros(mI) if mI == 0 else np.asarray(data["cI"], float)
+        cE = np.zeros(mE) if mE == 0 else np.asarray(data["cE"], float)
+        JI = data["JI"] if mI > 0 else None
+        JE = data["JE"] if mE > 0 else None
+        theta = model.constraint_violation(x)  # ||cE|| + ||max(0, -cI)||
 
-        # -------------------- Hessian of L --------------------
-        if bool(getattr(self.cfg, "ip_exact_hessian", True)):
-            H = model.lagrangian_hessian(x, lmb, nuv)
-            H, _ = make_psd_advanced(H, self.reg, it)
-        else:
-            H = self.hess.get_hessian(model, x, lmb, nuv)
-            H, _ = make_psd_advanced(
-                H, self.reg, it
-            )
+        self.mI = mI
+        self.s = s
+        self.mE = mE
 
-        # -------------------- residuals at x --------------------
-        r_d = g.copy()
-        if mI > 0:
-            r_d += JI.T @ lmb if sp.isspmatrix(JI) else np.asarray(JI).T @ lmb
-        if mE > 0:
-            r_d += JE.T @ nuv if sp.isspmatrix(JE) else np.asarray(JE).T @ nuv
-        r_pI = cI + s
+        # Compute Hessian of Lagrangian
+        H = (
+            model.lagrangian_hessian(x, lmb, nuv)
+            if self.cfg.ip_exact_hessian
+            else self.hess.get_hessian(model, x, lmb, nuv)
+        )
+        H, _ = make_psd_advanced(H, self.reg, it)
+
+        # Compute residuals for primal-dual equations (4)
+        r_d = (
+            g
+            + (JI.T @ lmb if JI is not None else 0)
+            + (JE.T @ nuv if JE is not None else 0)
+            - z
+        )
         r_pE = cE
+        r_pI = cI + s if mI > 0 else np.zeros(0)
+        r_comp_x = x * z - mu * np.ones(n)  # Complementarity for bounds
+        r_comp_s = s * lmb - mu * np.ones(mI) if mI > 0 else np.zeros(0)
 
-        # norms
-        stat = float(np.linalg.norm(r_d, ord=np.inf))
-        feasI = (
-            0.0 if mI == 0 else float(np.linalg.norm(np.maximum(0.0, cI), ord=np.inf))
+        # Compute optimality error E_mu (5)
+        s_max = getattr(self.cfg, "ip_s_max", 100.0)
+        s_d = (
+            max(
+                s_max,
+                (np.sum(np.abs(lmb)) + np.sum(np.abs(nuv)) + np.sum(np.abs(z)))
+                / (mI + mE + n),
+            )
+            / s_max
         )
-        feasE = 0.0 if mE == 0 else float(np.linalg.norm(cE, ord=np.inf))
-        comp = 0.0 if mI == 0 else float(np.linalg.norm(s * lmb - mu, ord=np.inf))
-        theta = model.constraint_violation(x)
+        s_c = max(s_max, np.sum(np.abs(z)) / n) / s_max
 
-        # quick exit if already converged (including μ)
-        if (
-            stat <= getattr(self.cfg, "ip_tol_stat", 1e-8)
-            and max(feasI, feasE) <= getattr(self.cfg, "ip_tol_feas", 1e-8)
-            and (0.0 if mI == 0 else abs(s @ lmb) / max(1, mI))
-            <= getattr(self.cfg, "ip_tol_comp", 1e-8)
-            and mu <= getattr(self.cfg, "ip_mu_min", 1e-12)
-        ):
-            info = self._pack_info(
-                0.0,
-                True,
-                True,
-                f,
-                theta,
-                {"stat": stat, "ineq": feasI, "eq": feasE, "comp": comp},
-                1.0,
-                0.0,
-                mu,
-            )
-            return x, lmb, nuv, info
-
-        # -------------------- build W and RHS --------------------
-        def _isspm(A):
-            return sp.isspmatrix(A)
-
-        def _csr(A, shape=None):
-            if A is None:
-                if shape is None:
-                    raise ValueError("shape required when A is None")
-                return sp.csr_matrix(shape)
-            return A.tocsr() if _isspm(A) else sp.csr_matrix(A)
-
-        def _sym(A):
-            return (A + A.T) * 0.5 if _isspm(A) else 0.5 * (A + A.T)
-
-        def _diag(v: np.ndarray):
-            return sp.diags(v) if v.ndim == 1 else sp.diags(np.asarray(v).ravel())
-
-        if mI > 0:
-            s = np.maximum(s, 1e-12)
-            lmb = np.maximum(lmb, 1e-12)
-            if bool(getattr(self.cfg, "ip_match_ref_form", True)):
-                # reference μ/s^2 algebra
-                Dref = mu / (s**2)
-                if _isspm(H) or _isspm(JI):
-                    Hs = _csr(H, (n, n))
-                    JIcsr = _csr(JI, (mI, n))
-                    W = _sym(Hs + JIcsr.T @ _diag(Dref) @ JIcsr)
-                else:
-                    W = _sym(H + (np.asarray(JI).T * Dref) @ np.asarray(JI))
-                r2 = lmb - mu / s
-                r3 = r_pI
-                rhs_core = -r2 + (mu / (s**2)) * r3
-                rhs_x = -r_d - (
-                    (JI.T @ rhs_core) if _isspm(JI) else (np.asarray(JI).T @ rhs_core)
-                )
-            else:
-                # Mehrotra λ/s algebra
-                D = lmb / s
-                if _isspm(H) or _isspm(JI):
-                    Hs = _csr(H, (n, n))
-                    JIcsr = _csr(JI, (mI, n))
-                    W = _sym(Hs + JIcsr.T @ _diag(D) @ JIcsr)
-                else:
-                    W = _sym(H + (np.asarray(JI).T * D) @ np.asarray(JI))
-                rhs_x_aff = -r_d - (
-                    (JI.T @ (D * r_pI))
-                    if _isspm(JI)
-                    else (np.asarray(JI).T @ (D * r_pI))
-                )
-        else:
-            W = _sym(H)
-            rhs_x = -r_d
-
-        if mI == 0:
-            dx, dnu = self.solve_KKT(W, rhs_x, JE, r_pE)
-            ds = np.zeros(0)
-            dlam = np.zeros(0)
-        else:
-            if bool(getattr(self.cfg, "ip_match_ref_form", True)):
-                dx, dnu = self.solve_KKT(W, rhs_x, JE, r_pE)
-                JI_dx = (JI @ dx) if not _isspm(JI) else JI.dot(dx)
-                ds = -r_pI - JI_dx
-                dlam = -(lmb - mu / s) - (mu / (s**2)) * ds
-            else:
-                dx_aff, dnu_aff = self.solve_KKT(W, rhs_x_aff, JE, r_pE)
-                JI_dx_aff = (JI @ dx_aff) if not _isspm(JI) else JI.dot(dx_aff)
-                ds_aff = -r_pI - JI_dx_aff
-                dl_aff = (lmb / s) * (r_pI + JI_dx_aff) - lmb
-                a_p_aff = self._max_step_ftb(
-                    s, ds_aff, float(getattr(self.cfg, "ip_tau", 0.995))
-                )
-                a_d_aff = self._max_step_ftb(
-                    lmb, dl_aff, float(getattr(self.cfg, "ip_tau", 0.995))
-                )
-                mu_aff = ((s + a_p_aff * ds_aff) @ (lmb + a_d_aff * dl_aff)) / max(
-                    1, mI
-                )
-                sigma = (mu_aff / max(mu, 1e-16)) ** float(
-                    getattr(self.cfg, "ip_sigma_power", 3.0)
-                )
-                rhs_corr = (lmb / s) * r_pI + ((sigma * mu) / s - lmb)
-                rhs_x = -r_d - (
-                    (JI.T @ rhs_corr) if _isspm(JI) else (np.asarray(JI).T @ rhs_corr)
-                )
-                dx, dnu = self.solve_KKT(W, rhs_x, JE, r_pE)
-                JI_dx = (JI @ dx) if not _isspm(JI) else JI.dot(dx)
-                ds = -r_pI - JI_dx
-                dlam = (lmb / s) * (r_pI + JI_dx) + ((sigma * mu) / s - lmb)
-
-        # -------------------- fraction-to-boundary & LS --------------------
-        a_p = (
-            self._max_step_ftb(s, ds, float(getattr(self.cfg, "ip_tau", 0.995)))
-            if mI > 0
-            else 1.0
+        err_mu = max(
+            np.linalg.norm(r_d, np.inf) / s_d,
+            np.linalg.norm(r_pE, np.inf) if mE > 0 else 0.0,
+            np.linalg.norm(r_pI, np.inf) if mI > 0 else 0.0,
+            np.linalg.norm(r_comp_x, np.inf) / s_c,
+            np.linalg.norm(r_comp_s, np.inf) / s_c,
         )
-        a_d = (
-            self._max_step_ftb(lmb, dlam, float(getattr(self.cfg, "ip_tau", 0.995)))
-            if mI > 0
-            else 1.0
-        )
-        alpha_max = float(min(float(getattr(self.cfg, "ip_alpha_max", 1.0)), a_p, a_d))
+        err_0 = self._compute_error(model, x, lmb, nuv, z, 0.0)  # E_0 for convergence
 
-        ls_iters = 0
-        if (self.ls is not None) and (mI > 0):
-            theta0 = theta
-            alpha, ls_iters, _needs_restoration = self.ls.search_ip(
-                model=model,
-                x=x,
-                dx=dx,
-                ds=ds,
-                s=s,
-                mu=mu,
-                theta0=theta0,
-                alpha_max=alpha_max,
-            )
-        else:
-            # fallback simple Armijo on φ
-            alpha = alpha_max
-            phi0 = float(
-                f
-                - mu * (np.sum(np.log(np.maximum(s, 1e-16))) if s.size else 0.0)
-                + rho
-                * (
-                    (np.sum(np.abs(cE)) if cE.size else 0.0)
-                    + (np.sum(np.abs(cI + s)) if (cI.size or s.size) else 0.0)
-                )
-            )
-            dphi = float(g @ dx) + (rho * float(np.sum(np.abs(cE))) if cE.size else 0.0)
-            for _ in range(int(getattr(self.cfg, "ip_ls_max", 25))):
-                if alpha < float(getattr(self.cfg, "ip_alpha_min", 1e-10)):
-                    break
-                s_trial = s + alpha * ds if mI > 0 else s
-                if mI > 0 and np.any(s_trial <= 0):
-                    alpha *= float(getattr(self.cfg, "ip_alpha_backtrack", 0.5))
-                    ls_iters += 1
-                    continue
-                x_trial = x + alpha * dx
-                dt = model.eval_all(x_trial, components=["f", "cI", "cE"])
-                f_t = float(dt["f"])
-                cI_t = (
-                    np.zeros(mI)
-                    if (mI == 0 or dt["cI"] is None)
-                    else np.asarray(dt["cI"], float)
-                )
-                cE_t = (
-                    np.zeros(mE)
-                    if (mE == 0 or dt["cE"] is None)
-                    else np.asarray(dt["cE"], float)
-                )
-                phi_t = float(
-                    f_t
-                    - mu
-                    * (
-                        np.sum(np.log(np.maximum(s_trial, 1e-16)))
-                        if s_trial.size
-                        else 0.0
-                    )
-                    + rho
-                    * (
-                        (np.sum(np.abs(cE_t)) if cE_t.size else 0.0)
-                        + (
-                            np.sum(np.abs(cI_t + s_trial))
-                            if (cI_t.size or s_trial.size)
-                            else 0.0
-                        )
-                    )
-                )
-                if (
-                    phi_t
-                    <= phi0
-                    + float(getattr(self.cfg, "ip_armijo_coeff", 1e-4)) * alpha * dphi
-                ):
-                    break
-                alpha *= float(getattr(self.cfg, "ip_alpha_backtrack", 0.5))
-                ls_iters += 1
-
-        # -------------------- α == 0 : try SOC rescue, or null-accept μ --------------------
-        if alpha <= 0.0:
-            # Attempt SOC rescue if enabled
-            if (
-                use_soc
-                and (soc_when == "after_ls_reject")
-                and (getattr(self, "soc", None) is not None)
-            ):
-                # predictions for Funnel/Filter
-                pred_df = max(0.0, float(-(g @ dx)))
-
-                def theta_lin_unit():
-                    cE_lin = (
-                        (cE + (JE @ dx if (mE > 0 and JE is not None) else 0.0))
-                        if (mE > 0)
-                        else None
-                    )
-                    inc_I = JI @ dx if (mI > 0 and JI is not None) else 0.0
-                    rI_lin = (cI + s + inc_I + ds) if (mI > 0) else None
-                    thE = float(np.sum(np.abs(cE_lin))) if cE_lin is not None else 0.0
-                    thI = float(np.sum(np.abs(rI_lin))) if rI_lin is not None else 0.0
-                    return thE + thI
-
-                pred_dtheta = max(0.0, theta - theta_lin_unit())
-
-                corr, needs_rest = self.soc.compute_correction(
-                    model=model,
-                    x_trial=x,
-                    Delta=Delta,
-                    s=(s if mI > 0 else None),
-                    mu=mu,
-                    funnel=getattr(self, "funnel", None),
-                    filter=(
-                        None
-                        if getattr(self, "funnel", None) is not None
-                        else getattr(self, "filter", None)
-                    ),
-                    theta0=theta,
-                    f0=f,
-                    pred_df=pred_df,
-                    pred_dtheta=pred_dtheta,
-                )
-                if (np.linalg.norm(corr) > 0.0) and (not needs_rest):
-                    # Accept SOC correction as the step
-                    x_new = x + corr
-                    s_new = s
-                    if mI > 0 and s.size > 0:
-                        inc_I = (JI @ corr) if (JI is not None) else 0.0
-                        s_new = s - (cI + inc_I)  # keep rI ≈ 0 around x
-                        if np.any(
-                            s_new <= 0.0
-                        ):  # stay interior; drop slack update if needed
-                            s_new = s
-                    l_new, nu_new = lmb, nuv  # multipliers unchanged on rescue
-
-                    # μ schedule after accepted move
-                    if mI > 0:
-                        mu_cand = float(s_new @ l_new) / max(1, mI)
-                        mu = max(
-                            getattr(self.cfg, "ip_mu_min", 1e-12),
-                            min(mu, 0.9 * mu_cand),
-                        )
-                    if (it + 1) % int(getattr(self.cfg, "ip_mu_reduce_every", 10)) == 0:
-                        mu = max(
-                            getattr(self.cfg, "ip_mu_min", 1e-12),
-                            float(getattr(self.cfg, "ip_mu_reduce", 0.2)) * mu,
-                        )
-
-                    # pack and return
-                    kkt = model.kkt_residuals(x_new, l_new, nu_new)
-                    conv = (
-                        kkt["stat"] <= getattr(self.cfg, "tol_stat", 1e-8)
-                        and kkt["ineq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-                        and kkt["eq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-                        and kkt["comp"] <= getattr(self.cfg, "tol_comp", 1e-8)
-                        and mu <= getattr(self.cfg, "ip_mu_min", 1e-12)
-                    )
-                    theta_new = model.constraint_violation(x_new)
-                    f_new = float(model.eval_all(x_new, components=["f"])["f"])
-                    info = self._pack_info(
-                        step_norm=float(np.linalg.norm(x_new - x)),
-                        accepted=True,
-                        converged=conv,
-                        f=f_new,
-                        theta=theta_new,
-                        kkt=kkt,
-                        alpha=0.0,
-                        rho=0.0,
-                        mu=mu,
-                    )
-                    info["ls_iters"] = ls_iters
-                    # write back
-                    st.s, st.lam, st.nu, st.mu = s_new, l_new, nu_new, mu
-                    return x_new, l_new, nu_new, info
-
-            # Null-accept path to advance μ when already small KKT
-            kkt_now = model.kkt_residuals(x, lmb, nuv)
-            kkt_ok = (
-                kkt_now["stat"] <= getattr(self.cfg, "tol_stat", 1e-8)
-                and kkt_now["ineq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-                and kkt_now["eq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-                and kkt_now["comp"] <= getattr(self.cfg, "tol_comp", 1e-8)
-            )
-            if allow_null_accept and kkt_ok:
-                # progress μ even without a move
-                if mI > 0:
-                    mu_cand = float(s @ lmb) / max(1, mI)
-                    mu = max(
-                        getattr(self.cfg, "ip_mu_min", 1e-12), min(mu, 0.9 * mu_cand)
-                    )
-                if (it + 1) % int(getattr(self.cfg, "ip_mu_reduce_every", 10)) == 0:
-                    mu = max(
-                        getattr(self.cfg, "ip_mu_min", 1e-12),
-                        float(getattr(self.cfg, "ip_mu_reduce", 0.2)) * mu,
-                    )
-
-                # check full convergence with μ
-                conv = (
-                    kkt_now["stat"] <= getattr(self.cfg, "tol_stat", 1e-8)
-                    and kkt_now["ineq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-                    and kkt_now["eq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-                    and kkt_now["comp"] <= getattr(self.cfg, "tol_comp", 1e-8)
-                    and mu <= getattr(self.cfg, "ip_mu_min", 1e-12)
-                )
-                info = self._pack_info(
-                    step_norm=0.0,
-                    accepted=True,
-                    converged=conv,
-                    f=float(model.eval_all(x, components=["f"])["f"]),
-                    theta=model.constraint_violation(x),
-                    kkt=kkt_now,
-                    alpha=0.0,
-                    rho=0.0,
-                    mu=mu,
-                )
-                info["ls_iters"] = ls_iters
-                st.s, st.lam, st.nu, st.mu = s, lmb, nuv, mu
-                return x, lmb, nuv, info
-
-            # Otherwise: reject as before
+        # Convergence checks
+        tol = getattr(self.cfg, "tol", 1e-8)
+        if err_0 <= tol:
             info = self._pack_info(
                 step_norm=0.0,
-                accepted=False,
-                converged=False,
+                accepted=True,
+                converged=True,
                 f=f,
                 theta=theta,
-                kkt={"stat": stat, "ineq": feasI, "eq": feasE, "comp": comp},
+                kkt={
+                    "stat": np.linalg.norm(r_d, np.inf),
+                    "ineq": np.linalg.norm(np.maximum(0, -cI), np.inf),
+                    "eq": np.linalg.norm(cE, np.inf),
+                    "comp": np.linalg.norm(r_comp_x, np.inf)
+                    + np.linalg.norm(r_comp_s, np.inf),
+                },
                 alpha=0.0,
                 rho=0.0,
                 mu=mu,
+                ls_iters=0,
             )
-            info["ls_iters"] = ls_iters
             return x, lmb, nuv, info
 
-        # -------------------- α > 0 : form trial; optional SOC polish --------------------
-        x_trial = x + alpha * dx
-        s_trial = s + alpha * ds if mI > 0 else s
-        l_trial = lmb + alpha * dlam if mI > 0 else lmb
-        nu_trial = nuv + alpha * dnu if mE > 0 else nuv
-
-        if (
-            use_soc
-            and (soc_when == "after_ls_accept")
-            and (getattr(self, "soc", None) is not None)
-        ):
-            # predictions based on accepted step (scale by α)
-            pred_df = max(0.0, float(-(g @ dx))) * float(alpha)
-
-            def theta_lin_scaled(v_dx, v_ds):
-                cE_lin = (
-                    (cE + (JE @ v_dx if (mE > 0 and JE is not None) else 0.0))
-                    if (mE > 0)
-                    else None
-                )
-                inc_I = JI @ v_dx if (mI > 0 and JI is not None) else 0.0
-                rI_lin = (
-                    (cI + s + inc_I + (v_ds if mI > 0 else 0.0)) if (mI > 0) else None
-                )
-                thE = float(np.sum(np.abs(cE_lin))) if cE_lin is not None else 0.0
-                thI = float(np.sum(np.abs(rI_lin))) if rI_lin is not None else 0.0
-                return thE + thI
-
-            theta_pred = theta_lin_scaled(alpha * dx, alpha * ds if mI > 0 else 0.0)
-            pred_dtheta = max(0.0, theta - theta_pred)
-
-            corr, needs_rest = self.soc.compute_correction(
-                model=model,
-                x_trial=x_trial,
-                Delta=Delta,
-                s=(s_trial if mI > 0 else None),
-                mu=mu,
-                funnel=getattr(self, "funnel", None),
-                filter=(
-                    None
-                    if getattr(self, "funnel", None) is not None
-                    else getattr(self, "filter", None)
-                ),
-                theta0=model.constraint_violation(x_trial),
-                f0=float(model.eval_all(x_trial, components=["f"])["f"]),
-                pred_df=pred_df,
-                pred_dtheta=pred_dtheta,
+        # Update mu if tolerance met (7)
+        if err_mu <= self.cfg.ip_kappa_eps * mu:
+            mu_new = max(
+                tol / 10, min(self.cfg.ip_kappa_mu * mu, mu**self.cfg.ip_theta_mu)
             )
-            if (np.linalg.norm(corr) > 0.0) and (not needs_rest):
-                x_trial = x_trial + corr
-                if mI > 0 and s_trial.size > 0:
-                    # keep rI ≈ 0 around pre-polish point using JI @ corr
-                    inc_I = (JI @ corr) if (JI is not None) else 0.0
-                    s_trial = s_trial - inc_I
-                    if np.any(s_trial <= 0.0):  # keep interior
-                        s_trial = s_trial + inc_I  # undo
+            st.mu = mu_new
+            self.filter = Filter(self.cfg)  # Reset filter
+            tau = max(self.cfg.ip_tau_min, 1 - mu_new)
+            mu = mu_new
 
-        # -------------------- accept, update μ, check convergence --------------------
-        st.s, st.lam, st.nu = s_trial, l_trial, nu_trial
+        # Solve barrier problem (11)
+        Sigma_x = z / x  # Diagonal for bounds
+        Sigma_s = lmb / s if mI > 0 else np.zeros(0)  # Diagonal for slacks
+        W = H + _diag(Sigma_x) + (JI.T @ _diag(Sigma_s) @ JI if mI > 0 else 0)
+        rhs_x = -r_d
+        dx, dnu = self.solve_KKT(W, rhs_x, JE, r_pE)
+        ds = -r_pI - (JI @ dx if JI is not None else 0) if mI > 0 else np.zeros(0)
+        dlam = (
+            -(lmb - mu / s) - (mu / (s**2) * ds) if mI > 0 else np.zeros(0)
+        )  # Adjust for reference mode
+        dz = mu / x - z - (z / x * dx)
 
-        if mI > 0:
-            mu_cand = float(st.s @ st.lam) / max(1, mI)
-            mu = max(getattr(self.cfg, "ip_mu_min", 1e-12), min(mu, 0.9 * mu_cand))
-        if (it + 1) % int(getattr(self.cfg, "ip_mu_reduce_every", 10)) == 0:
-            mu = max(
-                getattr(self.cfg, "ip_mu_min", 1e-12),
-                float(getattr(self.cfg, "ip_mu_reduce", 0.2)) * mu,
-            )
+        # Fraction-to-boundary step sizes (15)
+        alpha_max_x = self._max_step_ftb(x, dx, tau)
+        alpha_max_z = self._max_step_ftb(z, dz, tau)
+        alpha_max_s = self._max_step_ftb(s, ds, tau) if mI > 0 else 1.0
+        alpha_max = min(alpha_max_x, alpha_max_s)
 
-        # pack
-        kkt = model.kkt_residuals(x_trial, l_trial, nu_trial)
-        theta_new = model.constraint_violation(x_trial)
-        f_new = float(model.eval_all(x_trial, components=["f"])["f"])
-        conv = (
-            kkt["stat"] <= getattr(self.cfg, "tol_stat", 1e-8)
-            and kkt["ineq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-            and kkt["eq"] <= getattr(self.cfg, "tol_feas", 1e-8)
-            and kkt["comp"] <= getattr(self.cfg, "tol_comp", 1e-8)
-            and mu <= getattr(self.cfg, "ip_mu_min", 1e-12)
+        # Barrier objective and gradient
+        phi_0 = f - mu * (
+            np.sum(np.log(x)) + np.sum(np.log(s)) if mI > 0 else np.sum(np.log(x))
+        )
+        grad_phi = g - mu / x  # Approximate ∇ϕ_μ
+        d_phi = grad_phi @ dx
+
+        # Filter line-search (Section 2.3)
+        alpha = alpha_max
+        ls_iters = 0
+        gamma_theta, gamma_phi, delta, s_theta, s_phi, eta_phi = (
+            self.cfg.ip_gamma_theta,
+            self.cfg.ip_gamma_phi,
+            self.cfg.ip_delta,
+            self.cfg.ip_s_theta,
+            self.cfg.ip_s_phi,
+            self.cfg.ip_eta_phi,
+        )
+        alpha, ls_iters, needs_restoration = self.ls.search_ip(
+            model=model,
+            x=x,
+            dx=dx,
+            ds=ds,
+            s=s,
+            mu=mu,
+            d_phi=d_phi,
+            theta0=theta,
+            alpha_max=alpha_max
+        )
+        
+        # Second-order correction if first trial would increase theta (Section 2.4)
+        if ls_iters == 0 and alpha == 0.0 and needs_restoration:
+            for soc_iter in range(self.cfg.ip_pmax_soc):
+                cE_soc = cE + (JE @ dx if JE is not None else 0) if mE > 0 else np.zeros(0)
+                cI_soc = cI + (JI @ dx if JI is not None else 0) if mI > 0 else np.zeros(0)
+                rhs_soc = -np.concatenate([cE_soc, cI_soc]) if mE + mI > 0 else np.zeros(0)
+                dx_soc, _ = self.solve_KKT(W, rhs_soc[:n], JE, rhs_soc[n:] if mE > 0 else None)
+                alpha_soc = self._max_step_ftb(x, dx + dx_soc, tau)
+                x_soc = x + alpha_soc * (dx + dx_soc)
+                theta_soc = model.constraint_violation(x_soc)
+                if theta_soc < theta:
+                    dx = dx + dx_soc  # Update direction
+                    alpha, ls_iters, needs_restoration = self.ls.search_ip(
+                        model=model,
+                        x=x,
+                        dx=dx,
+                        ds=ds,
+                        s=s,
+                        mu=mu,
+                        theta0=theta,
+                        alpha_max=alpha_soc
+                    )
+                    break
+                if soc_iter == self.cfg.ip_pmax_soc - 1:
+                    break
+
+        # Handle restoration if needed
+        if alpha == 0.0 and needs_restoration:
+            try:
+                x_new = self._feasibility_restoration(model, x, mu, self.filter)
+                # Recompute multipliers (approximate)
+                data_new = model.eval_all(x_new, ["g", "cI", "JI", "cE", "JE"])
+                g_new = data_new["g"]
+                JI_new = data_new["JI"]
+                JE_new = data_new["JE"]
+                cI_new = data_new["cI"]
+                cE_new = data_new["cE"]
+                lmb_new = np.maximum(1e-8, lmb) if mI > 0 else lmb
+                nu_new = np.zeros(mE) if mE > 0 else nuv
+                z_new = np.maximum(1e-8, z)  # Reset z
+                info = self._pack_info(
+                    step_norm=np.linalg.norm(x_new - x), accepted=True, converged=False,
+                    f=model.eval_all(x_new, ["f"])["f"], theta=model.constraint_violation(x_new),
+                    kkt={}, alpha=0.0, rho=0.0, mu=mu, ls_iters=ls_iters
+                )
+                st.s, st.lam, st.nu, st.z = s, lmb_new, nu_new, z_new
+                return x_new, lmb_new, nu_new, info
+            except ValueError as e:
+                # Infeasibility detected
+                info = self._pack_info(
+                    step_norm=0.0, accepted=False, converged=False, f=f, theta=theta,
+                    kkt={"stat": safe_inf_norm(r_d), "ineq": safe_inf_norm(np.maximum(0, -cI)),
+                        "eq": safe_inf_norm(cE), "comp": safe_inf_norm(r_comp_x) + safe_inf_norm(r_comp_s)},
+                    alpha=0.0, rho=0.0, mu=mu, ls_iters=ls_iters
+                )
+                info["error"] = str(e)
+                return x, lmb, nuv, info
+            
+        # Accept step
+        x_new = x + alpha * dx
+        s_new = s + alpha * ds if mI > 0 else s
+        lmb_new = lmb + alpha * dlam if mI > 0 else lmb
+        nu_new = nuv + alpha * dnu if mE > 0 else nuv
+        z_new = z + min(alpha, alpha_max_z) * dz
+        # Apply z correction (16)
+        z_new = np.maximum(
+            mu / self.cfg.ip_kappa_sigma / x_new,
+            np.minimum(z_new, self.cfg.ip_kappa_sigma * mu / x_new),
         )
 
+        # # Update filter (22)
+        # if not (
+        #     theta <= theta_min
+        #     and switching
+        #     and phi_trial <= phi_0 + eta_phi * alpha * d_phi
+        # ):
+        #     self.filter.add_if_acceptable((1 - gamma_theta) * theta, phi_0 - gamma_phi * theta)
+
+        # Compute new residuals and check convergence
+        data_new = model.eval_all(x_new, ["f", "cI", "cE"])
+        f_new = float(data_new["f"])
+        cI_new = np.asarray(data_new["cI"], float) if mI > 0 else np.zeros(0)
+        cE_new = np.asarray(data_new["cE"], float) if mE > 0 else np.zeros(0)
+        theta_new = model.constraint_violation(x_new)
+        r_d_new = (
+            g
+            + (JI.T @ lmb_new if JI is not None else 0)
+            + (JE.T @ nu_new if JE is not None else 0)
+            - z_new
+        )
+        r_comp_x_new = x_new * z_new
+        r_comp_s_new = s_new * lmb_new if mI > 0 else np.zeros(0)
+        kkt_new = {
+            "stat": np.linalg.norm(r_d_new, np.inf),
+            "ineq": np.linalg.norm(np.maximum(0, -cI_new), np.inf) if mI > 0 else 0.0,
+            "eq": np.linalg.norm(cE_new, np.inf) if mE > 0 else 0.0,
+            "comp": np.linalg.norm(r_comp_x_new, np.inf)
+            + np.linalg.norm(r_comp_s_new, np.inf),
+        }
+        converged = (
+            kkt_new["stat"] <= tol
+            and kkt_new["ineq"] <= tol
+            and kkt_new["eq"] <= tol
+            and kkt_new["comp"] <= tol
+            and mu <= tol / 10
+        )
+
+        # Pack info
         info = self._pack_info(
-            step_norm=float(np.linalg.norm(x_trial - x)),
+            step_norm=np.linalg.norm(x_new - x),
             accepted=True,
-            converged=conv,
+            converged=converged,
             f=f_new,
             theta=theta_new,
-            kkt=kkt,
+            kkt=kkt_new,
             alpha=alpha,
             rho=0.0,
             mu=mu,
+            #ls_iters=ls_iters,
         )
-        info["ls_iters"] = ls_iters
-
-        st.mu = mu
-        return x_trial, l_trial, nu_trial, info
+        st.s, st.lam, st.nu, st.z, st.mu = s_new, lmb_new, nu_new, z_new, mu
+        return x_new, lmb_new, nu_new, info
 
     # -------------- helpers --------------
     @staticmethod

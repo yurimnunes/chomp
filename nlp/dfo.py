@@ -221,6 +221,8 @@ class DFOExactPenaltyStepper:
         else:
             state.radius = max(tr_min, float(Delta_new))
             curR = state.radius
+            
+        self.core.trmodel.radius  = curR
 
         # Update state
         x_out = x_trial if accepted else x

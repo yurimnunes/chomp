@@ -29,6 +29,7 @@ from scipy.sparse.linalg import (
 # Optional advanced preconditioners
 try:
     import pyamg
+
     HAS_PYAMG = True
 except ImportError:
     HAS_PYAMG = False
@@ -38,9 +39,11 @@ except ImportError:
 # Data structures (unchanged)
 # ======================================
 
+
 @dataclass
 class RegInfo:
     """Summary of a regularization pass."""
+
     mode: str
     sigma: float
     cond_before: float
@@ -63,127 +66,134 @@ class RegInfo:
 # Preconditioning Infrastructure
 # ======================================
 
+
 class PreconditionerFactory:
     """Factory for creating various types of preconditioners."""
-    
+
     @staticmethod
     def create_ilu_preconditioner(
-        H: sp.spmatrix, 
-        drop_tol: float = 1e-4, 
+        H: sp.spmatrix,
+        drop_tol: float = 1e-4,
         fill_factor: int = 10,
-        shift: float = 1e-8
+        shift: float = 1e-8,
     ) -> LinearOperator:
         """Create ILU(0) preconditioner with optional shift for stability."""
         import time
+
         start_time = time.time()
-        
+
         try:
             # Add small shift to improve diagonal dominance
             H_shifted = H + shift * sp.eye(H.shape[0], format=H.format)
-            
+
             # Convert to CSC for better factorization performance
             H_csc = H_shifted.tocsc()
-            
+
             # Compute incomplete LU factorization
             ilu = spilu(H_csc, drop_tol=drop_tol, fill_factor=fill_factor)
-            
+
             def matvec(x):
                 return ilu.solve(x)
-            
+
             def rmatvec(x):
                 return ilu.solve(x)  # Symmetric case
-            
+
             setup_time = time.time() - start_time
             logging.debug(f"ILU preconditioner setup in {setup_time:.3f}s")
-            
+
             precond = LinearOperator(
                 H.shape, matvec=matvec, rmatvec=rmatvec, dtype=H.dtype
             )
             precond.setup_time = setup_time
             return precond
-            
+
         except Exception as e:
             logging.warning(f"ILU preconditioner failed: {e}. Using identity.")
             return LinearOperator(H.shape, matvec=lambda x: x)
-    
+
     @staticmethod
     def create_amg_preconditioner(H: sp.spmatrix) -> Optional[LinearOperator]:
         """Create algebraic multigrid preconditioner (requires pyamg)."""
         if not HAS_PYAMG:
             return None
-            
+
         import time
+
         start_time = time.time()
-        
+
         try:
             # Ensure matrix is in CSR format for AMG
             H_csr = H.tocsr()
-            
+
             # Create AMG hierarchy (Ruge-Stuben classical AMG)
             ml = pyamg.ruge_stuben_solver(H_csr, max_levels=10, max_coarse=100)
-            
+
             def matvec(x):
-                return ml.solve(x, tol=1e-8, maxiter=1, cycle='V')
-            
+                return ml.solve(x, tol=1e-8, maxiter=1, cycle="V")
+
             setup_time = time.time() - start_time
             logging.debug(f"AMG preconditioner setup in {setup_time:.3f}s")
-            
+
             precond = LinearOperator(H.shape, matvec=matvec, dtype=H.dtype)
             precond.setup_time = setup_time
             return precond
-            
+
         except Exception as e:
             logging.warning(f"AMG preconditioner failed: {e}")
             return None
-    
+
     @staticmethod
     def create_shift_invert_operator(
-        H: Union[np.ndarray, sp.spmatrix], 
+        H: Union[np.ndarray, sp.spmatrix],
         sigma: float = 0.0,
-        solver_type: str = "spsolve"
+        solver_type: str = "spsolve",
     ) -> LinearOperator:
         """Create shift-and-invert operator (H - σI)^(-1) for eigenvalue problems."""
         import time
+
         start_time = time.time()
-        
+
         n = H.shape[0]
         is_sparse = sp.issparse(H)
-        
+
         if is_sparse:
             # Sparse shift-and-invert
             H_shifted = H - sigma * sp.eye(n, format=H.format)
-            
+
             if solver_type == "spsolve":
                 # Direct sparse solve
                 def matvec(x):
                     return spsolve(H_shifted, x)
+
             else:
                 # Iterative solve with preconditioning
                 precond = PreconditionerFactory.create_ilu_preconditioner(
                     H_shifted, drop_tol=1e-3
                 )
-                
+
                 def matvec(x):
                     sol, info = gmres(H_shifted, x, M=precond, tol=1e-8, maxiter=100)
                     if info != 0:
                         logging.warning(f"GMRES failed with info={info}")
                     return sol
+
         else:
             # Dense shift-and-invert
             try:
                 H_shifted = H - sigma * np.eye(n)
                 L, U = la.lu_factor(H_shifted)
-                
+
                 def matvec(x):
                     return la.lu_solve((L, U), x)
+
             except la.LinAlgError:
                 # Fallback to least squares
                 def matvec(x):
                     return la.lstsq(H_shifted, x)[0]
-        
+
         setup_time = time.time() - start_time
         logging.debug(f"Shift-invert operator setup in {setup_time:.3f}s")
-        
+
         op = LinearOperator(H.shape, matvec=matvec, dtype=H.dtype)
         op.setup_time = setup_time
         return op
@@ -192,6 +202,7 @@ class PreconditionerFactory:
 # ======================================
 # Enhanced Regularizer
 # ======================================
+
 
 class Regularizer:
     """
@@ -229,19 +240,27 @@ class Regularizer:
 
         # NEW: Preconditioning settings
         self.use_preconditioning = getattr(cfg, "use_preconditioning", True)
-        self.precond_type = getattr(cfg, "precond_type", "auto")  # 'auto', 'ilu', 'amg', 'shift_invert', 'none'
+        self.precond_type = getattr(
+            cfg, "precond_type", "auto"
+        )  # 'auto', 'ilu', 'amg', 'shift_invert', 'none'
         self.ilu_drop_tol = getattr(cfg, "ilu_drop_tol", 1e-4)
         self.ilu_fill_factor = getattr(cfg, "ilu_fill_factor", 10)
-        self.amg_threshold = getattr(cfg, "amg_threshold", 5000)  # Use AMG for matrices larger than this
-        self.shift_invert_mode = getattr(cfg, "shift_invert_mode", "buckling")  # 'normal', 'buckling', 'cayley'
-        self.adaptive_precond = getattr(cfg, "adaptive_precond", True)  # Switch preconditioners based on problem
+        self.amg_threshold = getattr(
+            cfg, "amg_threshold", 5000
+        )  # Use AMG for matrices larger than this
+        self.shift_invert_mode = getattr(
+            cfg, "shift_invert_mode", "buckling"
+        )  # 'normal', 'buckling', 'cayley'
+        self.adaptive_precond = getattr(
+            cfg, "adaptive_precond", True
+        )  # Switch preconditioners based on problem
 
         # Preconditioning telemetry
         self.precond_stats = {
             "setup_times": [],
             "solve_iterations": [],
             "convergence_failures": 0,
-            "type_switches": 0
+            "type_switches": 0,
         }
 
     # --------------------------- Enhanced matrix analysis ---------------------------
@@ -252,10 +271,10 @@ class Regularizer:
         is_sparse = sp.issparse(H)
         density = (H.nnz / (n * n)) if is_sparse else 1.0
         use_iterative = is_sparse or (n > 500 and density < 0.1)
-        
+
         # Determine preconditioner strategy
         precond_type = self._select_preconditioner_type(H, n, density)
-        
+
         try:
             if use_iterative:
                 return self._analyze_matrix_iterative(H, precond_type)
@@ -265,17 +284,19 @@ class Regularizer:
             logging.warning(f"Enhanced matrix analysis failed: {e}. Using fallback.")
             return self._fallback_analysis(H)
 
-    def _select_preconditioner_type(self, H: Union[np.ndarray, sp.spmatrix], n: int, density: float) -> str:
+    def _select_preconditioner_type(
+        self, H: Union[np.ndarray, sp.spmatrix], n: int, density: float
+    ) -> str:
         """Automatically select the best preconditioning strategy."""
         if not self.use_preconditioning or self.precond_type == "none":
             return "none"
-        
+
         if self.precond_type != "auto":
             return self.precond_type
-        
+
         # Adaptive selection based on problem characteristics
         is_sparse = sp.issparse(H)
-        
+
         if not is_sparse or n < 100:
             return "none"  # Direct methods work fine
         elif n > self.amg_threshold and HAS_PYAMG and density < 0.1:
@@ -285,39 +306,60 @@ class Regularizer:
         else:
             return "shift_invert"  # Good for eigenvalue problems near zero
 
-    def _analyze_matrix_iterative(self, H: Union[np.ndarray, sp.spmatrix], precond_type: str) -> Dict:
+    def _analyze_matrix_iterative(
+        self, H: Union[np.ndarray, sp.spmatrix], precond_type: str
+    ) -> Dict:
         """Analyze matrix using preconditioned iterative methods."""
         n = H.shape[0]
         precond = None
         setup_time = 0.0
-        
+
         # Create preconditioner
         if precond_type == "ilu":
             precond = PreconditionerFactory.create_ilu_preconditioner(
                 H, self.ilu_drop_tol, self.ilu_fill_factor, self.sigma
             )
-            setup_time = getattr(precond, 'setup_time', 0.0)
+            setup_time = getattr(precond, "setup_time", 0.0)
         elif precond_type == "amg":
             precond = PreconditionerFactory.create_amg_preconditioner(H)
-            setup_time = getattr(precond, 'setup_time', 0.0) if precond else 0.0
+            setup_time = getattr(precond, "setup_time", 0.0) if precond else 0.0
         elif precond_type == "shift_invert":
             # For eigenvalue problems, we'll use shift-invert in the eigsh call
             pass
-        
+
         try:
             if precond_type == "shift_invert":
                 # Use shift-and-invert for better convergence near zero
-                min_eig, min_vec = eigsh(H, k=1, sigma=0.0, mode=self.shift_invert_mode,
-                                       tol=self.iter_tol, maxiter=self.max_iter)
-                max_eig, max_vec = eigsh(H, k=1, which="LA", 
-                                       tol=self.iter_tol, maxiter=self.max_iter)
+                min_eig, min_vec = eigsh(
+                    H,
+                    k=1,
+                    sigma=0.0,
+                    mode=self.shift_invert_mode,
+                    tol=self.iter_tol,
+                    maxiter=self.max_iter,
+                )
+                max_eig, max_vec = eigsh(
+                    H, k=1, which="LA", tol=self.iter_tol, maxiter=self.max_iter
+                )
             else:
                 # Use regular preconditioned eigenvalue solve
-                min_eig, min_vec = eigsh(H, k=1, which="SA", M=precond,
-                                       tol=self.iter_tol, maxiter=self.max_iter)
-                max_eig, max_vec = eigsh(H, k=1, which="LA", M=precond,
-                                       tol=self.iter_tol, maxiter=self.max_iter)
-            
+                min_eig, min_vec = eigsh(
+                    H,
+                    k=1,
+                    which="SA",
+                    M=precond,
+                    tol=self.iter_tol,
+                    maxiter=self.max_iter,
+                )
+                max_eig, max_vec = eigsh(
+                    H,
+                    k=1,
+                    which="LA",
+                    M=precond,
+                    tol=self.iter_tol,
+                    maxiter=self.max_iter,
+                )
+
             min_eig = float(min_eig[0])
             max_eig = float(max_eig[0])
             cond_num = max_eig / max(abs(min_eig), 1e-16) if max_eig > 1e-16 else np.inf
@@ -325,25 +367,37 @@ class Regularizer:
             # Compute more eigenvalues for inertia/rank with preconditioning
             k_sample = min(self.k_eigs, n - 1)
             if precond_type == "shift_invert":
-                small_eigs, small_vecs = eigsh(H, k=k_sample, sigma=0.0, mode=self.shift_invert_mode,
-                                             tol=self.iter_tol, maxiter=self.max_iter)
+                small_eigs, small_vecs = eigsh(
+                    H,
+                    k=k_sample,
+                    sigma=0.0,
+                    mode=self.shift_invert_mode,
+                    tol=self.iter_tol,
+                    maxiter=self.max_iter,
+                )
             else:
-                small_eigs, small_vecs = eigsh(H, k=k_sample, which="SA", M=precond,
-                                             tol=self.iter_tol, maxiter=self.max_iter)
-            
+                small_eigs, small_vecs = eigsh(
+                    H,
+                    k=k_sample,
+                    which="SA",
+                    M=precond,
+                    tol=self.iter_tol,
+                    maxiter=self.max_iter,
+                )
+
             rank = n - int(np.sum(np.abs(small_eigs) < 1e-12))
             rank_def = n - rank
             pos_eigs = int(np.sum(small_eigs > 1e-12))
             neg_eigs = int(np.sum(small_eigs < -1e-12))
             zero_eigs = k_sample - pos_eigs - neg_eigs
-            
+
             # Extrapolate to full matrix (approximate)
             if k_sample < n:
                 remaining = n - k_sample
                 zero_eigs += remaining  # Conservative estimate
-            
+
             self.precond_stats["setup_times"].append(setup_time)
-            
+
             return {
                 "eigvals": small_eigs,
                 "eigvecs": small_vecs,
@@ -357,37 +411,53 @@ class Regularizer:
                 "precond_type": precond_type,
                 "precond_setup_time": setup_time,
             }
-            
+
         except ArpackNoConvergence as e:
             self.precond_stats["convergence_failures"] += 1
             logging.warning(f"Preconditioned eigensolve failed: {e}. Trying fallback.")
-            
+
             # Try with relaxed tolerance and different preconditioner
             if precond_type != "none" and self.adaptive_precond:
                 self.precond_stats["type_switches"] += 1
-                return self._analyze_matrix_iterative(H, "none")  # Fallback to no preconditioning
+                return self._analyze_matrix_iterative(
+                    H, "none"
+                )  # Fallback to no preconditioning
             else:
                 # Last resort: very relaxed solve
-                min_eig, _ = eigsh(H, k=1, which="SA", tol=self.iter_tol * 100, maxiter=self.max_iter * 3)
-                max_eig, _ = eigsh(H, k=1, which="LA", tol=self.iter_tol * 100, maxiter=self.max_iter * 3)
-                return self._create_basic_analysis(float(min_eig[0]), float(max_eig[0]), n, precond_type)
+                min_eig, _ = eigsh(
+                    H,
+                    k=1,
+                    which="SA",
+                    tol=self.iter_tol * 100,
+                    maxiter=self.max_iter * 3,
+                )
+                max_eig, _ = eigsh(
+                    H,
+                    k=1,
+                    which="LA",
+                    tol=self.iter_tol * 100,
+                    maxiter=self.max_iter * 3,
+                )
+                return self._create_basic_analysis(
+                    float(min_eig[0]), float(max_eig[0]), n, precond_type
+                )
 
     def _analyze_matrix_direct(self, H: Union[np.ndarray, sp.spmatrix]) -> Dict:
         """Direct eigenvalue analysis for small/dense matrices."""
         H_dense = H if isinstance(H, np.ndarray) else H.toarray()
         eigvals, eigvecs = la.eigh(H_dense)
-        
+
         min_eig = float(np.min(eigvals))
         max_eig = float(np.max(eigvals))
         cond_num = max_eig / max(abs(min_eig), 1e-16) if max_eig > 1e-16 else np.inf
-        
+
         n = len(eigvals)
         rank = int(np.sum(np.abs(eigvals) > 1e-12))
         rank_def = n - rank
         pos_eigs = int(np.sum(eigvals > 1e-12))
         neg_eigs = int(np.sum(eigvals < -1e-12))
         zero_eigs = int(np.sum(np.abs(eigvals) <= 1e-12))
-        
+
         return {
             "eigvals": eigvals,
             "eigvecs": eigvecs,
@@ -402,10 +472,12 @@ class Regularizer:
             "precond_setup_time": 0.0,
         }
 
-    def _create_basic_analysis(self, min_eig: float, max_eig: float, n: int, precond_type: str) -> Dict:
+    def _create_basic_analysis(
+        self, min_eig: float, max_eig: float, n: int, precond_type: str
+    ) -> Dict:
         """Create minimal analysis when full eigendecomposition fails."""
         cond_num = max_eig / max(abs(min_eig), 1e-16) if max_eig > 1e-16 else np.inf
-        
+
         return {
             "eigvals": np.array([min_eig, max_eig]),
             "eigvecs": np.eye(n)[:, :2] if n >= 2 else np.eye(n),
@@ -453,8 +525,12 @@ class Regularizer:
                 # Use the same preconditioning strategy as in analysis
                 if precond_type == "shift_invert":
                     small_eigs, small_vecs = eigsh(
-                        H, k=self.k_eigs, sigma=0.0, mode=self.shift_invert_mode,
-                        tol=self.iter_tol, maxiter=self.max_iter
+                        H,
+                        k=self.k_eigs,
+                        sigma=0.0,
+                        mode=self.shift_invert_mode,
+                        tol=self.iter_tol,
+                        maxiter=self.max_iter,
                     )
                 elif precond_type in ["ilu", "amg"]:
                     if precond_type == "ilu":
@@ -463,17 +539,24 @@ class Regularizer:
                         )
                     else:
                         precond = PreconditionerFactory.create_amg_preconditioner(H)
-                    
+
                     small_eigs, small_vecs = eigsh(
-                        H, k=self.k_eigs, which="SA", M=precond,
-                        tol=self.iter_tol, maxiter=self.max_iter
+                        H,
+                        k=self.k_eigs,
+                        which="SA",
+                        M=precond,
+                        tol=self.iter_tol,
+                        maxiter=self.max_iter,
                     )
                 else:
                     small_eigs, small_vecs = eigsh(
-                        H, k=self.k_eigs, which="SA", 
-                        tol=self.iter_tol, maxiter=self.max_iter
+                        H,
+                        k=self.k_eigs,
+                        which="SA",
+                        tol=self.iter_tol,
+                        maxiter=self.max_iter,
                     )
-                
+
                 small_mask = small_eigs < threshold
                 if np.any(small_mask):
                     mod_eigs = np.where(small_mask, self.sigma, small_eigs)
@@ -487,9 +570,11 @@ class Regularizer:
                         H_reg = H + V @ np.diag(D) @ V.T
                 else:
                     H_reg = H
-                    
+
             except ArpackNoConvergence as e:
-                logging.warning(f"Preconditioned eigenvalue modification failed: {e}. Falling back to Tikhonov.")
+                logging.warning(
+                    f"Preconditioned eigenvalue modification failed: {e}. Falling back to Tikhonov."
+                )
                 return self._adaptive_tikhonov(H, analysis)
         else:
             # Use direct method for small matrices
@@ -503,7 +588,7 @@ class Regularizer:
 
         post = self._analyze_matrix(H_reg)
         nnz_after = H_reg.nnz if sp.issparse(H_reg) else H_reg.size
-        
+
         return H_reg, RegInfo(
             mode="EIGEN_MOD",
             sigma=self.sigma,
@@ -521,7 +606,7 @@ class Regularizer:
         )
 
     # --------------------------- Rest of the methods remain the same ---------------------------
-    # (regularize, _adapt_sigma, _inertia_correction, _spectral_regularization, 
+    # (regularize, _adapt_sigma, _inertia_correction, _spectral_regularization,
     #  _adaptive_tikhonov, get_statistics, reset, etc.)
 
     def regularize(
@@ -540,10 +625,17 @@ class Regularizer:
         n = H.shape[0]
         if n == 0:
             return H, RegInfo(
-                mode="TIKHONOV", sigma=0.0, cond_before=1.0, cond_after=1.0,
-                min_eig_before=1.0, min_eig_after=1.0, rank_def=0,
-                inertia_before=(0, 0, 0), inertia_after=(0, 0, 0),
-                nnz_before=0, nnz_after=0,
+                mode="TIKHONOV",
+                sigma=0.0,
+                cond_before=1.0,
+                cond_after=1.0,
+                min_eig_before=1.0,
+                min_eig_after=1.0,
+                rank_def=0,
+                inertia_before=(0, 0, 0),
+                inertia_after=(0, 0, 0),
+                nnz_before=0,
+                nnz_after=0,
             )
 
         # Ensure symmetry
@@ -571,7 +663,9 @@ class Regularizer:
             H_reg, info = self._eigenvalue_modification(H, analysis)
         elif self.mode == "INERTIA_FIX":
             if not (0 <= constraint_count < n):
-                raise ValueError(f"Invalid constraint_count {constraint_count}; must be in [0, {n-1}]")
+                raise ValueError(
+                    f"Invalid constraint_count {constraint_count}; must be in [0, {n-1}]"
+                )
             H_reg, info = self._inertia_correction(H, analysis, constraint_count)
         elif self.mode == "SPECTRAL":
             H_reg, info = self._spectral_regularization(H, analysis)
@@ -608,11 +702,17 @@ class Regularizer:
         if model_quality is not None and len(self.model_quality_history) > 0:
             k = min(3, len(self.model_quality_history))
             weights = np.exp(-np.arange(k) / 2.0)
-            recent_quality = float(np.average(self.model_quality_history[-k:], weights=weights[::-1]))
+            recent_quality = float(
+                np.average(self.model_quality_history[-k:], weights=weights[::-1])
+            )
             if model_quality < recent_quality * self.model_quality_threshold_low:
-                self.sigma = min(self.sigma_max, self.sigma * self.model_quality_factor_inc)
+                self.sigma = min(
+                    self.sigma_max, self.sigma * self.model_quality_factor_inc
+                )
             elif model_quality > recent_quality * self.model_quality_threshold_high:
-                self.sigma = max(self.sigma_min, self.sigma * self.model_quality_factor_dec)
+                self.sigma = max(
+                    self.sigma_min, self.sigma * self.model_quality_factor_dec
+                )
 
         if grad_norm is not None:
             self.sigma = max(self.sigma, 1e-6 * float(grad_norm))
@@ -636,8 +736,12 @@ class Regularizer:
                 # Use enhanced eigenvalue computation for negative spectrum
                 if precond_type == "shift_invert":
                     neg_eigs, neg_vecs = eigsh(
-                        H, k=target_neg + 10, sigma=-self.sigma, mode=self.shift_invert_mode,
-                        tol=self.iter_tol, maxiter=self.max_iter
+                        H,
+                        k=target_neg + 10,
+                        sigma=-self.sigma,
+                        mode=self.shift_invert_mode,
+                        tol=self.iter_tol,
+                        maxiter=self.max_iter,
                     )
                 elif precond_type in ["ilu", "amg"]:
                     if precond_type == "ilu":
@@ -646,17 +750,24 @@ class Regularizer:
                         )
                     else:
                         precond = PreconditionerFactory.create_amg_preconditioner(H)
-                    
+
                     neg_eigs, neg_vecs = eigsh(
-                        H, k=target_neg + 10, which="SA", M=precond,
-                        tol=self.iter_tol, maxiter=self.max_iter
+                        H,
+                        k=target_neg + 10,
+                        which="SA",
+                        M=precond,
+                        tol=self.iter_tol,
+                        maxiter=self.max_iter,
                     )
                 else:
                     neg_eigs, neg_vecs = eigsh(
-                        H, k=target_neg + 10, which="SA",
-                        tol=self.iter_tol, maxiter=self.max_iter
+                        H,
+                        k=target_neg + 10,
+                        which="SA",
+                        tol=self.iter_tol,
+                        maxiter=self.max_iter,
                     )
-                
+
                 current_neg = int(np.sum(neg_eigs < -1e-12))
                 if current_neg > target_neg:
                     excess = current_neg - target_neg
@@ -670,7 +781,9 @@ class Regularizer:
                 else:
                     H_reg = H
             except ArpackNoConvergence as e:
-                logging.warning(f"Preconditioned inertia correction failed: {e}. Falling back to Tikhonov.")
+                logging.warning(
+                    f"Preconditioned inertia correction failed: {e}. Falling back to Tikhonov."
+                )
                 return self._adaptive_tikhonov(H, analysis)
         else:
             # Direct method for small matrices (unchanged)
@@ -681,7 +794,9 @@ class Regularizer:
 
             eigvals_mod = eigvals_sorted.copy()
             neg_idx = np.where(eigvals_mod < 0)[0]
-            flip_count = min(len(neg_idx), target_pos - int(np.sum(eigvals_mod > self.sigma)))
+            flip_count = min(
+                len(neg_idx), target_pos - int(np.sum(eigvals_mod > self.sigma))
+            )
             if flip_count > 0:
                 eigvals_mod[neg_idx[-flip_count:]] = self.sigma
 
@@ -726,12 +841,16 @@ class Regularizer:
         is_sparse = sp.issparse(H)
         nnz_before = H.nnz if is_sparse else H.size
         precond_type = analysis.get("precond_type", "none")
-        
+
         try:
             if is_sparse or H.shape[0] > 500:
-                U, s, Vt = svds(H, k=self.k_eigs, tol=self.iter_tol, maxiter=self.max_iter)
+                U, s, Vt = svds(
+                    H, k=self.k_eigs, tol=self.iter_tol, maxiter=self.max_iter
+                )
             else:
-                U, s, Vt = la.svd(H if isinstance(H, np.ndarray) else H.toarray(), full_matrices=False)
+                U, s, Vt = la.svd(
+                    H if isinstance(H, np.ndarray) else H.toarray(), full_matrices=False
+                )
 
             s_reg = np.maximum(s, self.sigma)
             if self.target_cond < np.inf:
@@ -811,24 +930,32 @@ class Regularizer:
         """Enhanced telemetry including preconditioning statistics."""
         base_stats = {
             "current_sigma": self.sigma,
-            "avg_condition": float(np.mean(self.cond_history)) if self.cond_history else 0.0,
+            "avg_condition": (
+                float(np.mean(self.cond_history)) if self.cond_history else 0.0
+            ),
             "sigma_adaptations": len(self.sigma_history),
             "mode": self.mode,
             "sigma_range": (
-                (min(self.sigma_history), max(self.sigma_history)) if self.sigma_history else (0.0, 0.0)
+                (min(self.sigma_history), max(self.sigma_history))
+                if self.sigma_history
+                else (0.0, 0.0)
             ),
         }
-        
+
         # Add preconditioning statistics
         precond_stats = {
             "preconditioning_enabled": self.use_preconditioning,
             "current_precond_type": self.precond_type,
-            "avg_precond_setup_time": float(np.mean(self.precond_stats["setup_times"])) if self.precond_stats["setup_times"] else 0.0,
+            "avg_precond_setup_time": (
+                float(np.mean(self.precond_stats["setup_times"]))
+                if self.precond_stats["setup_times"]
+                else 0.0
+            ),
             "convergence_failures": self.precond_stats["convergence_failures"],
             "precond_type_switches": self.precond_stats["type_switches"],
             "total_precond_setups": len(self.precond_stats["setup_times"]),
         }
-        
+
         return {**base_stats, **precond_stats}
 
     def reset(self) -> None:
@@ -838,13 +965,13 @@ class Regularizer:
         self.model_quality_history.clear()
         self.success_history.clear()
         self.sigma = getattr(self.cfg, "reg_sigma", 1e-8)
-        
+
         # Reset preconditioning stats
         self.precond_stats = {
             "setup_times": [],
             "solve_iterations": [],
             "convergence_failures": 0,
-            "type_switches": 0
+            "type_switches": 0,
         }
 
     @staticmethod
@@ -861,6 +988,7 @@ class Regularizer:
 # Enhanced integration helper
 # ======================================
 
+
 def make_psd_advanced(
     H: Union[np.ndarray, sp.spmatrix],
     regularizer: Regularizer,
@@ -870,9 +998,12 @@ def make_psd_advanced(
 ) -> Tuple[Union[np.ndarray, sp.spmatrix], RegInfo]:
     """
     Convert H to a numerically PSD-usable matrix via the enhanced regularizer.
-    
+
     Now includes preconditioning telemetry in the returned RegInfo.
     """
     return regularizer.regularize(
-        H, iteration=iteration, model_quality=model_quality, constraint_count=constraint_count
+        H,
+        iteration=iteration,
+        model_quality=model_quality,
+        constraint_count=constraint_count,
     )

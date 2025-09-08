@@ -77,7 +77,7 @@ class LineSearcher:
         # descent test (allow tiny violations)
         if gTp >= -1e-12:
             logging.debug(f"Non-descent direction: gTp={gTp:.2e}")
-            return 0.0, 0, True
+            return 1.0, 0, True
 
         # nonmonotone reference
         if self.f_hist is not None:
@@ -148,15 +148,8 @@ class LineSearcher:
 
     # ----------------------------- IP (x,s) ------------------------------
     def search_ip(
-        self,
-        model: "Model",
-        x: np.ndarray,
-        dx: np.ndarray,
-        ds: np.ndarray,
-        s: np.ndarray,
-        mu: float,
-        theta0: float,
-        alpha_max: float = 1.0,
+        self, model: "Model", x: np.ndarray, dx: np.ndarray, ds: np.ndarray, s: np.ndarray,
+        mu: float, d_phi: float, theta0: float, alpha_max: float = 1.0,
     ) -> Tuple[float, int, bool]:
         """
         Interior-point line search with proper fraction-to-boundary handling:
@@ -169,151 +162,97 @@ class LineSearcher:
         f0 = float(d0["f"])
         g0 = d0["g"]
         cE0, cI0 = d0["cE"], d0["cI"]
-
+        dphi = d_phi
         if s is None or s.size == 0 or np.any(s <= 0.0):
-            return 0.0, 0, True
+            print(" Invalid slack variables at base point")
+            return 1.0, 0, True
 
         # φ0 and θ0
-        phi0 = float(f0 - mu * np.sum(np.log(np.maximum(s, 1e-16))))
+        phi0 = float(f0 - mu * np.sum(np.log(np.maximum(s, max(1e-8 * mu, 1e-16)))))
         if theta0 is None:
-            rI0 = (cI0 + s) if (cI0 is not None) else None
+            rI0 = (cI0 + s) if cI0 is not None else None
             thE = float(np.abs(cE0).sum()) if cE0 is not None else 0.0
             thI = float(np.abs(rI0).sum()) if rI0 is not None else 0.0
             theta0 = thE + thI
 
-        # dφ = g·dx - μ Σ ds_i/s_i
-        dphi = float(g0 @ dx) - float(mu * np.sum(ds / np.maximum(s, 1e-16)))
-
         # Descent check on barrier function
         if dphi >= -1e-12:
+            print(f" dphi={dphi:.2e} (no descent in barrier)")
             logging.debug(f"Non-descent direction in barrier: dphi={dphi:.2e}")
-            return 0.0, 0, True
+            return 1.0, 0, True
 
-        # Recalculate fraction-to-boundary to be safe
-        # Find maximum α such that s + α*ds ≥ τ*s for some safety factor τ
+        # Recalculate fraction-to-boundary (pre-compute alpha_max)
         tau = getattr(self.cfg, 'ip_fraction_to_boundary_tau', 0.995)
-        
         if ds is not None and np.any(ds < 0):
-            # For each i where ds[i] < 0, we need: s[i] + α*ds[i] ≥ τ*s[i]
-            # This gives: α ≤ (1-τ)*s[i] / (-ds[i])
             negative_ds_mask = ds < 0
             if np.any(negative_ds_mask):
                 alpha_bounds = (1 - tau) * s[negative_ds_mask] / (-ds[negative_ds_mask])
-                alpha_max_safe = float(np.min(alpha_bounds))
-                alpha_max = min(alpha_max, alpha_max_safe)
-        
-        # Ensure alpha_max is positive and reasonable
+                alpha_max = min(alpha_max, float(np.min(alpha_bounds)))
         alpha_max = max(alpha_max, 1e-16)
 
         # Predictions for Funnel (unit step)
         pred_df = max(0.0, float(-(g0 @ dx)))
-
         def theta_lin():
-            cE_lin = (
-                cE0 + (d0["JE"] @ dx if d0["JE"] is not None else 0.0)
-                if cE0 is not None
-                else None
-            )
+            cE_lin = (cE0 + (d0["JE"] @ dx if d0["JE"] is not None else 0.0) if cE0 is not None else None)
             inc_I = d0["JI"] @ dx if d0["JI"] is not None else 0.0
             rI_lin = (cI0 + s + inc_I + ds) if cI0 is not None else None
             thE = float(np.abs(cE_lin).sum()) if cE_lin is not None else 0.0
             thI = float(np.abs(rI_lin).sum()) if rI_lin is not None else 0.0
             return thE + thI
-
         theta_pred = theta_lin()
         pred_dtheta = max(0.0, theta0 - theta_pred)
 
-        # Start with the safe maximum step size
+        # Line search loop
         alpha = float(min(1.0, alpha_max))
-        min_alpha = self.cfg.ls_min_alpha * (1.0 + np.linalg.norm(x))
-
         it = 0
         while it < self.cfg.ls_max_iter:
-            # Ensure we don't exceed the fraction-to-boundary limit
-            alpha = min(alpha, alpha_max)
-            
-            # If alpha is too small, give up
-            if alpha < min_alpha:
-                break
-
             x_t = x + alpha * dx
             s_t = s + alpha * ds
-            
-            # Double-check slack variables are positive (should be guaranteed by alpha_max)
-            if np.any(s_t <= 1e-16):
-                logging.warning(f"Slack variables violated at α={alpha:.2e}, alpha_max={alpha_max:.2e}")
-                # This indicates a bug in fraction-to-boundary calculation
-                alpha *= 0.5  # Try smaller step
-                it += 1
-                continue
-
-            # Evaluate trial point
             try:
                 d_t = model.eval_all(x_t)
                 f_t = float(d_t["f"])
-                
-                # Check for numerical issues
                 if not np.isfinite(f_t):
                     alpha *= self.cfg.ls_backtrack
                     it += 1
                     continue
-                    
-                phi_t = float(f_t - mu * np.sum(np.log(np.maximum(s_t, 1e-16))))
-                
+                phi_t = float(f_t - mu * np.sum(np.log(np.maximum(s_t, max(1e-8 * mu, 1e-16)))))
                 if not np.isfinite(phi_t):
                     alpha *= self.cfg.ls_backtrack
                     it += 1
                     continue
-                    
             except Exception as e:
                 logging.debug(f"Model evaluation failed at α={alpha:.2e}: {e}")
                 alpha *= self.cfg.ls_backtrack
                 it += 1
                 continue
-
             # Armijo condition on φ
             armijo_ok = phi_t <= phi0 + self.cfg.ls_armijo_f * alpha * dphi
-
-            # Acceptability via Funnel/Filter on (θ,f) - NOT on φ
+            # Acceptability via Funnel/Filter on (θ,f)
             cE_t, cI_t = d_t["cE"], d_t["cI"]
-            rI_t = (cI_t + s_t) if (cI_t is not None) else None
+            rI_t = (cI_t + s_t) if cI_t is not None else None
             thE = float(np.abs(cE_t).sum()) if cE_t is not None else 0.0
             thI = float(np.abs(rI_t).sum()) if rI_t is not None else 0.0
             theta_t = thE + thI
-
             acceptable_ok = True
             if self.funnel is not None:
-                acceptable_ok = self.funnel.is_acceptable(
-                    theta0, f0, theta_t, f_t, pred_df, pred_dtheta
-                )
+                acceptable_ok = self.funnel.is_acceptable(theta0, f0, theta_t, f_t, pred_df, pred_dtheta)
             elif self.filter is not None:
                 acceptable_ok = self.filter.is_acceptable(theta_t, f_t)
-
-            # Accept step if both conditions satisfied
             if armijo_ok and acceptable_ok:
-                # Update nonmonotone history only when φ isn't used (SQP mode)
                 if self.f_hist is not None and mu <= 0.0:
                     self.f_hist.append(f_t)
                 if self.funnel is not None:
-                    self.funnel.add_if_acceptable(
-                        theta0, f0, theta_t, f_t, pred_df, pred_dtheta
-                    )
+                    self.funnel.add_if_acceptable(theta0, f0, theta_t, f_t, pred_df, pred_dtheta)
                 elif self.filter is not None:
                     self.filter.add_if_acceptable(theta_t, f_t)
                 return alpha, it, False
-
-            # Backtrack
             alpha *= self.cfg.ls_backtrack
             it += 1
 
-        # Line search failed
-        # Check if we need restoration (high constraint violation)
         needs_restoration = theta0 > getattr(self.cfg, "ls_theta_restoration", 1e3)
-        
-        # Log why we failed
-        if alpha < min_alpha:
-            logging.debug(f"Line search failed: step size {alpha:.2e} below minimum {min_alpha:.2e}")
+        print(f" Line search failed after {it} iters, alpha={alpha:.2e}, needs_restoration={needs_restoration}")
+        if alpha < self.cfg.ls_min_alpha * (1.0 + np.linalg.norm(x)):
+            logging.debug(f"Line search failed: step size {alpha:.2e} below minimum")
         else:
             logging.debug(f"Line search failed: maximum iterations {self.cfg.ls_max_iter} reached")
-        
-        return 0.0, it, needs_restoration
+        return 1.0, it, needs_restoration
