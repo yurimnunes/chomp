@@ -1,4 +1,4 @@
-<img src="logo.png" alt="logo" width="200"/>
+<img src="logo.png" alt="logo" width="400"/>
 
 # 🦖 CHOMP — *CHOMP Handles Optimization of Many Problems*
 
