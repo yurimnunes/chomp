@@ -81,18 +81,44 @@ target_link_libraries(ad PRIVATE fmt::fmt)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 
 
-    # Create Python module
-    pybind11_add_module(piqp_cpp src/piqp_bindings.cpp)
-    
-    # Link with Eigen
-    target_link_libraries(piqp_cpp PRIVATE Eigen3::Eigen)
-    
-    # Compiler-specific flags for the Python module
-    target_compile_definitions(piqp_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
-    
-    if(OpenMP_CXX_FOUND)
-        target_link_libraries(piqp_cpp PRIVATE OpenMP::OpenMP_CXX)
-    endif()
+# Create Python module
+pybind11_add_module(piqp_cpp src/piqp_bindings.cpp)
+
+# Link with Eigen
+target_link_libraries(piqp_cpp PRIVATE Eigen3::Eigen)
+
+# Compiler-specific flags for the Python module
+target_compile_definitions(piqp_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(piqp_cpp PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+pybind11_add_module(osqp_cpp src/osqp_bindings.cpp)
+
+# Link with Eigen
+target_link_libraries(osqp_cpp PRIVATE Eigen3::Eigen)
+
+# Compiler-specific flags for the Python module
+target_compile_definitions(osqp_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(osqp_cpp PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+
+
+pybind11_add_module(qdldl_cpp src/qdldl_bindings.cpp)
+
+# Link with Eigen
+target_link_libraries(qdldl_cpp PRIVATE Eigen3::Eigen)
+
+# Compiler-specific flags for the Python module
+target_compile_definitions(qdldl_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(qdldl_cpp PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 
 
