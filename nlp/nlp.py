@@ -938,6 +938,14 @@ class NLPSolver:
                 )
                 # Update streaks / stats
                 self._update_streaks(info)
+                
+                if info["converged"]:
+                    if verbose:
+                        print(f"✓ Converged at iteration {k}")
+                    self.x = x_out
+                    self.lam, self.nu = lam_out, nu_out
+                    hist.append(info)
+                    break
 
                 if info["accepted"]:
                     if self.cfg.use_watchdog:

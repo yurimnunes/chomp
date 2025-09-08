@@ -14,136 +14,17 @@ from scipy.linalg import cholesky, solve_triangular
 from scipy.optimize import linprog
 from scipy.spatial.distance import cdist
 
+from .dfo_aux import *
+from .dfo_aux import (
+    _csv_basis,
+    _distance_weights,
+    _huber_weights,
+    _improved_fps,
+    _select_poised_rows,
+    _solve_weighted_ridge,
+)
+from .dfo_tr import *
 
-# Existing helper functions (unchanged)
-def _huber_weights(r: np.ndarray, delta: Optional[float]) -> np.ndarray:
-    if r.size == 0:
-        return np.ones_like(r)
-    a = np.abs(r)
-    if delta is None:
-        mad = np.median(a)
-        delta = max(1.5 * mad, np.percentile(a, 75)) if np.any(a > 0) else 1.0
-    w = np.ones_like(a)
-    mask = a > delta
-    if np.any(mask):
-        w[mask] = delta / np.maximum(a[mask], 1e-16)
-    return w
-
-def _distance_weights(Y: np.ndarray, p: float) -> np.ndarray:
-    if Y.size == 0:
-        return np.ones(0)
-    rn = np.linalg.norm(Y, axis=1)
-    return 1.0 / (1.0 + rn) ** p
-
-def _solve_weighted_ridge(Phi: np.ndarray, y: np.ndarray, w: np.ndarray, lam: float) -> np.ndarray:
-    if Phi.size == 0:
-        return np.zeros(0)
-    sw = np.sqrt(np.clip(w, 1e-12, np.inf))
-    Pw = Phi * sw[:, None]
-    yw = y * sw
-    A = Pw.T @ Pw + lam * np.eye(Phi.shape[1])
-    b = Pw.T @ yw
-    try:
-        L = cholesky(A, lower=True)
-        z = solve_triangular(L, b, lower=True)
-        x = solve_triangular(L.T, z, lower=False)
-        return x
-    except Exception:
-        try:
-            return np.linalg.solve(A, b)
-        except Exception:
-            return lstsq(Pw, yw, rcond=1e-10)[0]
-        
-def _improved_fps(Y: np.ndarray, k: int) -> np.ndarray:
-    m = Y.shape[0]
-    if k >= m:
-        return np.arange(m, dtype=int)
-    if m == 0:
-        return np.array([], dtype=int)
-    # start = argmin ||y|| (as before)
-    start = int(np.argmin(np.einsum('ij,ij->i', Y, Y)))
-    sel = [start]
-    mask = np.ones(m, dtype=bool)
-    mask[start] = False
-    # keep current best (squared) distance to the selected set
-    d2 = np.full(m, np.inf, dtype=Y.dtype)
-    d2[start] = 0.0
-    last = Y[start:start+1, :]                   # (1, n)
-    for _ in range(1, k):
-        # update d2 w.r.t. the last selected point in a vectorized way
-        diff = Y - last                          # (m, n)
-        d2 = np.minimum(d2, np.einsum('ij,ij->i', diff, diff))
-        # pick the farthest remaining
-        idx = np.argmax(np.where(mask, d2, -np.inf))
-        if not np.isfinite(d2[idx]):  # degenerate
-            break
-        sel.append(int(idx))
-        mask[idx] = False
-        last = Y[idx:idx+1, :]
-    return np.array(sel, dtype=int)
-
-
-def _csv_basis(Y: np.ndarray) -> Tuple[np.ndarray, int, int]:
-    m, n = Y.shape
-    ones = np.ones((m, 1), dtype=Y.dtype)
-    lin = Y
-    quads = []
-    for i in range(n):
-        for j in range(i, n):
-            quads.append(Y[:, i:i + 1] * Y[:, j:j + 1])
-    Phi = np.hstack([ones, lin] + (quads if quads else []))
-    nquad = n * (n + 1) // 2
-    return Phi, n, nquad
-
-def _select_poised_rows(Phi: np.ndarray, k: int) -> np.ndarray:
-    m, _ = Phi.shape
-    if k >= m:
-        return np.arange(m, dtype=int)
-    try:
-        U, s, Vt = np.linalg.svd(Phi, full_matrices=False)
-        lev = (U**2).sum(axis=1)
-    except Exception:
-        lev = np.linalg.norm(Phi, axis=1) ** 2
-    idx = np.argsort(-lev)[:k]
-    return np.sort(idx)
-
-# Acquisition functions
-def expected_improvement(gp_model, likelihood, X: torch.Tensor, y: torch.Tensor, xi: float = 0.01) -> torch.Tensor:
-    """
-    Compute Expected Improvement (EI) for a GP model.
-    Args:
-        gp_model: Trained GPyTorch model.
-        likelihood: GPyTorch likelihood.
-        X: Candidate points (n_samples, n_dims).
-        y: Observed outputs (n_samples,).
-        xi: Exploration parameter.
-    Returns:
-        EI values for each candidate point.
-    """
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        observed_pred = likelihood(gp_model(X))
-        mu = observed_pred.mean
-        sigma = observed_pred.variance.sqrt()
-        y_best = y.min()
-        z = (y_best - mu - xi) / sigma
-        ei = (y_best - mu - xi) * torch.distributions.Normal(0, 1).cdf(z) + sigma * torch.distributions.Normal(0, 1).log_prob(z).exp()
-        ei = torch.clamp(ei, min=0.0)
-    return ei
-
-def log_expected_improvement(gp_model, likelihood, X: torch.Tensor, y: torch.Tensor, xi: float = 0.01) -> torch.Tensor:
-    """
-    Compute Log Expected Improvement (LogEI).
-    Args:
-        gp_model: Trained GPyTorch model.
-        likelihood: GPyTorch likelihood.
-        X: Candidate points (n_samples, n_dims).
-        y: Observed outputs (n_samples,).
-        xi: Exploration parameter.
-    Returns:
-        LogEI values for each candidate point.
-    """
-    ei = expected_improvement(gp_model, likelihood, X, y, xi)
-    return torch.log(ei + 1e-10)
 
 # GPyTorch GP Model
 class ExactGPModel(gpytorch.models.ExactGP):
@@ -157,69 +38,6 @@ class ExactGPModel(gpytorch.models.ExactGP):
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
 
-# Modified DFOConfig
-@dataclass
-class DFOConfig:
-    huber_delta: Optional[float] = None
-    ridge: float = 1e-6
-    dist_w_power: float = 0.3
-    eig_floor: float = 1e-8
-    max_pts: int = 60
-    model_radius_mult: float = 2.0
-    use_quadratic_if: int = 25
-    mu: float = 10.0
-    eps_active: float = 1e-6
-    tr_inc: float = 1.6
-    tr_dec: float = 0.5
-    eta0: float = 0.05
-    eta1: float = 0.25
-    crit_beta1: float = 0.5
-    crit_beta2: float = 2.0
-    crit_beta3: float = 0.5
-    eps_c: float = 1e-4
-    k_fd: float = 1.0
-    k_H: float = 1.0
-    k_c: float = 1.0
-    vk_gn_maxit: int = 10
-    vk_gn_tol: float = 1e-8
-    lp_max_active: int = 32
-    lp_time_limit: float = 0.10
-    lp_verbose: bool = False
-    use_multiplier_step: bool = True
-    mult_sigma_thresh: float = 1e-3
-    mult_project_lambda: bool = True
-    mult_newton_clip_inf: bool = True
-    fl_tol: float = 1e-3
-    gp_noise: float = 1e-2  # Noise level for GP likelihood
-    gp_max_pts: int = 120   # Max points for GP
-    min_pts_gp: int = 6     # Min points for GP
-    acquisition: str = "ei"  # "ei" or "logei"
-    xi: float = 0.01        # Exploration parameter for EI/LogEI
-    gp_device: str = "cuda"  # "cuda" | "cpu" | "auto"
-    gp_dtype: str = "float32"  # "float32" | "float64"
-    gp_lr: float = 0.06
-    gp_train_steps: int = 25
-    gp_patience: int = 6
-    gp_warm_start: bool = True
-    gp_freeze_after: int = 2  # after this many successful fit rounds, stop re-optimizing
-    gp_hess_mode: str = "autograd"  # "diag_from_lengthscale" | "autograd"
-    
-# Existing FitResult and CriticalityState (unchanged)
-@dataclass
-class FitResult:
-    g: np.ndarray
-    H: np.ndarray
-    A_ineq: Optional[np.ndarray]
-    A_eq: Optional[np.ndarray]
-    Hc_list: Optional[List[np.ndarray]]
-    diag: Dict
-
-@dataclass
-class CriticalityState:
-    eps: float
-    Delta_bct: float
-    sigma_eps: float = 1.0
-    Delta_eps: float = 1.0
 
 # Modified Objective Model with GP
 class _ObjectiveModelBase:
@@ -492,115 +310,12 @@ class DFOGPModel(_ObjectiveModelBase):
                 raise ValueError(f"Unknown acquisition function: {acq_type}")
         return acq.detach().cpu().numpy()
 
-# Modified TRModel to support acquisition functions
-class TRModel:
-    def __init__(self, n: int, q: int, cfg: DFOConfig = None):
-        self.n = n
-        self.q = q
-        self.cfg = cfg or DFOConfig()
-        self.center = np.zeros(n)
-        self.radius = 1.0
-        self.pointsAbs = np.zeros((0, n))
-        self.fvals = np.zeros((0, q))
-        self.interp = None
-        self.min_pts = max(n + 1, self.cfg.min_pts_gp)
-        self.max_pts = self.cfg.gp_max_pts
+class _TMOptions:
+    pivot_threshold = 1e-3
+    exchange_threshold = 1e-3
+    tol_radius = 1e-6
+    add_threshold = 1e-3
     
-    def append_raw_sample(self, x: np.ndarray, fvec: np.ndarray):
-        x = np.asarray(x).ravel()
-        fvec = np.asarray(fvec).ravel().reshape(1, -1)
-        if self.pointsAbs.shape[0] > 0:
-            if np.any(norm(self.pointsAbs - x[None, :], axis=1) < 1e-12):
-                return
-        self.pointsAbs = np.vstack([self.pointsAbs, x]) if self.pointsAbs.size else x[None, :]
-        self.fvals = np.vstack([self.fvals, fvec]) if self.fvals.size else fvec
-        if self.pointsAbs.shape[0] > self.max_pts * 1.5:
-            self.rebuildModel(None)
-    
-    def ensure_basis_initialized(self):
-        self.rebuild_interp()
-    
-    def rebuild_interp(self):
-        if self.pointsAbs.shape[0] < self.min_pts:
-            self.interp = None
-            return
-        Y = (self.pointsAbs - self.center[None, :]) / max(self.radius, 1e-12)
-        try:
-            self.interp = DFOGPModel()
-            self.interp.fit_objective(Y, self.fvals[:, 0], self.n, self.cfg)
-        except Exception:
-            self.interp = None
-    
-    def hasDistantPoints(self, opts):
-        if self.pointsAbs.shape[0] == 0:
-            return False
-        dist = norm(self.pointsAbs - self.center[None, :], axis=1)
-        return np.any(dist > 1.5 * self.radius)
-    
-    def isOld(self, opts):
-        return self.pointsAbs.shape[0] > self.max_pts
-    
-    def rebuildModel(self, opts):
-        if self.pointsAbs.shape[0] == 0:
-            return
-        dist = norm(self.pointsAbs - self.center[None, :], axis=1)
-        idx = np.argsort(dist)[:self.max_pts]
-        self.pointsAbs = self.pointsAbs[idx]
-        self.fvals = self.fvals[idx]
-        self.rebuild_interp()
-    
-    def isLambdaPoised(self, opts):
-        if self.interp is None or self.pointsAbs.shape[0] < self.min_pts:
-            return False
-        Phi, _, _ = _csv_basis((self.pointsAbs - self.center[None, :]) / max(self.radius, 1e-12))
-        try:
-            _, s, _ = np.linalg.svd(Phi, full_matrices=False)
-            return s[-1] >= 1e-8 and (s[0] / s[-1]) <= 1e8
-        except Exception:
-            return False
-
-# Modified ensure_improvement with acquisition functions
-def ensure_improvement(trmodel: TRModel, call_fn, arg1, arg2, opts):
-    if trmodel.pointsAbs.shape[0] >= trmodel.max_pts:
-        return
-    num_cand = max(50, 10 * trmodel.n)
-    cand = []
-    # Axes points
-    for i in range(trmodel.n):
-        e = np.zeros(trmodel.n)
-        e[i] = 1.0
-        cand.append(trmodel.center + trmodel.radius * e)
-        cand.append(trmodel.center - trmodel.radius * e)
-    # Random points
-    for _ in range(num_cand - 2 * trmodel.n):
-        d = np.random.randn(trmodel.n)
-        d = d / max(norm(d), 1e-12) * trmodel.radius * np.random.uniform(0.1, 1.0)
-        cand.append(trmodel.center + d)
-    cand = np.unique(np.array(cand), axis=0)
-    
-    # Use acquisition function if GP model is available
-    if trmodel.interp and hasattr(trmodel.interp, "get_acquisition"):
-        acq_vals = trmodel.interp.get_acquisition(cand, trmodel.cfg.acquisition, trmodel.cfg.xi)
-        j = np.argmax(acq_vals)
-    else:
-        # Fallback to distance-based selection
-        if trmodel.pointsAbs.size:
-            D = cdist(cand, trmodel.pointsAbs)
-            minD = np.min(D, axis=1)
-        else:
-            minD = np.full(len(cand), trmodel.radius)
-        j = np.argmax(minD)
-    
-    x_new = cand[j]
-    fvec, ok = call_fn(x_new)
-    if ok:
-        trmodel.append_raw_sample(x_new, fvec)
-        trmodel.rebuild_interp()
-
-def change_tr_center(trmodel: TRModel, x_new: np.ndarray, fvec: np.ndarray, opts):
-    trmodel.center = x_new
-    trmodel.append_raw_sample(x_new, fvec)
-    trmodel.rebuild_interp()
 # ===============================
 # DFOExactPenalty
 # ===============================
@@ -616,12 +331,6 @@ class DFOExactPenalty:
         self.last_diag: Dict = {}
         self.obj_model = DFOGPModel() if objective_model is None else objective_model
         self.trmodel: Optional[TRModel] = None
-        
-        class _TMOptions:
-            pivot_threshold = 1e-3
-            exchange_threshold = 1e-3
-            tol_radius = 1e-6
-            add_threshold = 1e-3
         self._tm_opts = _TMOptions()
 
     # -------- TR hooks --------
@@ -679,7 +388,7 @@ class DFOExactPenalty:
             pass
         tries = 0
         while not self.trmodel.isLambdaPoised(self._tm_opts) and tries <= max(1, self.n):
-            ensure_improvement(self.trmodel, self._tm_funcs(), None, None, self._tm_opts)
+            self.trmodel.ensure_improvement(self._tm_funcs(), None, None, self._tm_opts)
             tries += 1
 
     def on_accept(self, x_new: np.ndarray, f: float, cI: Optional[np.ndarray], cE: Optional[np.ndarray]):
@@ -690,7 +399,7 @@ class DFOExactPenalty:
             np.asarray(cI, float).ravel() if (cI is not None and cI.size) else (np.zeros(self.m_ineq)),
             np.asarray(cE, float).ravel() if (cE is not None and cE.size) else (np.zeros(self.m_eq)),
         ))
-        change_tr_center(self.trmodel, x_new, fvec, self._tm_opts)
+        self.trmodel.change_tr_center(x_new, fvec, self._tm_opts)
 
     def set_objective_model(self, model: _ObjectiveModelBase):
         self.obj_model = model
@@ -703,24 +412,256 @@ class DFOExactPenalty:
         dx = np.linalg.norm(X - x[None, :], axis=1)
         return bool(np.any(dx <= atol + rtol * max(1.0, np.linalg.norm(x))))
 
-    def add_sample(self, x: np.ndarray, f: float, cI: np.ndarray = None, cE: np.ndarray = None):
-        x = np.asarray(x, float).ravel()
-        if self._is_duplicate_x(x):
-            return
-        ci = np.asarray(cI, float).ravel() if cI is not None else np.zeros(self.m_ineq)
-        ce = np.asarray(cE, float).ravel() if cE is not None else np.zeros(self.m_eq)
-        c = np.concatenate([ci, ce]) if (self.m_ineq + self.m_eq) > 0 else np.zeros(0)
-        self.X.append(x)
-        self.F.append(float(f))
-        self.C.append(c)
-        if self.trmodel is not None:
-            self._tm_append_if_new(x, f, ci, ce)
 
     def arrays(self):
         if not self.X:
             return np.zeros((0, self.n)), np.zeros((0,)), np.zeros((0, self.m_ineq + self.m_eq))
         return np.vstack(self.X), np.asarray(self.F, float), np.vstack(self.C)
 
+    def add_sample(self, x: np.ndarray, f: float, cI: np.ndarray = None, cE: np.ndarray = None):
+        """
+        Add a new sample point to the model, using polynomial pivoting and orthogonalization.
+
+        Args:
+            x (np.ndarray): Input point of shape (n,).
+            f (float): Objective function value.
+            cI (np.ndarray, optional): Inequality constraint values of shape (m_ineq,).
+            cE (np.ndarray, optional): Equality constraint values of shape (m_eq,).
+        """
+        x = np.asarray(x, dtype=np.float64).ravel()
+        if self._is_duplicate_x(x):
+            # logging.debug(f"Point {x} rejected: duplicate within tolerance")
+            return
+
+        ci = np.asarray(cI, dtype=np.float64).ravel() if cI is not None else np.zeros(self.m_ineq, dtype=np.float64)
+        ce = np.asarray(cE, dtype=np.float64).ravel() if cE is not None else np.zeros(self.m_eq, dtype=np.float64)
+        c = np.concatenate([ci, ce]) if (self.m_ineq + self.m_eq) > 0 else np.zeros(0, dtype=np.float64)
+
+        # Compute constraint violation for weighting
+        vI = np.maximum(0.0, ci).max() if ci.size else 0.0
+        vE = np.abs(ce).max() if ce.size else 0.0
+        viol = max(vI, vE)
+        viol_weight = 1.0 / (1.0 + viol)
+
+        # Check if the new point improves the polynomial basis
+        if self.trmodel is not None and self.X:
+            Delta = max(self.trmodel.radius, 1e-12)
+            X_all = np.vstack(self.X) if self.X else np.zeros((0, self.n), dtype=np.float64)
+            Y_current = (X_all - self.trmodel.center[None, :]) / Delta if X_all.shape[0] > 0 else np.zeros((0, self.n))
+            y_new = (x - self.trmodel.center) / Delta
+            Phi_current, _, _ = _csv_basis(Y_current)
+            Phi_new, _, _ = _csv_basis(np.vstack([Y_current, y_new]) if Y_current.shape[0] > 0 else y_new[None, :])
+
+            try:
+                sel = _select_poised_rows(Phi_current, min(Phi_current.shape[1], Y_current.shape[0])) if Phi_current.shape[0] > 0 else np.array([])
+                leverage = np.sum((Phi_new[-1] @ np.linalg.pinv(Phi_current[sel]))**2) if sel.size > 0 else 1.0
+                leverage_threshold = getattr(self.cfg, 'leverage_threshold', 1e-3)
+                
+                if leverage < leverage_threshold * viol_weight:
+                    # logging.debug(f"Point {x} rejected: leverage score {leverage:.2e} below threshold {leverage_threshold:.2e}")
+                    return
+            except np.linalg.LinAlgError as e:
+                logging.warning(f"Leverage score computation failed: {e}. Accepting point without pivoting check.")
+                leverage = 1.0
+
+        # Append the new point
+        self.X.append(x)
+        self.F.append(float(f))
+        self.C.append(c)
+        if self.trmodel is not None:
+            fvec = np.concatenate([np.array([float(f)], dtype=np.float64), ci, ce])
+            self._tm_append_if_new(x, f, ci, ce)
+
+        # Prune if exceeding max_pts
+        if len(self.X) > self.cfg.max_pts:
+            logging.debug(f"Sample set size {len(self.X)} exceeds max_pts {self.cfg.max_pts}. Pruning.")
+            X_all = np.vstack(self.X) if self.X else np.zeros((0, self.n), dtype=np.float64)
+            C_all = np.vstack(self.C) if self.C else np.zeros((0, self.m_ineq + self.m_eq), dtype=np.float64)
+            F_all = np.array(self.F, dtype=np.float64) if self.F else np.zeros((0,), dtype=np.float64)
+            Delta = max(self.trmodel.radius, 1e-12) if self.trmodel else 1.0
+            Y_all = (X_all - self.trmodel.center[None, :]) / Delta if self.trmodel and X_all.shape[0] > 0 else X_all
+            Phi, _, _ = _csv_basis(Y_all)
+
+            try:
+                idx_keep = _select_poised_rows(Phi, min(self.cfg.max_pts, X_all.shape[0]))
+                idx_keep = np.asarray(idx_keep, dtype=np.int64)  # Ensure integer indices
+                if np.max(idx_keep) >= X_all.shape[0]:
+                    logging.warning(f"Invalid indices in idx_keep: {idx_keep}. Adjusting to valid range.")
+                    idx_keep = idx_keep[idx_keep < X_all.shape[0]]
+                if len(idx_keep) == 0:
+                    logging.warning("No valid indices after pruning. Using distance-based fallback.")
+                    raise np.linalg.LinAlgError("Empty index set")
+                idx_keep = np.sort(idx_keep)
+                # Construct fvals with objective and constraints
+                fvals_new = np.hstack([
+                    F_all[idx_keep].reshape(-1, 1),
+                    C_all[idx_keep]
+                ])
+                self.X = [X_all[i] for i in idx_keep]
+                self.F = [F_all[i] for i in idx_keep]
+                self.C = [C_all[i] for i in idx_keep]
+                if self.trmodel is not None:
+                    self.trmodel.pointsAbs = X_all[idx_keep]
+                    self.trmodel.fvals = fvals_new
+                    self.trmodel.rebuild_interp()
+            except np.linalg.LinAlgError as e:
+                logging.warning(f"Pruning failed: {e}. Using distance-based pruning.")
+                d = norm(X_all - self.trmodel.center[None, :], axis=1) if self.trmodel and X_all.shape[0] > 0 else norm(X_all, axis=1)
+                idx_keep = np.argsort(d)[:min(self.cfg.max_pts, X_all.shape[0])]
+                idx_keep = np.sort(idx_keep)
+                self.X = [X_all[i] for i in idx_keep]
+                self.F = [F_all[i] for i in idx_keep]
+                self.C = [C_all[i] for i in idx_keep]
+                if self.trmodel is not None:
+                    self.trmodel.pointsAbs = X_all[idx_keep]
+                    self.trmodel.fvals = C_all[idx_keep]
+                    self.trmodel.rebuild_interp()
+
+    def _improve_models_FL(self, center: np.ndarray, Delta: float, budget: int = 2) -> None:
+        """
+        Improve the local model by adding new sample points within the trust region, ensuring synchronized pruning.
+
+        Args:
+            center (np.ndarray): Trust region center of shape (n,).
+            Delta (float): Trust region radius.
+            budget (int): Maximum number of new points to add.
+        """
+        if budget <= 0 or not hasattr(self, "oracle") or self.oracle is None:
+            return
+        Delta = float(max(Delta, 1e-12))
+
+        # Get current working subset
+        Xs, Fs, Cs = self._pick_working_subset(center, Delta)
+        Y = (Xs - center[None, :]) / Delta if Xs.shape[0] > 0 else np.zeros((0, self.n), dtype=np.float64)
+
+        # Remove low-leverage points, synchronizing with trmodel
+        if Xs.shape[0] >= self.cfg.min_pts_gp:
+            Phi, _, _ = _csv_basis(Y)
+            try:
+                sel = _select_poised_rows(Phi, min(Phi.shape[1], Xs.shape[0]))
+                lev = np.sum((Phi @ np.linalg.pinv(Phi[sel]))**2, axis=1)
+                low_idx_local = np.argsort(lev)[:min(budget, len(lev))]
+                X_all = np.vstack(self.X) if self.X else np.zeros((0, self.n), dtype=np.float64)
+                C_all = np.vstack(self.C) if self.C else np.zeros((0, self.m_ineq + self.m_eq), dtype=np.float64)
+                F_all = np.array(self.F, dtype=np.float64) if self.F else np.zeros((0,), dtype=np.float64)
+                global_map = []
+                for xi in Xs:
+                    cand = np.where((X_all == xi).all(axis=1))[0]
+                    j = int(cand[0]) if cand.size else int(np.argmin(norm(X_all - xi[None, :], axis=1)))
+                    global_map.append(j)
+                global_map = np.asarray(global_map, dtype=int)
+                to_drop_global = set(global_map[low_idx_local].tolist())
+                if to_drop_global:
+                    # logging.debug(f"Pruning {len(to_drop_global)} low-leverage points from global set")
+                    idx_keep = np.array([i for i in range(X_all.shape[0]) if i not in to_drop_global])
+                    idx_keep = np.sort(idx_keep)
+                    idx_keep = np.asarray(idx_keep, dtype=np.int64)  # Ensure integer indices
+
+                    # check if idx_keep is empty
+                    if len(idx_keep) == 0:
+                        logging.warning("No valid indices after pruning. Using distance-based fallback.")
+                        pass
+
+                    # Construct fvals with objective and constraints
+                    fvals_new = np.hstack([
+                        F_all[idx_keep].reshape(-1, 1),
+                        C_all[idx_keep]
+                    ])
+                    self.X = [X_all[i] for i in idx_keep]
+                    self.F = [F_all[i] for i in idx_keep]
+                    self.C = [C_all[i] for i in idx_keep]
+                    if self.trmodel is not None:
+                        self.trmodel.pointsAbs = X_all[idx_keep]
+                        self.trmodel.fvals = fvals_new
+                        self.trmodel.rebuild_interp()
+                    Xs, Fs, Cs = self._pick_working_subset(center, Delta)
+                    Y = (Xs - center[None, :]) / Delta if Xs.shape[0] > 0 else np.zeros((0, self.n), dtype=np.float64)
+            except np.linalg.LinAlgError as e:
+                logging.warning(f"Leverage score computation failed: {e}. Falling back to distance-based pruning.")
+                d = norm(Xs - center[None, :], axis=1) if Xs.shape[0] > 0 else np.zeros(0)
+                low_idx_local = np.argsort(d)[:min(budget, len(d))]
+                X_all = np.vstack(self.X) if self.X else np.zeros((0, self.n), dtype=np.float64)
+                C_all = np.vstack(self.C) if self.C else np.zeros((0, self.m_ineq + self.m_eq), dtype=np.float64)
+                F_all = np.array(self.F, dtype=np.float64) if self.F else np.zeros((0,), dtype=np.float64)
+                global_map = []
+                for xi in Xs:
+                    cand = np.where((X_all == xi).all(axis=1))[0]
+                    j = int(cand[0]) if cand.size else int(np.argmin(norm(X_all - xi[None, :], axis=1)))
+                    global_map.append(j)
+                global_map = np.asarray(global_map, dtype=int)
+                to_drop_global = set(global_map[low_idx_local].tolist())
+                if to_drop_global:
+                    logging.debug(f"Pruning {len(to_drop_global)} distance-based points from global set")
+                    idx_keep = np.array([i for i in range(X_all.shape[0]) if i not in to_drop_global])
+                    idx_keep = np.sort(idx_keep)
+                    idx_keep = np.asarray(idx_keep, dtype=np.int64)  # Ensure integer indices
+
+                    if len(idx_keep) == 0:
+                        logging.warning("No valid indices after pruning. Using distance-based fallback.")
+                        pass
+                    # Construct fvals with objective and constraints
+                    fvals_new = np.hstack([
+                        F_all[idx_keep].reshape(-1, 1),
+                        C_all[idx_keep]
+                    ])
+                    self.X = [X_all[i] for i in idx_keep]
+                    self.F = [F_all[i] for i in idx_keep]
+                    self.C = [C_all[i] for i in idx_keep]
+                    if self.trmodel is not None:
+                        self.trmodel.pointsAbs = X_all[idx_keep]
+                        self.trmodel.fvals = fvals_new
+                        self.trmodel.rebuild_interp()
+                    Xs, Fs, Cs = self._pick_working_subset(center, Delta)
+                    Y = (Xs - center[None, :]) / Delta if Xs.shape[0] > 0 else np.zeros((0, self.n), dtype=np.float64)
+
+        # Adjust budget based on model quality
+        budget = min(budget, self.cfg.min_pts_gp - Xs.shape[0] if Xs.shape[0] < self.cfg.min_pts_gp else budget)
+        if budget <= 0:
+            return
+
+        # Generate candidate points using quasi-Monte Carlo (Sobol)
+        box = Delta * self.cfg.model_radius_mult
+        num_cand = max(10, 5 * self.n)
+        sampler = qmc.Sobol(d=self.n, scramble=True, seed=np.random.randint(0, 10000))
+        cand = sampler.random(num_cand)
+        cand = qmc.scale(cand, -box, box) + center
+        cand = np.unique(cand, axis=0)
+
+        # Select new points using acquisition function or distance-based selection
+        if self.trmodel and self.trmodel.interp and hasattr(self.trmodel.interp, "get_acquisition"):
+            try:
+                acq_vals = self.trmodel.interp.get_acquisition(cand, self.cfg.acquisition, self.cfg.xi)
+                X_cur, _, C_cur = self.arrays()
+                if C_cur.shape[0] > 0:
+                    cI_cur = C_cur[:, :self.m_ineq] if self.m_ineq else np.zeros((C_cur.shape[0], 0))
+                    vI = np.maximum(0.0, cI_cur).max(axis=1)
+                    vE = np.abs(C_cur[:, self.m_ineq:]) if self.m_eq else np.zeros((C_cur.shape[0], 0))
+                    vE = vE.max(axis=1) if vE.size else np.zeros(C_cur.shape[0])
+                    weights = 1.0 / (1.0 + vI + vE)
+                    acq_vals *= weights[np.argmin(cdist(cand, X_cur), axis=1)]
+                pick = np.argsort(-acq_vals)[:budget]
+            except Exception as e:
+                logging.warning(f"Acquisition function failed: {e}. Falling back to distance-based selection.")
+                X_cur, _, _ = self.arrays()
+                if X_cur.shape[0] > 0:
+                    D = cdist(cand, X_cur, metric="euclidean")
+                    minD = np.min(D, axis=1)
+                else:
+                    minD = np.full(len(cand), np.inf)
+                pick = np.argsort(-minD)[:budget]
+        else:
+            X_cur, _, _ = self.arrays()
+            if X_cur.shape[0] > 0:
+                D = cdist(cand, X_cur, metric="euclidean")
+                minD = np.min(D, axis=1)
+            else:
+                minD = np.full(len(cand), np.inf)
+            pick = np.argsort(-minD)[:budget]
+
+        # Add selected points with pivoting check
+        for x_new in cand[pick]:
+            f_new, cI_new, cE_new = self.oracle_eval(x_new)
+            self.add_sample(x_new, f_new, cI_new, cE_new)
     # -------- Local fitting --------
     def fit_local(self, center: np.ndarray, Delta: float) -> "FitResult":
         self._tm_seed_if_needed(center)
@@ -1169,76 +1110,7 @@ class DFOExactPenalty:
             return (cond <= 1e8) and (s[-1] >= 1e-8)
         except Exception:
             return False
-
-    def _improve_models_FL(self, center: np.ndarray, Delta: float, budget: int = 2) -> None:
-        if budget <= 0 or not hasattr(self, "oracle") or self.oracle is None:
-            return
-        Xs, Fs, Cs = self._pick_working_subset(center, Delta)
-        m = Xs.shape[0]
-        Delta = float(max(Delta, 1e-12))
-        Y = (Xs - center[None, :]) / Delta if m > 0 else np.zeros((0, self.n))
         
-        # Remove low-leverage points
-        if m >= self.cfg.min_pts_gp:
-            Phi, _, _ = _csv_basis(Y)
-            p = Phi.shape[1]
-            try:
-                sel_sq = _select_poised_rows(Phi, p)
-                lev = np.sum((Phi @ np.linalg.pinv(Phi[sel_sq]))**2, axis=1)
-            except Exception:
-                lev = np.linalg.norm(Phi, axis=1)**2
-            low_idx_local = np.argsort(lev)[:min(budget, len(lev))]
-            X_all = np.vstack(self.X)
-            global_map = []
-            for xi in Xs:
-                cand = np.where((X_all == xi).all(axis=1))[0]
-                j = int(cand[0]) if cand.size else int(np.argmin(np.linalg.norm(X_all - xi[None, :], axis=1)))
-                global_map.append(j)
-            global_map = np.asarray(global_map, dtype=int)
-            to_drop_global = set(global_map[low_idx_local].tolist())
-            if to_drop_global:
-                for gidx in sorted(to_drop_global, reverse=True):
-                    del self.X[gidx]
-                    del self.F[gidx]
-                    del self.C[gidx]
-        
-        # Add diverse points using acquisition function
-        n = self.n
-        box = Delta * self.cfg.model_radius_mult
-        cand = []
-        for i in range(n):
-            e = np.zeros(n)
-            e[i] = 1.0
-            cand.append(center + box * e)
-            cand.append(center - box * e)
-        if n <= 10:
-            for s in np.ndindex((2,)*n):
-                sgn = np.array(s, dtype=float) * 2 - 1
-                cand.append(center + box * sgn)
-        for _ in range(max(10, 5*n)):
-            d = np.random.randn(n)
-            d /= max(norm(d, ord=np.inf), 1e-12)
-            cand.append(center + box * d)
-        cand = np.unique(np.asarray(cand), axis=0)
-        
-        # Use acquisition function if GP model is available
-        if self.trmodel and self.trmodel.interp and hasattr(self.trmodel.interp, "get_acquisition"):
-            acq_vals = self.trmodel.interp.get_acquisition(cand, self.cfg.acquisition, self.cfg.xi)
-            pick = np.argsort(-acq_vals)[:budget]
-        else:
-            X_cur, _, _ = self.arrays()
-            if X_cur.shape[0] > 0:
-                D = cdist(cand, X_cur, metric="euclidean")
-                minD = np.min(D, axis=1)
-            else:
-                minD = np.full(len(cand), np.inf)
-            pick = np.argsort(-minD)[:budget]
-        
-        to_add = cand[pick]
-        for x_new in to_add:
-            f_new, cI_new, cE_new = self.oracle_eval(x_new)
-            self.add_sample(x_new, f_new, cI_new, cE_new)
-
     # -------- Criticality loop --------
     def criticality_loop(self, xk: np.ndarray, eps: float, Delta_in: float) -> Tuple[float, float, float]:
         beta1 = float(self.cfg.crit_beta1)
@@ -1341,143 +1213,132 @@ class DFOExactPenalty:
         return -g / (np.linalg.norm(g) + 1e-16)
 
     # -------- Step proposal --------
-    def propose_step(self, x: np.ndarray, Delta: float, fit: FitResult,
-                     cI0: Optional[np.ndarray], cE0: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
-        g, H, A_ineq, A_eq, Hc_list = fit.g, fit.H, fit.A_ineq, fit.A_eq, fit.Hc_list
-        cI0 = np.asarray(cI0).ravel() if (cI0 is not None and self.m_ineq > 0) else np.zeros(self.m_ineq)
-        cE0 = np.asarray(cE0).ravel() if (cE0 is not None and self.m_eq > 0) else np.zeros(self.m_eq)
+    def propose_step(self, x: np.ndarray, Delta: float, fit: FitResult, 
+                        cI0: Optional[np.ndarray], cE0: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
+            g, H, A_ineq, A_eq, Hc_list = fit.g, fit.H, fit.A_ineq, fit.A_eq, fit.Hc_list
+            cI0 = np.asarray(cI0, dtype=np.float64).ravel() if (cI0 is not None and self.m_ineq > 0) else np.zeros(self.m_ineq, dtype=np.float64)
+            cE0 = np.asarray(cE0, dtype=np.float64).ravel() if (cE0 is not None and self.m_eq > 0) else np.zeros(self.m_eq, dtype=np.float64)
+            eps = self.cfg.eps_active
+            A_mask, V_mask, _ = self._split_sets(cI0, eps)
+            E_mask = (np.abs(cE0) <= eps) if cE0.size else np.zeros(0, dtype=bool)
+            grad_mp1 = self._mp1_grad(g, A_ineq, V_mask)
+            d_default = self._desc_dir_lp(grad_mp1, A_ineq, A_mask)
+            
+            if norm(d_default, ord=np.inf) <= 1e-14:
+                return np.zeros_like(d_default), {
+                    "t": 0.0, "d": d_default, "breaks": [], "sigma": 0.0,
+                    "pred_red_cons": 0.0, "pred_red_quad": 0.0, "Delta_out": float(Delta),
+                    "used_multiplier_step": False, "is_FL": True
+                }
 
-        eps = self.cfg.eps_active
-        A_mask, V_mask, _ = self._split_sets(cI0, eps)
-        E_mask = (np.abs(cE0) <= eps) if cE0.size else np.zeros(0, dtype=bool)
+            lin_term = float(g @ d_default)
+            pen_term = 0.0
+            if A_ineq is not None and np.any(A_mask):
+                pen_term += float(self.cfg.mu * np.maximum(0.0, (A_ineq[A_mask] @ d_default)).sum())
+            if A_eq is not None and np.any(E_mask):
+                pen_term += float(self.cfg.mu * np.abs(A_eq[E_mask] @ d_default).sum())
+            sigma = float(-(lin_term + pen_term))
 
-        grad_mp1 = self._mp1_grad(g, A_ineq, V_mask)
-        d_default = self._desc_dir_lp(grad_mp1, A_ineq, A_mask)
-        if norm(d_default, ord=np.inf) <= 1e-14:
-            return np.zeros_like(d_default), {
-                "t": 0.0, "d": d_default, "breaks": [], "sigma": 0.0,
-                "pred_red_cons": 0.0, "pred_red_quad": 0.0, "Delta_out": float(Delta),
-                "used_multiplier_step": False, "is_FL": True
+            # Adaptive trust region radius
+            if sigma < self.cfg.eps_c:
+                sig = max(sigma, 1e-16)
+                target1 = max(self.cfg.crit_beta1 * sig, 1e-12)
+                target2 = self.cfg.crit_beta2 * sig
+                Delta = min(Delta, target1, target2)
+
+            breaks = [0.0] + self._breakpoints(cI0, d_default, A_ineq, Hc_list, Delta, cE0, A_eq)
+            t_tr = Delta / max(norm(d_default, ord=np.inf), 1e-16)
+            if not breaks or breaks[-1] < t_tr:
+                breaks.append(t_tr)
+
+            def mp_interval_value(t: float, d: np.ndarray) -> float:
+                return self._model_mp_value(t, d, g, H, cI0, A_ineq, Hc_list, cE0, A_eq)
+
+            t_best = 0.0
+            val_best = 0.0
+            for a, b in zip(breaks[:-1], breaks[1:]):
+                t_mid = 0.5 * (a + b)
+                val = mp_interval_value(t_mid, d_default)
+                if t_best == 0.0 or val < val_best:
+                    coef2 = float(d_default @ (H @ d_default))
+                    slope_pen = 0.0
+                    if A_ineq is not None and A_ineq.size:
+                        aTd_all = A_ineq @ d_default
+                        c_mid = cI0 + t_mid * aTd_all
+                        pos_mask = np.flatnonzero(c_mid > 0.0)
+                        if pos_mask.size:
+                            slope_pen += self.cfg.mu * float(np.sum(aTd_all[pos_mask]))
+                        if Hc_list is not None:
+                            for idx in pos_mask:
+                                if idx < len(Hc_list) and Hc_list[idx] is not None:
+                                    slope_pen += self.cfg.mu * float(d_default @ (Hc_list[idx] @ d_default)) * t_mid
+                    if A_eq is not None and cE0 is not None and A_eq.size and cE0.size:
+                        aTdE = A_eq @ d_default
+                        e_mid = cE0 + t_mid * aTdE
+                        slope_pen += self.cfg.mu * float(np.sum(np.sign(e_mid) * aTdE))
+                    coef1 = float(g @ d_default) + slope_pen
+                    t_star = t_mid
+                    if abs(coef2) > 1e-16:
+                        t_star = float(np.clip(-coef1 / coef2, a + 1e-12, b - 1e-12))
+                    for t in (t_mid, t_star):
+                        vv = mp_interval_value(t, d_default)
+                        if t_best == 0.0 or vv < val_best:
+                            t_best, val_best = t, vv
+
+            h_default = t_best * d_default
+            cI_h = cI0 + (A_ineq @ h_default) if (A_ineq is not None and h_default.size) else None
+            cE_h = cE0 + (A_eq @ h_default) if (A_eq is not None and h_default.size) else None
+            v_default = self._vk_correction(A_ineq, cI_h, A_eq, cE_h, h_default, Delta)
+            s_default = h_default + v_default
+            pred_red_cons = self._conservative_pred_red(sigma=sigma, Delta=Delta, n=self.n)
+            pred_red_quad_default = max(1e-16, -(g @ s_default) - 0.5 * (s_default @ (H @ s_default)))
+
+            # Augmented Lagrangian step
+            used_mult = False
+            s_choice = s_default
+            pred_red_quad_choice = pred_red_quad_default
+            s_mult = None  # Initialize s_mult to None
+            if self.cfg.use_multiplier_step and sigma <= self.cfg.mult_sigma_thresh:
+                lam = self._estimate_multipliers(grad_mp1, A_ineq, A_mask)
+                if lam is not None and np.all(lam >= -1e-12) and np.all(lam <= self.cfg.mu + 1e-12):
+                    H_eff, g_eff = self._effective_H_and_g(g, H, A_ineq, Hc_list, lam, A_mask, V_mask)
+                    h_mult = self._solve_box_newton(H_eff, g_eff, Delta)
+                    cI_hm = cI0 + (A_ineq @ h_mult) if (A_ineq is not None and h_mult.size) else None
+                    cE_hm = cE0 + (A_eq @ h_mult) if (A_eq is not None and h_mult.size) else None
+                    v_mult = self._vk_correction(A_ineq, cI_hm, A_eq, cE_hm, h_mult, Delta)
+                    s_mult = h_mult + v_mult
+                    mp_def = mp_interval_value(1.0, s_default)
+                    mp_mul = mp_interval_value(1.0, s_mult)
+                    if mp_mul < mp_def:
+                        s_choice = s_mult
+                        used_mult = True
+                        pred_red_quad_choice = max(1e-16, -(g @ s_mult) - 0.5 * (s_mult @ (H @ s_mult)))
+
+            # Feasibility decrease check
+            theta0 = self._violation_measure(cI0, cE0)
+            cI_def = cI0 + (A_ineq @ s_default) if (A_ineq is not None and s_default is not None and s_default.size) else None
+            cE_def = cE0 + (A_eq @ s_default) if (A_eq is not None and s_default is not None and s_default.size) else None
+            theta_def = self._violation_measure(cI_def, cE_def)
+            theta_mult = None
+            if s_mult is not None:  # Safe check since s_mult is initialized
+                cI_mul = cI0 + (A_ineq @ s_mult) if (A_ineq is not None and s_mult.size) else None
+                cE_mul = cE0 + (A_eq @ s_mult) if (A_eq is not None and s_mult.size) else None
+                theta_mult = self._violation_measure(cI_mul, cE_mul)
+            theta_choice = theta_mult if (used_mult and theta_mult is not None) else theta_def
+            tol = float(self.cfg.fl_tol)
+            is_FL = (theta_choice <= theta0 * (1.0 - tol)) or (theta_choice <= theta0 + 1e-16)
+
+            return s_choice, {
+                "t": float(t_best),
+                "d": d_default,
+                "breaks": breaks,
+                "sigma": float(sigma),
+                "pred_red_cons": float(pred_red_cons),
+                "pred_red_quad": float(pred_red_quad_choice),
+                "Delta_out": float(Delta),
+                "used_multiplier_step": bool(used_mult),
+                "is_FL": bool(is_FL),
             }
-
-        # Criticality sigma with both ineq and eq linearized contributions
-        lin_term = float(g @ d_default)
-        pen_term = 0.0
-        if A_ineq is not None and np.any(A_mask):
-            pen_term += float(self.cfg.mu * np.maximum(0.0, (A_ineq[A_mask] @ d_default)).sum())
-        if A_eq is not None and np.any(E_mask):
-            pen_term += float(self.cfg.mu * np.abs(A_eq[E_mask] @ d_default).sum())
-        sigma = float(-(lin_term + pen_term))
-
-        # Criticality-aware TR clipping
-        if sigma < self.cfg.eps_c:
-            sig = max(sigma, 1e-16)
-            target1 = max(self.cfg.crit_beta1 * sig, 1e-12)
-            target2 = self.cfg.crit_beta2 * sig
-            Delta = min(Delta, target1, target2)
-
-        # Breakpoints now include equalities
-        breaks = [0.0] + self._breakpoints(cI0, d_default, A_ineq, Hc_list, Delta, cE0, A_eq)
-        t_tr = Delta / max(norm(d_default, ord=np.inf), 1e-16)
-        if not breaks or breaks[-1] < t_tr:
-            breaks.append(t_tr)
-
-        def mp_interval_value(t: float, d: np.ndarray) -> float:
-            return self._model_mp_value(t, d, g, H, cI0, A_ineq, Hc_list, cE0, A_eq)
-
-        # 1D piecewise quadratic/abs search over [breaks]
-        t_best = 0.0
-        val_best = 0.0
-        for a, b in zip(breaks[:-1], breaks[1:]):
-            t_mid = 0.5 * (a + b)
-            val = mp_interval_value(t_mid, d_default)
-            if t_best == 0.0 or val < val_best:
-                # local quadratic minimizer inside (a,b)
-                coef2 = float(d_default @ (H @ d_default))
-                # slope contribution from penalties at t_mid (subgradient selection)
-                slope_pen = 0.0
-                if A_ineq is not None and A_ineq.size:
-                    aTd_all = (A_ineq @ d_default)
-                    c_mid = cI0 + t_mid * aTd_all
-                    pos_mask = np.flatnonzero(c_mid > 0.0)
-                    if pos_mask.size:
-                        slope_pen += self.cfg.mu * float(np.sum(aTd_all[pos_mask]))
-                    if Hc_list is not None:
-                        for idx in pos_mask:
-                            if idx < len(Hc_list) and Hc_list[idx] is not None:
-                                slope_pen += self.cfg.mu * float(d_default @ (Hc_list[idx] @ d_default)) * t_mid
-                if A_eq is not None and cE0 is not None and A_eq.size and cE0.size:
-                    aTdE = (A_eq @ d_default)
-                    e_mid = cE0 + t_mid * aTdE
-                    # subgradient of |.| is sign(.) (take 0 in case of exact zero)
-                    slope_pen += self.cfg.mu * float(np.sum(np.sign(e_mid) * aTdE))
-
-                coef1 = float(g @ d_default) + slope_pen
-                t_star = t_mid
-                if abs(coef2) > 1e-16:
-                    t_star = float(np.clip(-coef1 / coef2, a + 1e-12, b - 1e-12))
-                for t in (t_mid, t_star):
-                    vv = mp_interval_value(t, d_default)
-                    if t_best == 0.0 or vv < val_best:
-                        t_best, val_best = t, vv
-
-        h_default = t_best * d_default
-        cI_h = cI0 + (A_ineq @ h_default) if (A_ineq is not None and h_default.size) else None
-        cE_h = cE0 + (A_eq @ h_default) if (A_eq is not None and h_default.size) else None
-        v_default = self._vk_correction(A_ineq, cI_h, A_eq, cE_h, h_default, Delta)
-        s_default = h_default + v_default
-
-        pred_red_cons = self._conservative_pred_red(sigma=sigma, Delta=Delta, n=self.n)
-        pred_red_quad_default = max(1e-16, -(g @ s_default) - 0.5 * (s_default @ (H @ s_default)))
-
-        # Optional multiplier-augmented step (only if near criticality)
-        used_mult = False
-        s_choice = s_default
-        pred_red_quad_choice = pred_red_quad_default
-        s_mult = None
-
-        if self.cfg.use_multiplier_step and sigma <= self.cfg.mult_sigma_thresh:
-            lam = self._estimate_multipliers(grad_mp1=grad_mp1, A_ineq=A_ineq, A_mask=A_mask)
-            if lam is not None and np.all(lam >= -1e-12) and np.all(lam <= self.cfg.mu + 1e-12):
-                H_eff, g_eff = self._effective_H_and_g(g, H, A_ineq, Hc_list, lam, A_mask, V_mask)
-                h_mult = self._solve_box_newton(H_eff, g_eff, Delta)
-                cI_hm = cI0 + (A_ineq @ h_mult) if (A_ineq is not None and h_mult.size) else None
-                cE_hm = cE0 + (A_eq @ h_mult) if (A_eq is not None and h_mult.size) else None
-                v_mult = self._vk_correction(A_ineq, cI_hm, A_eq, cE_hm, h_mult, Delta)
-                s_mult = h_mult + v_mult
-                mp_def = mp_interval_value(1.0, s_default)
-                mp_mul = mp_interval_value(1.0, s_mult)
-                if mp_mul < mp_def:
-                    s_choice = s_mult
-                    used_mult = True
-                    pred_red_quad_choice = max(1e-16, -(g @ s_mult) - 0.5 * (s_mult @ (H @ s_mult)))
-
-        # Feasibility decrease check
-        theta0 = self._violation_measure(cI0, cE0)
-        cI_def = cI0 + (A_ineq @ s_default) if (A_ineq is not None and s_default is not None and s_default.size) else None
-        cE_def = cE0 + (A_eq @ s_default) if (A_eq is not None and s_default is not None and s_default.size) else None
-        theta_def = self._violation_measure(cI_def, cE_def)
-        theta_mult = None
-        if s_mult is not None:
-            cI_mul = cI0 + (A_ineq @ s_mult) if (A_ineq is not None and s_mult.size) else None
-            cE_mul = cE0 + (A_eq @ s_mult) if (A_eq is not None and s_mult.size) else None
-            theta_mult = self._violation_measure(cI_mul, cE_mul)
-        theta_choice = theta_mult if (used_mult and theta_mult is not None) else theta_def
-        tol = float(self.cfg.fl_tol)
-        is_FL = (theta_choice <= theta0 * (1.0 - tol)) or (theta_choice <= theta0 + 1e-16)
-
-        return s_choice, {
-            "t": float(t_best),
-            "d": d_default,
-            "breaks": breaks,
-            "sigma": float(sigma),
-            "pred_red_cons": float(pred_red_cons),
-            "pred_red_quad": float(pred_red_quad_choice),
-            "Delta_out": float(Delta),
-            "used_multiplier_step": bool(used_mult),
-            "is_FL": bool(is_FL),
-        }
-
     # -------- Conservative predicted reduction --------
     def _conservative_pred_red(self, sigma: float, Delta: float, n: int) -> float:
         kfd, kH, kc = self.cfg.k_fd, self.cfg.k_H, self.cfg.k_c

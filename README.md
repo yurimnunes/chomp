@@ -1,6 +1,6 @@
 <img src="logo.png" alt="logo" width="400"/>
 
-# 🦖 CHOMP — *CHOMP Handles Optimization of Many Problems*
+# CHOMP — **C**HOMP **H**andles **O**ptimization of **M**any **P**roblems (recurrently)
 
 **CHOMP** is a modular **Nonlinear Programming (NLP) solver** that can *chomp through tough constrained problems* using multiple state-of-the-art strategies:
 
