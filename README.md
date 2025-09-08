@@ -45,7 +45,7 @@ CHOMP combines **automatic differentiation**, **sparse linear algebra**, and **a
 ## 📦 Installation
 
 ```bash
-git clone https://github.com/your-org/chomp.git
+git clone https://github.com/lseman/chomp.git
 cd chomp
 pip install -e .
 ```
@@ -54,7 +54,6 @@ pip install -e .
 
 * Python ≥ 3.9
 * NumPy, SciPy
-* [qdldl-cpp](https://github.com/oxfordcontrol/qdldl) (exposed via pybind11)
 
 ---
 
