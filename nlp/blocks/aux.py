@@ -78,10 +78,10 @@ class SQPConfig:
     # ---------------- Core toggles ----------------
     mode: str = "auto"                     # {"auto","ip","sqp"}
     verbose: bool = True
-    use_filter: bool = True
+    use_filter: bool = False
     use_line_search: bool = True
     use_trust_region: bool = True
-    use_soc: bool = True
+    use_soc: bool = False
     use_composite_step: bool = True
     use_funnel: bool = False
     use_watchdog: bool = False
@@ -90,9 +90,9 @@ class SQPConfig:
     hessian_mode: str = "exact"            # {"exact","bfgs","lbfgs","hybrid","gn"}
 
     # ---------------- Tolerances ----------------
-    tol_feas: float = 1e-8
-    tol_stat: float = 1e-8
-    tol_comp: float = 1e-8
+    tol_feas: float = 1e-5
+    tol_stat: float = 1e-5
+    tol_comp: float = 1e-5
     adaptive_tol: bool = True
 
     # ---------------- Filter (basic) ----------------

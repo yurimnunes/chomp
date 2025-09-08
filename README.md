@@ -157,15 +157,6 @@ print(H)  # full 2x2 matrix
 
 ---
 
-## 🚀 Roadmap
-
-* [ ] CUDA acceleration
-* [ ] Better visualization (interactive graph viewers)
-* [ ] JAX/PyTorch interop
-* [ ] Sparse Hessian support
-
----
-
 ## 📖 Citation
 
 If you use **capyAD** in research, please cite:

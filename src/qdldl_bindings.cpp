@@ -74,6 +74,40 @@ make_ordering_from_numpy(py::object maybe_perm, std::int64_t n)
     return qdldl::make_ordering<std::int64_t>(std::move(perm));
 }
 
+// NEW: parse string-or-array ordering; compute AMD when requested
+static inline qdldl::Ordering<std::int64_t>
+parse_ordering_or_compute(
+    py::object perm_or_str,
+    const SparseMatrixD& A,
+    std::int64_t n)
+{
+    if (perm_or_str.is_none()) {
+        // identity
+        std::vector<std::int64_t> p(static_cast<std::size_t>(n));
+        std::iota(p.begin(), p.end(), 0);
+        return qdldl::make_ordering<std::int64_t>(std::move(p));
+    }
+
+    // if it's a string, allow "amd", "natural", "identity"
+    if (py::isinstance<py::str>(perm_or_str)) {
+        auto s = perm_or_str.cast<std::string>();
+        for (auto& c : s) c = static_cast<char>(::tolower(c));
+        if (s == "amd") {
+            auto ord = qdldl::amd_ordering<double, std::int64_t>(A);
+            return ord;
+        } else if (s == "natural" || s == "identity" || s == "none") {
+            std::vector<std::int64_t> p(static_cast<std::size_t>(n));
+            std::iota(p.begin(), p.end(), 0);
+            return qdldl::make_ordering<std::int64_t>(std::move(p));
+        } else {
+            throw std::invalid_argument("Unknown ordering string: " + s + " (use 'amd' or 'natural')");
+        }
+    }
+
+    // otherwise assume it is a NumPy permutation array
+    return make_ordering_from_numpy(perm_or_str, n);
+}
+
 // ---------------------------
 // Pybind11 module
 // ---------------------------
@@ -95,7 +129,6 @@ PYBIND11_MODULE(qdldl_cpp, m) {
         .def_property_readonly("L_data",   [](const Factor& f){ return py::array(f.Lx.size(),   f.Lx.data()); })
         .def_property_readonly("D",        [](const Factor& f){ return py::array(f.D.size(),    f.D.data()); })
         .def_property_readonly("Dinv",     [](const Factor& f){ return py::array(f.Dinv.size(), f.Dinv.data()); })
-        // Back-compat: allow dict-like access for old code
         .def("__getitem__", [](const Factor& f, const std::string& key) -> py::object {
             if (key == "positive_eigenvalues") return py::int_(f.posD);
             if (key == "n")                    return py::int_(f.n);
@@ -125,24 +158,47 @@ PYBIND11_MODULE(qdldl_cpp, m) {
         });
 
     // ---------------------------
-    // factorize (optional perm)
+    // NEW: expose AMD permutation computation
+    // ---------------------------
+    m.def("amd",
+        [](py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> indptr,
+           py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> indices,
+           py::array_t<double,       py::array::c_style | py::array::forcecast> data,
+           std::int64_t n)
+        {
+            SparseMatrixD A = make_sparse_from_csc(indptr, indices, data, n);
+            qdldl::Ordering<std::int64_t> ord;
+            {
+                py::gil_scoped_release nogil;
+                ord = qdldl::amd_ordering<double, std::int64_t>(A);
+            }
+            // return perm as numpy array
+            return py::array(ord.perm.size(), ord.perm.data());
+        },
+        py::arg("indptr"), py::arg("indices"), py::arg("data"), py::arg("n"),
+        R"doc(
+Compute an AMD permutation for the given upper-triangular CSC matrix.
+Returns 'perm' such that analyzing/factorizing P*A*P^T reduces fill.
+)doc");
+
+    // ---------------------------
+    // factorize (perm: None | ndarray | "amd" | "natural")
     // ---------------------------
     m.def("factorize",
         [](py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> indptr,
            py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> indices,
            py::array_t<double,       py::array::c_style | py::array::forcecast> data,
            std::int64_t n,
-           py::object perm /* = None */)
+           py::object perm /* = None | "amd" | "natural" | ndarray */)
         {
             SparseMatrixD A = make_sparse_from_csc(indptr, indices, data, n);
 
             LDLFactorization<double, std::int64_t> fac(n);
             {
-                py::gil_scoped_release nogil;
                 if (perm.is_none()) {
                     fac = QDLDLSolverD::factorize(A);
                 } else {
-                    auto ord = make_ordering_from_numpy(perm, n);
+                    auto ord = parse_ordering_or_compute(perm, A, n); // UPDATED
                     fac = QDLDLSolverD::factorize_with_ordering(A, ord);
                 }
             }
@@ -161,7 +217,11 @@ PYBIND11_MODULE(qdldl_cpp, m) {
         py::arg("perm") = py::none(),
         R"doc(
 Factorize an upper-triangular CSC matrix (n x n) using QDLDL.
-Optionally takes a permutation 'perm' (int64, shape [n]) to factorize P*A*P^T.
+'perm' may be:
+  - None (natural ordering)
+  - "amd" (compute AMD internally)
+  - "natural" (explicit identity)
+  - an int64 NumPy array with shape [n] (custom permutation)
 )doc");
 
     // Back-compat shim
@@ -176,26 +236,25 @@ Optionally takes a permutation 'perm' (int64, shape [n]) to factorize P*A*P^T.
         "Compatibility alias of factorize() without permutation.");
 
     // ---------------------------
-    // analyze (optional perm) -> Symbolic
+    // analyze (perm: None | ndarray | "amd" | "natural") -> Symbolic
     // ---------------------------
     m.def("analyze",
         [](py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> indptr,
            py::array_t<std::int64_t, py::array::c_style | py::array::forcecast> indices,
            py::array_t<double,       py::array::c_style | py::array::forcecast> data,
            std::int64_t n,
-           py::object perm /* = None */)
+           py::object perm /* = None | "amd" | "natural" | ndarray */)
         {
             SparseMatrixD A = make_sparse_from_csc(indptr, indices, data, n);
             SymbolicHandle out;
             out.n = n;
 
             {
-                py::gil_scoped_release nogil;
                 if (perm.is_none()) {
                     out.S = QDLDLSolverD::analyze(A);
                     out.has_perm = false;
                 } else {
-                    auto ord = make_ordering_from_numpy(perm, n);
+                    auto ord = parse_ordering_or_compute(perm, A, n); // UPDATED
                     out.S = QDLDLSolverD::analyze_with_ordering(A, ord);
                     out.perm  = std::move(ord.perm);
                     out.iperm = std::move(ord.iperm);
@@ -207,7 +266,8 @@ Optionally takes a permutation 'perm' (int64, shape [n]) to factorize P*A*P^T.
         py::arg("indptr"), py::arg("indices"), py::arg("data"), py::arg("n"),
         py::arg("perm") = py::none(),
         R"doc(
-Symbolic analysis (etree + L column pointers). Optionally with permutation 'perm'.
+Symbolic analysis (etree + L column pointers).
+'perm' may be None, "amd", "natural", or a NumPy int64 array of shape [n].
 Returns a Symbolic handle you can pass to refactorize().
 )doc");
 
@@ -234,7 +294,6 @@ Returns a Symbolic handle you can pass to refactorize().
                     ord.n     = S.n;
                     ord.perm  = S.perm;
                     ord.iperm = S.iperm;
-                    // numeric on P*A*P^T using precomputed S of the permuted structure
                     fac = QDLDLSolverD::refactorize_with_ordering(A, S.S, ord);
                 }
             }
@@ -323,5 +382,5 @@ Faster when sparsity pattern is unchanged but values change.
         "Solve then apply a few steps of iterative refinement.");
 
     // Tiny info
-    m.def("version", [](){ return std::string("qdldl_cpp 1.2 (ordering+symbolic)"); });
+    m.def("version", [](){ return std::string("qdldl_cpp 1.3 (amd+ordering+symbolic)"); }); // UPDATED
 }
