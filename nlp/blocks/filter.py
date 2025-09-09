@@ -259,26 +259,29 @@ class Filter:
         self.initial_theta = None
         self.initial_f = None
         logging.info("[Filter] reset")
-    
+
+import logging
+from typing import List, Tuple
+
+import numpy as np
+
+
 class Funnel:
     """
     Scalar funnel mechanism for globalization with separate f- and h-type steps.
-
     A trial point (θ_new, f_new) is acceptable if:
-      (i)  θ_new ≤ τ  (must stay within the funnel), and
+      (i) θ_new ≤ τ (must stay within the funnel), and
       (ii) it passes either:
-           - f-type: Armijo decrease in objective:   Δf_actual ≥ σ Δf_pred
+           - f-type: Armijo decrease in objective: Δf_actual ≥ σ Δf_pred
            - h-type: sufficient infeasibility decrease relative to current τ:
-                     Δθ_actual ≥ σ Δθ_pred  and  θ_new ≤ β τ
+                     Δθ_actual ≥ σ Δθ_pred and θ_new ≤ β τ
     On h-type acceptance, the funnel width τ is updated by a convex combination
     between θ_new and the previous τ to contract the funnel.
-
     Parameters
     ----------
     cfg : SQPConfig
         Configuration object providing the attributes documented in the module
         docstring under "Required SQPConfig fields (for Funnel)".
-
     Attributes
     ----------
     tau : float
@@ -291,6 +294,12 @@ class Funnel:
 
     def __init__(self, cfg: 'SQPConfig'):
         self.cfg = cfg
+        # Validate parameters
+        assert 0 < self.cfg.funnel_sigma < 1, "sigma must be in (0,1)"
+        assert 0 < self.cfg.funnel_beta < 1, "beta must be in (0,1)"
+        assert 0 < self.cfg.funnel_kappa < 1, "kappa must be in (0,1)"
+        assert self.cfg.funnel_delta > 0, "delta must be positive"
+        assert self.cfg.funnel_min_tau >= 0, "min_tau must be non-negative"
         self.tau: float = float(self.cfg.funnel_initial_tau)
         self.iter: int = 0
         self.history: List[Tuple[float, float]] = []  # (theta, f)
@@ -313,7 +322,6 @@ class Funnel:
     ) -> bool:
         """
         Check funnel acceptability of a trial point.
-
         Parameters
         ----------
         current_theta, current_f : float
@@ -324,26 +332,22 @@ class Funnel:
             Model-predicted decrease in objective (≥ 0 meaning 'expected improvement').
         predicted_dtheta : float
             Model-predicted decrease in infeasibility (≥ 0).
-
         Returns
         -------
         bool
             True if acceptable, False otherwise.
         """
-        if new_theta < 0 or not np.isfinite(new_f) or current_theta < 0:
+        if new_theta < 0 or current_theta < 0 or not np.isfinite(new_f) or predicted_dtheta < 0:
             return False
-
         eps = 1e-10
-        actual_df = current_f - new_f          # positive if objective decreased
+        actual_df = current_f - new_f  # positive if objective decreased
         actual_dtheta = current_theta - new_theta  # positive if infeasibility decreased
-
         # 1) Must be inside the funnel
         if new_theta > self.tau + eps:
             return False
-
         # 2) Switching: decide f-type vs h-type
-        #    If predicted objective decrease is 'large enough' relative to θ^2,
-        #    prefer f-type; otherwise do h-type checks.
+        # If predicted objective decrease is 'large enough' relative to θ^2,
+        # prefer f-type; otherwise do h-type checks.
         if predicted_df >= self.cfg.funnel_delta * (current_theta ** 2) - eps:
             # f-type: Armijo on objective
             return self._armijo_f(actual_df, predicted_df)
@@ -361,28 +365,25 @@ class Funnel:
     ) -> bool:
         """
         Accept a trial point if it meets funnel criteria; update τ on h-type.
-
         Parameters
         ----------
         (see `is_acceptable`)
-
         Returns
         -------
         bool
             True if accepted (and τ possibly updated), False otherwise.
         """
+        if self.iter == 0:
+            self.tau = max(self.tau, self.cfg.funnel_kappa_initial * current_theta)  # Ensure initial acceptability
         if not self.is_acceptable(current_theta, current_f, new_theta, new_f, predicted_df, predicted_dtheta):
             logging.debug(f"[Funnel] reject (θ={new_theta:.3e}, f={new_f:.3e})")
             return False
-
         eps = 1e-10
         is_f_type = predicted_df >= self.cfg.funnel_delta * (current_theta ** 2) - eps
-
         # Optional bounded history for diagnostics
         self.history.append((new_theta, new_f))
         if len(self.history) > self.cfg.funnel_max_history:
             self.history.pop(0)
-
         # τ update on h-type only (contract toward θ_new)
         if not is_f_type:
             self.tau = max(
@@ -390,7 +391,6 @@ class Funnel:
                 (1 - self.cfg.funnel_kappa) * new_theta + self.cfg.funnel_kappa * self.tau
             )
             logging.debug(f"[Funnel] τ updated to {self.tau:.3e}")
-
         self.iter += 1
         logging.debug(f"[Funnel] accept (θ={new_theta:.3e}, f={new_f:.3e}); "
                       f"type={'f' if is_f_type else 'h'}, τ={self.tau:.3e}")

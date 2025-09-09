@@ -79,12 +79,12 @@ class SQPConfig:
     mode: str = "auto"                     # {"auto","ip","sqp"}
     verbose: bool = True
     use_filter: bool = False
-    use_line_search: bool = True
+    use_line_search: bool = False
     use_trust_region: bool = True
     use_soc: bool = False
-    use_composite_step: bool = True
+    use_composite_step: bool = False
     use_funnel: bool = False
-    use_watchdog: bool = False
+    use_watchdog: bool = True
     use_nonmonotone_ls: bool = False
     use_active_set_prediction: bool = False
     hessian_mode: str = "exact"            # {"exact","bfgs","lbfgs","hybrid","gn"}
@@ -267,6 +267,8 @@ class Model:
         c_ineq: List[Callable] | None = None,
         c_eq: List[Callable] | None = None,
         n: int | None = None,
+        lb: np.ndarray | None = None,
+        ub: np.ndarray | None = None,
         use_sparse: bool = False,
     ):
         """Initialize model with objective `f`, constraints, and dimension `n`."""
@@ -444,48 +446,173 @@ class Model:
         self._cache_x = x_key
         return res  # type: ignore[return-value]
 
-    def lagrangian_hessian(self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray) -> Union[np.ndarray, sp.spmatrix]:
-        """Compute Lagrangian Hessian: H_f + Σ_i λ_i H_{cI_i} + Σ_j ν_j H_{cE_j}."""
-        if x.shape[0] != self.n or lam.shape[0] != self.m_ineq or nu.shape[0] != self.m_eq:
-            raise ValueError(f"Incompatible shapes: x={x.shape}, lam={lam.shape}, nu={nu.shape}")
+    def lagrangian_hessian(
+        self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
+    ) -> Union[np.ndarray, sp.spmatrix]:
+        """
+        Robust ∇²_x L(x,λ,ν) = H_f(x) + Σ_i λ_i H_{cI_i}(x) + Σ_j ν_j H_{cE_j}(x).
+
+        Hardening features:
+        • Per-term np.errstate to avoid runtime floating warnings.
+        • NaN/Inf → 0.0 sanitization + magnitude clipping.
+        • Strict symmetrization for every piece.
+        • Graceful handling of m_ineq==0 / m_eq==0 / missing callables.
+        • Final "finite" check with identity fallback.
+        • Optional tiny diagonal floor to prevent near-singular diagonals.
+
+        Tunables (via self.cfg, optional):
+        - multiplier_threshold (default 1e-8)
+        - hess_clip_max (default 1e12)
+        - hess_diag_floor (default 0.0; set >0 to enforce tiny diagonal)
+        """
+        import logging
+
+        # --- config & shapes ---
+        n   = int(getattr(self, "n", x.shape[0]))
+        mI  = int(getattr(self, "m_ineq", 0))
+        mE  = int(getattr(self, "m_eq", 0))
+        use_sparse = bool(getattr(self, "use_sparse", False))
+
+        cfg = getattr(self, "cfg", None)
+        multiplier_threshold = float(getattr(cfg, "multiplier_threshold", 1e-8))
+        clip_max             = float(getattr(cfg, "hess_clip_max", 1e12))
+        diag_floor           = float(getattr(cfg, "hess_diag_floor", 0.0))
+
+        # --- validate inputs softly ---
+        if x.shape[0] != n:
+            raise ValueError(f"Incompatible x shape: expected ({n},), got {x.shape}")
+        lam = np.asarray(lam, dtype=float).ravel()
+        nu  = np.asarray(nu,  dtype=float).ravel()
+
+        if lam.size != mI:
+            logging.warning(f"[lagrangian_hessian] λ size {lam.size} != m_ineq {mI}; clipping to min.")
+            lam = lam[:mI]
+        if nu.size != mE:
+            logging.warning(f"[lagrangian_hessian] ν size {nu.size} != m_eq {mE}; clipping to min.")
+            nu = nu[:mE]
+
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(lam)) and np.all(np.isfinite(nu))):
             raise ValueError("Non-finite values in x, lam, or nu")
 
-        multiplier_threshold = getattr(self, "cfg", None)
-        multiplier_threshold = getattr(multiplier_threshold, "multiplier_threshold", 1e-8)
+        # --- helpers ---
+        def _to_type(A):
+            """Cast to configured storage type (sparse CSR or dense ndarray)."""
+            if use_sparse:
+                return A if sp.issparse(A) else sp.csr_matrix(np.asarray(A, dtype=float))
+            else:
+                return A.toarray() if sp.issparse(A) else np.asarray(A, dtype=float)
 
-        H = self.eval_all(x, components=["H"])["H"].copy()  # type: ignore[index]
-        for li, Hi in zip(lam, self.cI_hess):
-            if abs(li) > multiplier_threshold:
-                try:
-                    H_i = np.asarray(Hi(x), dtype=float)
-                    if self.use_sparse:
-                        H_i = sp.csr_matrix(H_i)
-                    if (sp.issparse(H_i) and (H_i - H_i.T).nnz != 0) or (
-                        not sp.issparse(H_i) and not np.allclose(H_i, H_i.T, rtol=1e-10)
-                    ):
-                        H_i = 0.5 * (H_i + H_i.T)
-                    H += li * H_i
-                except Exception as e:
-                    logging.warning(f"Inequality Hessian evaluation failed: {e}; skipping")
+        def _symmetrize(A):
+            return (A + A.T) * 0.5 if sp.issparse(A) else 0.5 * (A + A.T)
 
-        for ni, Hi in zip(nu, self.cE_hess):
-            if abs(ni) > multiplier_threshold:
-                try:
-                    H_i = np.asarray(Hi(x), dtype=float)
-                    if self.use_sparse:
-                        H_i = sp.csr_matrix(H_i)
-                    if (sp.issparse(H_i) and (H_i - H_i.T).nnz != 0) or (
-                        not sp.issparse(H_i) and not np.allclose(H_i, H_i.T, rtol=1e-10)
-                    ):
-                        H_i = 0.5 * (H_i + H_i.T)
-                    H += ni * H_i
-                except Exception as e:
-                    logging.warning(f"Equality Hessian evaluation failed: {e}; skipping")
+        def _sanitize(A):
+            """Replace NaN/Inf → 0, clip |A|, keep type."""
+            if sp.issparse(A):
+                data = A.data.copy()
+                # NaN/Inf -> 0
+                bad = ~np.isfinite(data)
+                if np.any(bad):
+                    data[bad] = 0.0
+                # clip absurd magnitudes
+                np.clip(data, -clip_max, clip_max, out=data)
+                A = sp.csr_matrix((data, A.indices, A.indptr), shape=A.shape)
+                return A
+            else:
+                B = np.asarray(A, dtype=float)
+                # NaN/Inf -> 0
+                if not np.isfinite(B).all():
+                    B = np.nan_to_num(B, nan=0.0, posinf=0.0, neginf=0.0)
+                # clip
+                np.clip(B, -clip_max, clip_max, out=B)
+                return B
 
-        if not np.all(np.isfinite(H.data if sp.issparse(H) else H)):
-            logging.warning("Non-finite Lagrangian Hessian; resetting to identity")
-            H = sp.eye(self.n, format="csr") if self.use_sparse else np.eye(self.n)
+        def _ensure_shape(A):
+            """Ensure n×n; if mismatched, warn and skip by returning None."""
+            if A.shape != (n, n):
+                logging.warning(f"[lagrangian_hessian] Hessian piece has shape {A.shape}, expected {(n,n)}; skipping.")
+                return None
+            return A
+
+        def _add_piece(H_acc, weight, Hi_callable):
+            if Hi_callable is None or abs(weight) <= multiplier_threshold:
+                return H_acc
+            try:
+                with np.errstate(all="ignore"):
+                    H_i = Hi_callable(x)
+            except Exception as e:
+                logging.warning(f"[lagrangian_hessian] constraint Hessian raised {e}; skipping.")
+                return H_acc
+
+            H_i = _to_type(H_i)
+            H_i = _ensure_shape(H_i)
+            if H_i is None:
+                return H_acc
+
+            H_i = _sanitize(H_i)
+            H_i = _symmetrize(H_i)
+
+            return H_acc + weight * H_i
+
+        # --- base Hessian (objective) ---
+        try:
+            with np.errstate(all="ignore"):
+                H_base = self.eval_all(x, components=["H"]).get("H", None)
+        except Exception as e:
+            logging.warning(f"[lagrangian_hessian] eval_all failed to get H: {e}; using zeros.")
+            H_base = None
+
+        if H_base is None:
+            H = sp.csr_matrix((n, n)) if use_sparse else np.zeros((n, n), dtype=float)
+        else:
+            H = _to_type(H_base)
+            H = _ensure_shape(H)
+            if H is None:
+                H = sp.csr_matrix((n, n)) if use_sparse else np.zeros((n, n), dtype=float)
+            H = _sanitize(H)
+            H = _symmetrize(H)
+            if use_sparse:
+                H = H.tocsr()
+
+        # --- add inequality pieces ---
+        cI_hess_list = getattr(self, "cI_hess", None) or []
+        if len(cI_hess_list) < lam.size:
+            logging.warning(f"[lagrangian_hessian] cI_hess length {len(cI_hess_list)} < λ size {lam.size}; extras ignored.")
+        for li, Hi in zip(lam, cI_hess_list):
+            H = _add_piece(H, li, Hi)
+
+        # --- add equality pieces ---
+        cE_hess_list = getattr(self, "cE_hess", None) or []
+        if len(cE_hess_list) < nu.size:
+            logging.warning(f"[lagrangian_hessian] cE_hess length {len(cE_hess_list)} < ν size {nu.size}; extras ignored.")
+        for ni, Hi in zip(nu, cE_hess_list):
+            H = _add_piece(H, ni, Hi)
+
+        # --- optional tiny diagonal floor to avoid near-singular diagonals ---
+        if diag_floor > 0.0:
+            if use_sparse:
+                d = H.diagonal()
+                fix = (np.abs(d) < diag_floor) | ~np.isfinite(d)
+                if np.any(fix):
+                    add = sp.diags(diag_floor * fix.astype(float))
+                    H = (H + add).tocsr()
+            else:
+                d = np.diag(H)
+                fix = (np.abs(d) < diag_floor) | ~np.isfinite(d)
+                if np.any(fix):
+                    H = H.copy()
+                    idx = np.where(fix)[0]
+                    H[idx, idx] = diag_floor
+
+        # --- final sanity: finite or fallback ---
+        if use_sparse:
+            if not np.all(np.isfinite(H.data)):
+                logging.warning("[lagrangian_hessian] non-finite entries after assembly; falling back to identity.")
+                H = sp.eye(n, format="csr")
+        else:
+            if not np.all(np.isfinite(H)):
+                logging.warning("[lagrangian_hessian] non-finite entries after assembly; falling back to identity.")
+                H = np.eye(n)
+
         return H
 
     def constraint_violation(self, x: np.ndarray) -> float:
@@ -514,7 +641,7 @@ class Model:
         return theta
 
     def kkt_residuals(self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray) -> Dict[str, float]:
-        """Compute KKT residuals (stationarity, feasibility; complementarity omitted here)."""
+        """Compute KKT residuals: stationarity, feasibility, and complementarity."""
         if x.shape[0] != self.n or lam.shape[0] != self.m_ineq or nu.shape[0] != self.m_eq:
             raise ValueError(f"Incompatible shapes: x={x.shape}, lam={lam.shape}, nu={nu.shape}")
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(lam)) and np.all(np.isfinite(nu))):
@@ -522,39 +649,55 @@ class Model:
 
         mI, mE, n = self.m_ineq, self.m_eq, self.n
         d = self.eval_all(x, components=["g", "JI", "cI", "JE", "cE"])
-
         g = np.asarray(d.get("g", np.zeros(n)), dtype=float).ravel()
-        cI = _clean_vec(d.get("cI", None), mI) if mI > 0 else np.zeros(0, dtype=float)  # type: ignore[arg-type]
-        cE = _clean_vec(d.get("cE", None), mE) if mE > 0 else np.zeros(0, dtype=float)  # type: ignore[arg-type]
-
+        cI = _clean_vec(d.get("cI", None), mI) if mI > 0 else np.zeros(0, dtype=float)
+        cE = _clean_vec(d.get("cE", None), mE) if mE > 0 else np.zeros(0, dtype=float)
         JI = d.get("JI", None)
         JE = d.get("JE", None)
         if JI is None and mI > 0:
             JI = _zero_mat(mI, n)
         if JE is None and mE > 0:
             JE = _zero_mat(mE, n)
-
         lam = _clean_vec(lam, mI) if mI > 0 else np.zeros(0, dtype=float)
         nu = _clean_vec(nu, mE) if mE > 0 else np.zeros(0, dtype=float)
+
+        # Ensure non-negative multipliers for inequalities
+        lam = np.maximum(lam, 0.0)
 
         # Stationarity: g + JIᵀ λ + JEᵀ ν
         rL = g.copy()
         if mI > 0:
-            rL += (JI.T @ lam) if sp.issparse(JI) else (np.asarray(JI, float).T @ lam)  # type: ignore[operator]
+            rL += (JI.T @ lam) if sp.issparse(JI) else (np.asarray(JI, float).T @ lam)
         if mE > 0:
-            rL += (JE.T @ nu) if sp.issparse(JE) else (np.asarray(JE, float).T @ nu)  # type: ignore[operator]
+            rL += (JE.T @ nu) if sp.issparse(JE) else (np.asarray(JE, float).T @ nu)
 
-        scale_g = max(1.0, float(np.linalg.norm(g, ord=np.inf)), self.n)
+        # Scaling factor based on gradient norm
+        scale_g = max(1.0, float(np.linalg.norm(g, ord=np.inf)))
         stat_inf = float(np.linalg.norm(rL, ord=np.inf)) / scale_g
         ineq_inf = float(np.linalg.norm(np.maximum(0.0, cI), ord=np.inf)) / scale_g if mI > 0 else 0.0
         eq_inf = float(np.linalg.norm(cE, ord=np.inf)) / scale_g if mE > 0 else 0.0
 
-        residuals = {"stat": stat_inf, "ineq": ineq_inf, "eq": eq_inf, "comp": 0.0}
-        if not all(np.isfinite(v) for v in residuals.values()):
-            logging.warning(f"Non-finite KKT residuals: {residuals}")
-            residuals = {k: float("inf") for k in residuals}
-        return residuals
+        # Complementarity: max(|λ_i * cI_i|) for inequality constraints
+        comp_inf = 0.0
+        if mI > 0:
+            comp_terms = np.abs(lam * cI)  # λ_i * g_i should be ≈ 0
+            comp_inf = float(np.max(comp_terms)) / scale_g if comp_terms.size > 0 else 0.0
 
+        residuals = {
+            "stat": stat_inf,
+            "ineq": ineq_inf,
+            "eq": eq_inf,
+            "comp": comp_inf,
+        }
+
+        # Log raw residuals for debugging
+        if not all(np.isfinite(v) for v in residuals.values()):
+            logging.warning(f"Non-finite KKT residuals: {residuals}, raw comp terms: {comp_terms if mI > 0 else []}")
+            residuals = {k: float("inf") for k in residuals}
+        elif comp_inf > 1e-4:  # Log large complementarity terms
+            logging.debug(f"KKT comp terms: {comp_terms if mI > 0 else []}")
+
+        return residuals
     def reset_cache(self):
         """Clear evaluation cache."""
         self._cache.clear()
