@@ -117,10 +117,7 @@ class DFOExactPenaltyStepper:
 
     # ------------- public API -------------
     def step(self, nlp_model: Model, x: np.ndarray, state: DFOExactState, it: int):
-        import logging
-        logging.basicConfig(level=logging.DEBUG)
-
-        # Register oracle
+        # ---------------- registrar/oracle ----------------
         def make_model_oracle(model: Model, mI: int, mE: int):
             def oracle(x_in: np.ndarray):
                 out = model.eval_all(x_in, components=['f', 'cI', 'cE'])
@@ -129,32 +126,33 @@ class DFOExactPenaltyStepper:
                 cE = out['cE'] if out['cE'] is not None else np.zeros(mE)
                 return f, cI, cE
             return oracle
+
         self.core.set_oracle(make_model_oracle(nlp_model, self.mI, self.mE))
 
-        # Sync penalty with core
+        # Sync penalty with core (mu, eps_active)
         self.core.cfg.mu = float(state.mu)
         self.core.cfg.eps_active = float(state.eps_active)
 
-        # Radius (ℓ∞ TR)
-        Delta = self.tr.get_radius() if self.tr is not None else state.radius
+        # ---------------- trust-region radius ----------------
         tr_min = float(getattr(self.cfg, 'dfo_al_tr_min', 1e-10))
+        Delta = self.tr.get_radius() if self.tr is not None else state.radius
+        Delta = max(tr_min, float(Delta))
         if self.tr is not None:
-            self.tr.set_radius(max(tr_min, Delta))
+            self.tr.set_radius(Delta)
         else:
-            state.radius = max(tr_min, Delta)
-        Delta = max(tr_min, Delta)
+            state.radius = Delta
 
-        # Ensure the core sees the center sample
+        # ---------------- ensure center sample ----------------
         d0 = self._eval_cached(nlp_model, x)
         cI0 = np.asarray(d0.get('cI', np.zeros(self.mI))) if self.mI else np.zeros(0)
         cE0 = np.asarray(d0.get('cE', np.zeros(self.mE))) if self.mE else np.zeros(0)
         self.core.add_sample(x, float(d0['f']), cI0, cE0)
 
-        # Criticality loop
+        # ---------------- criticality loop ----------------
         Delta, eps_new, sigma_crit = self.core.criticality_loop(xk=x, eps=state.eps_active, Delta_in=Delta)
         state.eps_active = float(eps_new)
 
-        # Local model & step proposal
+        # ---------------- local model + proposal ----------------
         fit = self.core.fit_local(center=x, Delta=Delta)
         h, step_info = self.core.propose_step(x, Delta, fit, cI0=cI0, cE0=cE0)
         step_norm_inf = float(norm(h, ord=np.inf))
@@ -162,7 +160,48 @@ class DFOExactPenaltyStepper:
         step_info['sigma'] = sigma
         H_reg, _ = make_psd_advanced(fit.H, self.regularizer, it)
 
-        # Trial evaluation
+        # ---------------- predicted reduction (penalty model) ----------------
+        # Use a conservative penalty-model prediction for the acceptance ratio and TR update,
+        # mirroring the C++ flow (pred from l1TrustRegionStep).
+        pred_red_cons = float(self.core._conservative_pred_red(sigma=max(sigma, 0.0), Delta=Delta, n=self.n))
+        print(" it", it, "step_inf", step_norm_inf, "Delta", Delta,
+              "pred_red_cons", pred_red_cons, "sigma", sigma)
+        # Guard: if no predicted decrease, reject without evaluating expensive oracle at trial
+        if not np.isfinite(pred_red_cons) or pred_red_cons <= 0.0:
+            # shrink TR and return no move
+            if self.tr is not None:
+                self.tr.update(pred_red=0.0, act_red=0.0, step_norm=0.0,
+                            theta0=nlp_model.constraint_violation(x), kkt=None, act_sz=0, H=H_reg, step=np.zeros_like(x))
+                curR = self.tr.get_radius()
+            else:
+                state.radius = max(tr_min, self.core.cfg.tr_dec * Delta)
+                curR = state.radius
+            info = {
+                'step_norm': 0.0,
+                'accepted': False,
+                'converged': False,
+                'f': float(d0['f']),
+                'theta': nlp_model.constraint_violation(x),
+                'stat': nlp_model.kkt_residuals(x, state.lam, state.nu).get('stat', 1e6),
+                'ineq': 0.0, 'eq': 0.0, 'comp': 0.0,
+                'ls_iters': 0,
+                'alpha': float(step_info.get('t', 0.0)),
+                'rho': float('-inf'),
+                'sigma': float(sigma),
+                'pred_red_cons': 0.0,
+                'pred_red_quad': float(step_info.get('pred_red_quad', 0.0)),
+                'tr_radius': float(curR),
+                'mode': 'dfo_exact_penalty_core',
+                'solve_success': True,
+                'solve_info': {'core': step_info},
+                'model_samples': int(self.core.arrays()[0].shape[0]),
+                'cache_hits': int(self._cache_hits),
+                'penalty_mu': float(state.mu),
+                'used_multiplier_step': bool(step_info.get('used_multiplier_step', False)),
+            }
+            return x, state.lam, state.nu, info
+
+        # ---------------- trial evaluation (only if pred > 0) ----------------
         x_trial = x + h
         d1 = self._eval_cached(nlp_model, x_trial)
         f0 = float(d0['f'])
@@ -170,23 +209,20 @@ class DFOExactPenaltyStepper:
         cI1 = np.asarray(d1.get('cI', np.zeros(self.mI))) if self.mI else np.zeros(0)
         cE1 = np.asarray(d1.get('cE', np.zeros(self.mE))) if self.mE else np.zeros(0)
 
-        # Exact penalty values
+        # Exact penalty values and actual red.
         phi0 = state.phi(f0, cI0, cE0)
         phi1 = state.phi(f1, cI1, cE1)
-        act_red = phi0 - phi1
+        act_red = float(phi0 - phi1)
 
-        # Predicted reductions
-        pred_red_quad = float(step_info.get('pred_red_quad', max(1e-16, -(fit.g @ h) - 0.5 * (h @ (fit.H @ h)))))
-        pred_red_cons = self.core._conservative_pred_red(sigma=float(sigma), Delta=Delta, n=self.n)
-        pred_red_tr = max(1e-16, pred_red_cons)
+        # ρ uses penalty-model prediction (consistent units)
+        eps_rho = 1e-16
+        rho = float(act_red / max(pred_red_cons, eps_rho))
 
-        # Ratio for accept/reject
-        rho = float(act_red / max(pred_red_quad, 1e-16))
         eta0 = float(getattr(self.cfg, 'dfo_eta0', self.core.cfg.eta0))
         eta1 = float(getattr(self.cfg, 'dfo_eta1', self.core.cfg.eta1))
         is_FL = bool(step_info.get('is_FL', fit.diag.get('is_FL', True)))
 
-        # Standard DFO accept/reject
+        # ---------------- accept / reject ----------------
         if rho >= eta1:
             accepted = True
             Delta_new = max(Delta, self.core.cfg.tr_inc * step_norm_inf)
@@ -197,7 +233,7 @@ class DFOExactPenaltyStepper:
             accepted = False
             Delta_new = self.core.cfg.tr_dec * Delta
 
-        # Criticality-aware cap on Delta
+        # ---------------- criticality-aware cap ----------------
         sig = max(float(sigma), 0.0)
         beta1 = float(getattr(self.core.cfg, 'crit_beta1', 1.0))
         beta2 = float(getattr(self.core.cfg, 'crit_beta2', 2.0))
@@ -205,7 +241,7 @@ class DFOExactPenaltyStepper:
         cap2 = beta2 * max(sig, 1e-16)
         Delta_new = min(Delta_new, cap1, cap2)
 
-        # Feasibility filter
+        # ---------------- feasibility filter ----------------
         theta0 = nlp_model.constraint_violation(x)
         theta1 = nlp_model.constraint_violation(x_trial)
         filter_theta_min = float(getattr(self.cfg, 'filter_theta_min', 1e-6))
@@ -213,22 +249,28 @@ class DFOExactPenaltyStepper:
             if not (theta1 <= 1.05 * theta0 + 1e-16):
                 accepted = False
 
-        # Apply TR update
+        # ---------------- apply TR update ----------------
         if self.tr is not None:
-            self.tr.update(pred_red=pred_red_tr, act_red=act_red, step_norm=step_norm_inf,
-                        theta0=theta0, kkt=None, act_sz=0, H=H_reg, step=h)
+            # Use penalty-model prediction for TR update (consistent with rho)
+            self.tr.update(pred_red=pred_red_cons, act_red=act_red, step_norm=step_norm_inf if accepted else 0.0,
+                        theta0=theta0, kkt=None, act_sz=0, H=H_reg, step=h if accepted else np.zeros_like(h))
             curR = self.tr.get_radius()
         else:
             state.radius = max(tr_min, float(Delta_new))
             curR = state.radius
-            
-        self.core.trmodel.radius  = curR
 
-        # Update state
-        x_out = x_trial if accepted else x
-        self.core.add_sample(x_trial, f1, cI1, cE1)
+        self.core.trmodel.radius = curR
+
+        # ---------------- state/model updates ----------------
         if accepted:
-            self.core.on_accept(x_out, f1, cI1, cE1)
+            # Only add the trial sample when accepted (avoid polluting geometry with rejects)
+            self.core.add_sample(x_trial, f1, cI1, cE1)
+            self.core.on_accept(x_trial, f1, cI1, cE1)
+            x_out = x_trial
+        else:
+            x_out = x  # stay
+
+        # Adaptive μ if feasibility stalls
         vcur = max(np.maximum(0.0, cI1).max() if cI1.size else 0.0,
                 np.abs(cE1).max() if cE1.size else 0.0)
         vprev = max(np.maximum(0.0, cI0).max() if cI0.size else 0.0,
@@ -236,83 +278,56 @@ class DFOExactPenaltyStepper:
         if state.adaptive_mu_update(vcur, vprev):
             self.core.cfg.mu = float(state.mu)
 
-        # KKT stats
+        # ---------------- KKT + convergence ----------------
         kkt = nlp_model.kkt_residuals(x_out, state.lam, state.nu)
-        stat = kkt.get('stat', 1e6)
-        ineq = kkt.get('ineq', 0.0)
-        eq = kkt.get('eq', 0.0)
-        comp = kkt.get('comp', 0.0)
+        stat = float(kkt.get('stat', 1e6))
+        ineq = float(kkt.get('ineq', 0.0))
+        eq   = float(kkt.get('eq', 0.0))
+        comp = float(kkt.get('comp', 0.0))
 
-        # SOTA Convergence Check
-        tol = getattr(self.cfg, 'tol', 1e-8)  # From run_solve
-        max_stagnation = getattr(self.cfg, 'max_stagnation', 10)  # Max iterations without progress
-        state.violation_history.append(vcur)
-        if len(state.violation_history) > max_stagnation:
-            state.violation_history.pop(0)
+        tol = getattr(self.cfg, 'tol', 1e-8)
+        max_stagnation = getattr(self.cfg, 'max_stagnation', 10)
 
-        # Convergence criteria
-        converged = False
-        if it > 0:
-            # 1. Step size criterion
-            step_criterion = step_norm_inf <= tol * max(1.0, norm(x_out))
-            # 2. Objective stagnation
-            f_history = getattr(state, 'f_history', [])
-            f_history.append(f1)
-            if len(f_history) > max_stagnation:
-                f_history.pop(0)
-            f_change = max(abs(f1 - f) for f in f_history) if f_history else float('inf')
-            obj_criterion = f_change <= tol * max(1.0, abs(f1))
-            # 3. Constraint violation
-            viol_criterion = vcur <= tol
-            # 4. Criticality measure
-            crit_criterion = sigma <= tol
-            # 5. Stagnation (repeated rejections)
-            rejection_streak = getattr(state, 'rejection_streak', 0)
-            if not accepted:
-                state.rejection_streak = rejection_streak + 1
-            else:
-                state.rejection_streak = 0
-            stagnation_criterion = state.rejection_streak >= max_stagnation
-            # 6. KKT residuals
-            kkt_criterion = stat <= tol and ineq <= tol and eq <= tol and comp <= tol
-
-            # Converged if step size is small, objective/constraints are stable, or KKT conditions are met
-            converged = (
-                (step_criterion and viol_criterion and crit_criterion) or
-                (obj_criterion and viol_criterion and crit_criterion) or
-                kkt_criterion or
-                stagnation_criterion
-            )
-            # if converged:
-            #     logging.info(f"Converged at iteration {it}: "
-            #                 f"step={step_norm_inf:.2e}, f_change={f_change:.2e}, "
-            #                 f"viol={vcur:.2e}, sigma={sigma:.2e}, "
-            #                 f"rejection_streak={state.rejection_streak}, "
-            #                 f"KKT(stat={stat:.2e}, ineq={ineq:.2e}, eq={eq:.2e}, comp={comp:.2e})")
-
-        # Store history for next iteration
+        # Track short history for simple stagnation detection
         state.f_history = getattr(state, 'f_history', [])
-        state.f_history.append(f1)
+        state.f_history.append(float(self._eval_cached(nlp_model, x_out)['f']))
         if len(state.f_history) > max_stagnation:
             state.f_history.pop(0)
 
-        # Info dictionary
+        # Step, objective-change, feasibility, criticality, KKT
+        step_criterion = (step_norm_inf if accepted else 0.0) <= tol * max(1.0, norm(x_out))
+        obj_criterion  = (abs(f1 - f0) if accepted else 0.0) <= tol * max(1.0, abs(f1 if accepted else f0))
+        viol_criterion = vcur <= tol
+        crit_criterion = sig <= tol
+        rejection_streak = getattr(state, 'rejection_streak', 0)
+        if not accepted:
+            state.rejection_streak = rejection_streak + 1
+        else:
+            state.rejection_streak = 0
+        stagnation_criterion = state.rejection_streak >= max_stagnation
+        kkt_criterion = (stat <= tol) and (ineq <= tol) and (eq <= tol) and (comp <= tol)
+
+        converged = (
+            (step_criterion and viol_criterion and crit_criterion) or
+            (obj_criterion  and viol_criterion and crit_criterion) or
+            kkt_criterion or
+            stagnation_criterion
+        )
+
+        # ---------------- info ----------------
         info = {
-            'step_norm': step_norm_inf,
+            'step_norm': float(step_norm_inf if accepted else 0.0),
             'accepted': bool(accepted),
             'converged': bool(converged),
             'f': float(self._eval_cached(nlp_model, x_out)['f']),
             'theta': nlp_model.constraint_violation(x_out),
-            'stat': stat,
-            'ineq': ineq,
-            'eq': eq,
-            'comp': comp,
+            'stat': stat, 'ineq': ineq, 'eq': eq, 'comp': comp,
             'ls_iters': 0,
             'alpha': float(step_info.get('t', 0.0)),
             'rho': float(rho),
-            'sigma': float(sigma),
+            'sigma': float(sig),
             'pred_red_cons': float(pred_red_cons),
-            'pred_red_quad': float(pred_red_quad),
+            'pred_red_quad': float(step_info.get('pred_red_quad', 0.0)),  # kept for logging/comparison only
             'tr_radius': float(curR),
             'mode': 'dfo_exact_penalty_core',
             'solve_success': True,

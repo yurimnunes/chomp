@@ -1,18 +1,36 @@
-cmake_minimum_required(VERSION 3.5)
-# set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
+cmake_minimum_required(VERSION 3.20)
 
-project(ad LANGUAGES C CXX)
+# ------------------------------------------------------------------
+# Project
+# ------------------------------------------------------------------
+project(ad
+  VERSION 0.1.0
+  LANGUAGES CXX C
+)
 
-# Set C++17 as the standard
+# C++ standard (use features without GNU extensions)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Set the C and C++ compilers to musl-gcc set(CMAKE_C_COMPILER "gcc")
-# set(CMAKE_CXX_COMPILER "g++") include(CPM.cmake)
+# Position independent code (safe for shared/pybind modules)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Attempt to include CPM.cmake from provided path
+# Build options
+option(AD_ENABLE_OPENMP   "Enable OpenMP"                    OFF)
+option(AD_ENABLE_PIQP     "Build piqp_cpp Python bindings"   ON)
+option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"   ON)
+option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"  ON)
+option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"     ON)
+option(AD_ENABLE_L1CORE   "Build l1core Python bindings"     ON)
+option(AD_ENABLE_GUROBI   "Link GUROBI to ad module"         ON)
+
+# ------------------------------------------------------------------
+# Dependencies via CPM or system packages
+# ------------------------------------------------------------------
+# First try to include CPM if present in the repo
+# ---- CPM bootstrap (before any CPMAddPackage) ----
 include(cmake/CPM.cmake OPTIONAL)
-
 # Check if CPM was included, if not, fetch and include CPM
 if(NOT COMMAND CPMAddPackage)
   # Include FetchContent module
@@ -21,7 +39,7 @@ if(NOT COMMAND CPMAddPackage)
   FetchContent_Declare(
     CPM
     GIT_REPOSITORY https://github.com/cpm-cmake/CPM.cmake.git
-    GIT_TAG v0.38.7 # You can specify a specific version of CPM.cmake
+    GIT_TAG v0.42.0 # You can specify a specific version of CPM.cmake
   )
   # Fetch CPM
   FetchContent_MakeAvailable(CPM)
@@ -33,106 +51,198 @@ cpmaddpackage(
   NAME fmt GITHUB_REPOSITORY fmtlib/fmt GIT_TAG 11.0.1 # Specify the version of
                                                        # fmt you want to use
 )
+# fmt (header-only/targets)
+CPMAddPackage(
+  NAME fmt
+  GITHUB_REPOSITORY fmtlib/fmt
+  GIT_TAG 11.0.1
+)
+if(NOT fmt_ADDED)
+  find_package(fmt REQUIRED)
+endif()
 
-# Include directories
-include_directories(/usr/include/python3.12)
-# include_directories(/data/sqp_solver/src)
+# pybind11 (preferred via package config; fall back to CPM)
+find_package(pybind11 CONFIG QUIET)
+if(NOT pybind11_FOUND)
+  CPMAddPackage(
+    NAME pybind11
+    GITHUB_REPOSITORY pybind/pybind11
+    GIT_TAG v2.13.6
+  )
+endif()
 
-include_directories(/usr/include/eigen3/)
-# include_directories(/usr/include/suitesparse/)
-# include_directories(/usr/lib/python3.12/site-packages/numpy/core/include)
-include_directories(/home/seman/gurobi1101/linux64/include)
-# include_directories(/home/knitro/gurobi1100/linux64/include)
+find_package(Eigen3 3.3 CONFIG QUIET)
+if(NOT Eigen3_FOUND)
+# Eigen setup
+CPMAddPackage(
+  NAME Eigen
+  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+  GIT_TAG master # Specify the version of Eigen you want to use
+)
+endif()
 
-# Find Python, pybind11, and OpenMP
-find_package(Python COMPONENTS Interpreter Development)
-find_package(pybind11 CONFIG)
-find_package(OpenMP REQUIRED)
-# find_package(Python3 3.12 COMPONENTS Interpreter Development REQUIRED)
+# Python 3 — Interpreter + Development
+find_package(Python3 3.13 COMPONENTS Interpreter Development REQUIRED)
 
-# find_package(CUDA REQUIRED)
-message(STATUS "Python Executable: ${Python3_EXECUTABLE}")
-message(STATUS "Python Version: ${Python3_VERSION}")
-message(STATUS "Python Include Dir: ${Python3_INCLUDE_DIRS}")
-message(STATUS "Python Libraries: ${Python3_LIBRARIES}")
-# Add the executable
-add_library(
-  ad MODULE
+# Eigen
+
+# OpenMP (optional)
+if(AD_ENABLE_OPENMP)
+  find_package(OpenMP QUIET)
+endif()
+
+# ------------------------------------------------------------------
+# Optional: GUROBI
+# ------------------------------------------------------------------
+# You can pass -DGUROBI_ROOT=/path/to/gurobi/linux64 on the cmake command line
+set(GUROBI_ROOT "" CACHE PATH "Path to GUROBI linux64 installation root")
+
+function(_ad_link_gurobi tgt)
+  if(NOT AD_ENABLE_GUROBI)
+    return()
+  endif()
+
+  if(NOT GUROBI_ROOT)
+    # Default to the path you used previously; make it easy to override
+    set(GUROBI_ROOT "/home/seman/gurobi1101/linux64" CACHE PATH "" FORCE)
+  endif()
+
+  set(_gurobi_inc "${GUROBI_ROOT}/include")
+  # Prefer shared .so, but allow static C++ archive
+  set(_gurobi_lib "${GUROBI_ROOT}/lib")
+
+  if(EXISTS "${_gurobi_inc}" AND EXISTS "${_gurobi_lib}")
+    target_include_directories(${tgt} PRIVATE "${_gurobi_inc}")
+    # Typical names: libgurobi110.so + libgurobi_c++.a (matches your original)
+    target_link_libraries(${tgt} PRIVATE
+      "${_gurobi_lib}/libgurobi_c++.a"
+      "${_gurobi_lib}/libgurobi110.so"
+    )
+    # Ensure runtime can find libgurobi*.so
+    if(UNIX AND NOT APPLE)
+      set_property(TARGET ${tgt} APPEND PROPERTY
+        BUILD_RPATH "${_gurobi_lib}")
+      set_property(TARGET ${tgt} APPEND PROPERTY
+        INSTALL_RPATH "${_gurobi_lib}")
+    endif()
+  else()
+    message(WARNING "GUROBI not found at GUROBI_ROOT='${GUROBI_ROOT}'. "
+                    "To disable, set -DAD_ENABLE_GUROBI=OFF.")
+  endif()
+endfunction()
+
+# ------------------------------------------------------------------
+# Helper: add a pybind11 module with common settings
+# ------------------------------------------------------------------
+function(ad_add_pybind_module name)
+    # Usage: ad_add_pybind_module(<name> src1.cpp src2.cpp ...)
+    set(_srcs ${ARGN})  # ARGN contains all arguments after 'name'
+    
+    # Only need ONE of these - pybind11_add_module creates the target
+    pybind11_add_module(${name} ${_srcs})
+    message(STATUS "Added pybind11 module: ${name} with sources: ${_srcs}")
+    
+    target_compile_features(${name} PRIVATE cxx_std_23)
+    
+    # Common include dirs (PRIVATE)
+    target_include_directories(${name}
+        PRIVATE
+        "${PROJECT_SOURCE_DIR}/src"
+    )
+    
+    # Common links
+    target_link_libraries(${name}
+        PRIVATE
+        fmt::fmt
+        Eigen3::Eigen
+    )
+    
+    if(AD_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+        target_link_libraries(${name} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    
+    # Nice warnings
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endfunction()
+# ------------------------------------------------------------------
+# Core AD Python module
+# ------------------------------------------------------------------
+# Source list isolated; add/remove files here
+set(AD_SOURCES
   src/ad.cpp
   src/Variable.cpp
   src/Expression.cpp
-  src/ADGraph.cpp)
+  src/ADGraph.cpp
+)
 
-# Link libraries
-target_link_libraries(
-  ad
-  PRIVATE pybind11::pybind11
-          -L/usr/lib64
-          -L/usr/lib64/x86_64-linux-gnu
-          -lcholmod
-          -lm
-          -ldl
-          -lgomp
-          /home/seman/gurobi1101/linux64/lib/libgurobi_c++.a
-          /home/seman/gurobi1101/linux64/lib/libgurobi110.so)
+ad_add_pybind_module(ad ${AD_SOURCES})
 
-target_link_libraries(ad PRIVATE fmt::fmt)
+# External system libs specific to 'ad' (from original list)
+# Prefer target_link_libraries with plain names; avoid raw -L/-l unless needed.
+# If the system requires explicit search paths, you can add them via
+# target_link_directories(ad PRIVATE /usr/lib64 /usr/lib64/x86_64-linux-gnu)
+# but try to rely on the linker defaults first.
+target_link_libraries(ad PRIVATE
+  m
+  dl
+)
 
-find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+# Link GUROBI if requested
+_ad_link_gurobi(ad)
 
+set(L1_SOURCES
+        l1penalty/src/bindings.cpp
+        l1penalty/src/Solvers.cpp
+        l1penalty/src/PolynomialVector.cpp
+        l1penalty/src/pointWork.cpp
+        l1penalty/src/Overloads.cpp
+        l1penalty/src/l1Solver.cpp
+        l1penalty/src/Helpers.cpp
+        l1penalty/src/l1Fun.cpp
+        l1penalty/src/TRModel.cpp
+)
 
-# Create Python module
-pybind11_add_module(piqp_cpp src/piqp_bindings.cpp)
-
-# Link with Eigen
-target_link_libraries(piqp_cpp PRIVATE Eigen3::Eigen)
-
-# Compiler-specific flags for the Python module
-target_compile_definitions(piqp_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
-
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(piqp_cpp PRIVATE OpenMP::OpenMP_CXX)
+# ------------------------------------------------------------------
+# Optional extra Python modules
+# ------------------------------------------------------------------
+if(AD_ENABLE_L1CORE)
+ad_add_pybind_module(l1core ${L1_SOURCES})
+_ad_link_gurobi(l1core)
 endif()
 
-pybind11_add_module(osqp_cpp src/osqp_bindings.cpp)
-
-# Link with Eigen
-target_link_libraries(osqp_cpp PRIVATE Eigen3::Eigen)
-
-# Compiler-specific flags for the Python module
-target_compile_definitions(osqp_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
-
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(osqp_cpp PRIVATE OpenMP::OpenMP_CXX)
+if(AD_ENABLE_PIQP)
+  # piqp_cpp
+  ad_add_pybind_module(piqp_cpp src/piqp_bindings.cpp)
 endif()
 
-
-
-pybind11_add_module(qdldl_cpp src/qdldl_bindings.cpp)
-
-# Link with Eigen
-target_link_libraries(qdldl_cpp PRIVATE Eigen3::Eigen)
-
-# Compiler-specific flags for the Python module
-target_compile_definitions(qdldl_cpp PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})
-
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(qdldl_cpp PRIVATE OpenMP::OpenMP_CXX)
+if(AD_ENABLE_AMDQG)
+  ad_add_pybind_module(amdqg src/amdqg_bindings.cpp)
 endif()
 
-
-
-# Link OpenMP if found
-if(OpenMP_CXX_FOUND)
-  target_link_libraries(ad PRIVATE OpenMP::OpenMP_CXX)
+if(AD_ENABLE_OSQP)
+  # osqp_cpp
+  ad_add_pybind_module(osqp_cpp src/osqp_bindings.cpp)
 endif()
 
-# Get the Python extension suffix for Python 3.12
-execute_process(
-  COMMAND /usr/bin/python-config --extension-suffix
-  OUTPUT_VARIABLE PYTHON_EXTENSION_SUFFIX
-  OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(AD_ENABLE_QDLDL)
+  # qdldl_cpp
+  ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
+endif()
 
-# Set output file name with Python extension suffix
-set_target_properties(ad PROPERTIES PREFIX "" SUFFIX
-                                               ${PYTHON_EXTENSION_SUFFIX})
+# ------------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------------
+message(STATUS "==== Build summary ====")
+message(STATUS "C++ Standard          : C++${CMAKE_CXX_STANDARD}")
+message(STATUS "Python3               : ${Python3_EXECUTABLE} (${Python3_VERSION})")
+message(STATUS "pybind11              : ${pybind11_VERSION}")
+message(STATUS "Eigen3                : ${Eigen3_VERSION}")
+message(STATUS "OpenMP enabled        : ${AD_ENABLE_OPENMP} (found: ${OpenMP_CXX_FOUND})")
+message(STATUS "Build piqp_cpp        : ${AD_ENABLE_PIQP}")
+message(STATUS "Build osqp_cpp        : ${AD_ENABLE_OSQP}")
+message(STATUS "Build qdldl_cpp       : ${AD_ENABLE_QDLDL}")
+message(STATUS "Link GUROBI           : ${AD_ENABLE_GUROBI} (root: ${GUROBI_ROOT})")
