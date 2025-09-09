@@ -1,3 +1,0 @@
-[ 25%] Building CXX object CMakeFiles/l1penalty.dir/main.cpp.o
-[ 50%] Building CXX object CMakeFiles/l1penalty.dir/Aux.cpp.o
-[ 75%] Building CXX object CMakeFiles/l1penalty.dir/pointWork.cpp.o
