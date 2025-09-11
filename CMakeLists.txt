@@ -104,7 +104,9 @@ function(_ad_link_gurobi tgt)
 
   if(NOT GUROBI_ROOT)
     # Default to the path you used previously; make it easy to override
-    set(GUROBI_ROOT "/home/seman/gurobi1101/linux64" CACHE PATH "" FORCE)
+    #set(GUROBI_ROOT "/home/seman/gurobi1101/linux64" CACHE PATH "" FORCE)
+    #set(GUROBI_ROOT "/opt/gurobi1200/linux64" CACHE PATH "" FORCE)
+    set(GUROBI_ROOT $ENV{GUROBI_HOME})
   endif()
 
   set(_gurobi_inc "${GUROBI_ROOT}/include")
@@ -116,7 +118,8 @@ function(_ad_link_gurobi tgt)
     # Typical names: libgurobi110.so + libgurobi_c++.a (matches your original)
     target_link_libraries(${tgt} PRIVATE
       "${_gurobi_lib}/libgurobi_c++.a"
-      "${_gurobi_lib}/libgurobi110.so"
+      #"${_gurobi_lib}/libgurobi110.so"
+      "${_gurobi_lib}/libgurobi120.so"
     )
     # Ensure runtime can find libgurobi*.so
     if(UNIX AND NOT APPLE)
