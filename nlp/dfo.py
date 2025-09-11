@@ -100,8 +100,6 @@ class DFOExactPenaltyStepper:
         self.core.attach_trmodel(trmodel)  # single attach; the core will maintain geometry
         self._eval_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_hits = 0
-        if self.tr is not None:
-            self.tr.configure_for_algorithm('dfo')
 
     # ------------- utilities -------------
     def _ckey(self, x: np.ndarray) -> str:

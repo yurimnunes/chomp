@@ -162,9 +162,28 @@ class RestorationModel:
         self.n_orig = int(base_model.n)
         self.m_base_E = int(base_model.m_eq)
         self.m_base_I = int(base_model.m_ineq)
-        self.m_eq = self.m_base_E + self.m_base_I  # all constraints are equalities here
+        self.m_eq = self.m_base_E + self.m_base_I
         self.m_ineq = 0
         self.n = self.n_orig + 2 * self.m_eq  # x + p + n
+
+        # -------- bounds so IP sees p>=0, n>=0 and original x-bounds --------
+        # Original x bounds (default to ±inf if base does not define):
+        lb_x = getattr(self.base, "lb", None)
+        ub_x = getattr(self.base, "ub", None)
+        lb_x = (np.full(self.n_orig, -np.inf, float) if lb_x is None
+                else np.asarray(lb_x, float).reshape(-1))
+        ub_x = (np.full(self.n_orig, +np.inf, float) if ub_x is None
+                else np.asarray(ub_x, float).reshape(-1))
+
+        if self.m_eq > 0:
+            zeros_m = np.zeros(self.m_eq, dtype=float)
+            inf_m   = np.full(self.m_eq, +np.inf, dtype=float)
+            # p >= 0, n >= 0
+            self.lb = np.concatenate([lb_x, zeros_m, zeros_m])
+            self.ub = np.concatenate([ub_x,  inf_m,   inf_m])
+        else:
+            self.lb = lb_x.copy()
+            self.ub = ub_x.copy()
 
     # ------------ splitting / joining ------------
     def split(self, bar_x):
@@ -476,16 +495,6 @@ class InteriorPointStepper:
             )
             return Kup.tocsc()
 
-        def _ordering_perm(K_upper):
-            # simple heuristic; plug your AMD / METIS here as needed
-            try:
-                import sksparse.cholmod as ch
-
-                F = ch.analyze(K_upper, ordering_method="amd")
-                return F.P()
-            except Exception:
-                return None
-
         def _normest_rowsum_inf(A: sp.spmatrix) -> float:
             A = _csr(A)
             return float(np.max(np.abs(A).sum(axis=1))) if A.shape[0] else 1.0
@@ -529,7 +538,7 @@ class InteriorPointStepper:
                 svec = r1 + gamma * (G.T @ r2)
                 rhs_schur = (G @ solve_Kgam(svec)) - r2
 
-                dy, info = cg(S, rhs_schur, tol=cg_tol, maxiter=cg_maxit)
+                dy, info = cg(S, rhs_schur, rtol=cg_tol, maxiter=cg_maxit)
                 if info != 0:
                     # One retry with larger gamma; otherwise fall back to qdldl
                     gamma *= 5.0
@@ -965,7 +974,7 @@ class InteriorPointStepper:
                 kkt={
                     "stat": np.linalg.norm(r_d, np.inf),
                     "ineq": (
-                        np.linalg.norm(np.maximum(0, -cI), np.inf) if mI > 0 else 0.0
+                        np.linalg.norm(np.maximum(0, cI), np.inf) if mI > 0 else 0.0
                     ),
                     "eq": np.linalg.norm(cE, np.inf) if mE > 0 else 0.0,
                     "comp": 0.0,  # at E_0 we don't include μ-comps
@@ -1013,7 +1022,7 @@ class InteriorPointStepper:
                     kkt={
                         "stat": np.linalg.norm(r_d, np.inf),
                         "ineq": (
-                            np.linalg.norm(np.maximum(0, -cI), np.inf)
+                            np.linalg.norm(np.maximum(0, cI), np.inf)
                             if mI > 0
                             else 0.0
                         ),
@@ -1026,6 +1035,79 @@ class InteriorPointStepper:
                 )
                 info["error"] = str(e)
                 return x, lmb, nuv, info
+
+        # ----- Mehrotra predictor for adaptive μ -----
+        # (run with μ=0 to get affine directions)
+        if mI > 0 or np.any(hasL) or np.any(hasU):
+            # reuse same W, rhs_x (they do not include μ explicitly)
+            dx_aff, dnu_aff = self.solve_KKT(W, -r_d, JE, r_pE)
+
+            # inequality slacks: ds_aff = -r_pI - JI dx_aff
+            ds_aff = (
+                -r_pI - (JI @ dx_aff if (mI > 0 and JI is not None) else 0)
+                if mI > 0 else np.zeros(0)
+            )
+
+            # affine dλ from: diag(λ) ds + diag(s) dλ = - s∘λ   (μ=0)
+            if mI > 0:
+                dlam_aff = (-s * lmb - lmb * ds_aff) / np.maximum(s, 1e-16)
+            else:
+                dlam_aff = np.zeros(0)
+
+            # bounds (lower): zL*dx + sL*dzL = - sL*zL   (μ=0, sL = x-lb)
+            dzL_aff = np.where(
+                hasL, (-sL * zL - zL * dx_aff) / np.maximum(sL, 1e-16), 0.0
+            )
+
+            # bounds (upper): -zU*dx + sU*dzU = - sU*zU   (μ=0, sU = ub-x)
+            dzU_aff = np.where(
+                hasU, (-sU * zU + zU * dx_aff) / np.maximum(sU, 1e-16), 0.0
+            )
+
+            # fraction-to-boundary for the affine step to keep all > 0
+            def _ftb_pos(z, dz):
+                if z.size == 0: return 1.0
+                neg = dz < 0
+                if not np.any(neg): return 1.0
+                return float(min(1.0, self.cfg.ip_tau * np.min(-z[neg] / dz[neg])))
+
+            alpha_aff = 1.0
+            if mI > 0:
+                alpha_aff = min(alpha_aff, _ftb_pos(s,    ds_aff))
+                alpha_aff = min(alpha_aff, _ftb_pos(lmb,  dlam_aff))
+            if np.any(hasL):
+                alpha_aff = min(alpha_aff, _ftb_pos(zL[hasL], dzL_aff[hasL]))
+                alpha_aff = min(alpha_aff, _ftb_pos(sL[hasL], dx_aff[hasL]))   # sL = x-lb
+            if np.any(hasU):
+                alpha_aff = min(alpha_aff, _ftb_pos(zU[hasU], dzU_aff[hasU]))
+                alpha_aff = min(alpha_aff, _ftb_pos(sU[hasU], -dx_aff[hasU]))  # sU = ub-x
+
+            # μ_aff from all complementarity pairs (ineq + active bounds)
+            mu_min = float(self.cfg.ip_mu_min)
+            parts = []
+            if mI > 0:
+                s_aff   = s   + alpha_aff * ds_aff
+                lam_aff = lmb + alpha_aff * dlam_aff
+                parts.append(np.dot(s_aff, lam_aff))
+            if np.any(hasL):
+                sL_aff = sL + alpha_aff * dx_aff
+                zL_aff = zL + alpha_aff * dzL_aff
+                parts.append(np.dot(sL_aff[hasL], zL_aff[hasL]))
+            if np.any(hasU):
+                sU_aff = sU - alpha_aff * dx_aff
+                zU_aff = zU + alpha_aff * dzU_aff
+                parts.append(np.dot(sU_aff[hasU], zU_aff[hasU]))
+
+            denom = (mI + int(np.sum(hasL)) + int(np.sum(hasU)))
+            mu_aff = max(mu_min, (sum(parts) / max(1, denom)) if parts else mu)
+
+            # σ = (μ_aff / μ)^p  (clipped to [0,1])
+            pwr = float(getattr(self.cfg, "ip_sigma_power", 3.0))
+            sigma = float(np.clip((mu_aff / max(mu, mu_min)) ** pwr, 0.0, 1.0))
+
+            # final μ for the main step
+            mu = max(mu_min, sigma * mu_aff)
+
 
         # recover (ds, dλ) for inequalities (reference form)
         ds = (
@@ -1173,7 +1255,7 @@ class InteriorPointStepper:
                     kkt={
                         "stat": np.linalg.norm(r_d, np.inf),
                         "ineq": (
-                            np.linalg.norm(np.maximum(0, -cI), np.inf)
+                            np.linalg.norm(np.maximum(0, cI), np.inf)
                             if mI > 0
                             else 0.0
                         ),
@@ -1213,32 +1295,37 @@ class InteriorPointStepper:
             )
 
         # --- recompute basic measures for reporting ---
-        data_new = model.eval_all(x_new, ["f", "cI", "cE"])
-        f_new = float(data_new["f"])
+        # --- recompute basic measures for reporting (AT x_new) ---
+        data_new = model.eval_all(x_new, ["f", "g", "cI", "JI", "cE", "JE"])
+        f_new  = float(data_new["f"])
+        g_new  = np.asarray(data_new["g"], float)
         cI_new = np.asarray(data_new["cI"], float) if mI > 0 else np.zeros(0)
         cE_new = np.asarray(data_new["cE"], float) if mE > 0 else np.zeros(0)
+        JI_new = data_new["JI"] if mI > 0 else None
+        JE_new = data_new["JE"] if mE > 0 else None
         theta_new = model.constraint_violation(x_new)
 
+        # stationarity at x_new
         r_d_new = (
-            g
-            + (JI.T @ lmb_new if JI is not None else 0)
-            + (JE.T @ nu_new if JE is not None else 0)
-            - zL_new
-            + zU_new
+            g_new
+            + (JI_new.T @ lmb_new if (mI > 0 and JI_new is not None) else 0)
+            + (JE_new.T @ nu_new  if (mE > 0 and JE_new is not None) else 0)
+            - zL_new + zU_new
         )
-        r_comp_L_new = np.where(hasL, (x_new - lb) * zL_new, 0.0)
-        r_comp_U_new = np.where(hasU, (ub - x_new) * zU_new, 0.0)
-        r_comp_s_new = s_new * lmb_new if mI > 0 else np.zeros(0)
+
+        # complementarity at x_new
+        r_comp_L_new = np.where(hasL, (x_new - lb) * zL_new - mu, 0.0) if np.any(hasL) else 0.0
+        r_comp_U_new = np.where(hasU, (ub - x_new) * zU_new - mu, 0.0) if np.any(hasU) else 0.0
+        r_comp_s_new = (s_new * lmb_new - mu) if mI > 0 else np.zeros(0)
 
         kkt_new = {
             "stat": np.linalg.norm(r_d_new, np.inf),
-            "ineq": np.linalg.norm(np.maximum(0, -cI_new), np.inf) if mI > 0 else 0.0,
-            "eq": np.linalg.norm(cE_new, np.inf) if mE > 0 else 0.0,
+            "ineq": np.linalg.norm(np.maximum(0, cI_new), np.inf) if mI > 0 else 0.0,
+            "eq":   np.linalg.norm(cE_new, np.inf) if mE > 0 else 0.0,
             "comp": max(
-                np.linalg.norm(r_comp_L_new, np.inf),
-                np.linalg.norm(r_comp_U_new, np.inf),
-            )
-            + (np.linalg.norm(r_comp_s_new, np.inf) if r_comp_s_new.size > 0 else 0.0),
+                (np.linalg.norm(r_comp_L_new, np.inf) if np.any(hasL) else 0.0),
+                (np.linalg.norm(r_comp_U_new, np.inf) if np.any(hasU) else 0.0),
+            ) + (np.linalg.norm(r_comp_s_new, np.inf) if r_comp_s_new.size > 0 else 0.0),
         }
 
         converged = (

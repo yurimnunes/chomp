@@ -34,7 +34,7 @@ Eigen::MatrixXd nfp_finite_differences(const Eigen::MatrixXd &points, const Eige
 
 bool hasDistantPoints(TRModelPtr &model, const Options &options);
 
-bool hasNonFinite(const Eigen::VectorXd &vec);
+// bool hasNonFinite(const Eigen::VectorXd &vec);
 
 int try2addPoint(TRModelPtr &model, const Eigen::VectorXd &newPoint, const Eigen::VectorXd &newFValues,
                  const Funcao &funcs, Eigen::VectorXd &bl, Eigen::VectorXd &bu, const Options &options);

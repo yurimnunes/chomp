@@ -177,7 +177,6 @@ class LineSearcher:
 
         # Descent check on barrier function
         if dphi >= -1e-12:
-            print(f" dphi={dphi:.2e} (no descent in barrier)")
             logging.debug(f"Non-descent direction in barrier: dphi={dphi:.2e}")
             return 1.0, 0, True
 

@@ -164,8 +164,8 @@ class SQPStepper:
             )
             return p
 
-        old_radius = float(self.tr.radius)
-        self.tr.radius = float(Delta)
+        old_radius = float(self.tr.delta)
+        self.tr.delta = float(Delta)
         try:
             p, _, _ = self.tr.solve(
                 _to_dense_if_needed(H, getattr(self.tr, "requires_dense", False)),
@@ -178,7 +178,7 @@ class SQPStepper:
                 act_tol=act_tol or getattr(self.cfg, "act_tol", 1e-6),
             )
         finally:
-            self.tr.radius = old_radius
+            self.tr.delta = old_radius
         return p
 
     def _normal_step(
@@ -379,30 +379,46 @@ class SQPStepper:
         ) and self.cfg.use_composite_step
 
         # Update trust-region metric
-        Delta = self.tr.radius if self.tr else self.cfg.tr_delta0
+        Delta = self.tr.delta if self.tr else self.cfg.tr_delta0
         if self.tr and hasattr(self.tr, "set_metric_from_H") and getattr(self.tr, "norm_type", "2") == "ellip":
             self.tr.set_metric_from_H(H)
 
         # Compute step
         if use_cs:
-            p, lam_new, nu_new = self._composite_step(
+            p, _ = self._composite_step(
                 model, x, H, g0, data["JE"], data["cE"], data["JI"], data["cI"], Delta, lam, nu
             )
         else:
-            p, _, _, lam_new, nu_new = self.tr.solve(
+            p, lam_new, nu_new = self.qp.solve(
                 _to_dense_if_needed(H, self.requires_dense),
                 g0,
                 _to_dense_if_needed(data["JI"], self.requires_dense),
                 data["cI"],
                 _to_dense_if_needed(data["JE"], self.requires_dense),
                 data["cE"],
-                #tr_radius=self.tr.radius if self.tr else None,
+                tr_radius=Delta,
             )
             if p is None or not np.all(np.isfinite(p)):
                 if self.tr:
-                    self.tr.radius *= self.cfg.tr_gamma_dec
+                    self.tr.delta *= self.cfg.tr_gamma_dec
                 info = self._pack_info(0.0, False, False, f0, theta0, kkt, 0, 0.0, 0.0)
+                # try restoration if available
+                if self.restoration:
+                    print("QP failed, trying restoration...")
+                    trR = self.tr.delta if self.tr else self.cfg.tr_delta0
+                    pr, meta = self.restoration.try_restore(model, x, trR)
+                    if meta.get("ok", False) and pr is not None and np.all(np.isfinite(pr)):
+                        x2 = x + pr
+                        d2 = model.eval_all(x2)
+                        k2 = model.kkt_residuals(x2, lam, nu)
+                        info = self._pack_info(
+                            float(np.linalg.norm(pr)), True, False, float(d2["f"]), model.constraint_violation(x2), k2, 0, 0.0, 0.0
+                        )
+                        if self.tr:
+                            self.tr.delta = max(self.cfg.tr_delta_min, 0.5 * trR)
+                        return x2, lam, nu, info
                 return x, lam, nu, info
+
         # Check for degenerate composite step
         if self.cfg.use_composite_step:
             gL_tmp = g0.copy()
@@ -421,11 +437,11 @@ class SQPStepper:
                     data["cI"],
                     _to_dense_if_needed(data["JE"], self.requires_dense),
                     data["cE"],
-                    tr_radius=self.tr.radius if self.tr else None,
+                    #tr_radius=self.tr.delta if self.tr else None,
                 )
                 if p is None or not np.all(np.isfinite(p)):
                     if self.tr:
-                        self.tr.radius *= self.cfg.tr_gamma_dec
+                        self.tr.delta *= self.cfg.tr_gamma_dec
                     info = self._pack_info(0.0, False, False, f0, theta0, kkt, 0, 0.0, 0.0)
                     return x, lam, nu, info
 
@@ -434,7 +450,7 @@ class SQPStepper:
             alpha, ls_iters, _ = self.ls.search_sqp(model, x, p)
             if alpha <= 1e-12:
                 if self.restoration:
-                    trR = self.tr.radius if self.tr else self.cfg.tr_delta0
+                    trR = self.tr.delta if self.tr else self.cfg.tr_delta0
                     pr, meta = self.restoration.try_restore(model, x, trR)
                     if meta.get("ok", False) and pr is not None and np.all(np.isfinite(pr)):
                         x2 = x + pr
@@ -444,7 +460,7 @@ class SQPStepper:
                             float(np.linalg.norm(pr)), True, False, float(d2["f"]), model.constraint_violation(x2), k2, ls_iters, 0.0, 0.0
                         )
                         if self.tr:
-                            self.tr.radius = max(self.cfg.tr_delta_min, 0.5 * trR)
+                            self.tr.delta = max(self.cfg.tr_delta_min, 0.5 * trR)
                         return x2, lam, nu, info
                 info = self._pack_info(0.0, False, False, f0, theta0, kkt, ls_iters, 0.0, 0.0)
                 return x, lam, nu, info
@@ -453,7 +469,7 @@ class SQPStepper:
         s = alpha * p
         x_trial = x + s
         if self.cfg.use_soc and alpha < 1.0:
-            Delta_for_soc = self.tr.radius if self.tr else float(np.linalg.norm(s))
+            Delta_for_soc = self.tr.delta if self.tr else float(np.linalg.norm(s))
             dx_corr, _needs_rest = self.soc.compute_correction(model, x_trial, Delta_for_soc)
             s += dx_corr
             x_trial = x + s
@@ -489,7 +505,7 @@ class SQPStepper:
 
         if not accept or need_rest:
             if self.restoration:
-                trR = self.tr.radius if self.tr else self.cfg.tr_delta0
+                trR = self.tr.delta if self.tr else self.cfg.tr_delta0
                 pr, meta = self.restoration.try_restore(model, x, trR)
                 if meta.get("ok", False) and pr is not None and np.all(np.isfinite(pr)):
                     x2 = x + pr
@@ -499,7 +515,7 @@ class SQPStepper:
                         float(np.linalg.norm(pr)), False, False, float(d2["f"]), model.constraint_violation(x2), k2, ls_iters, alpha, rho
                     )
                     if self.tr:
-                        self.tr.radius = max(self.cfg.tr_delta_min, 0.5 * trR)
+                        self.tr.delta = max(self.cfg.tr_delta_min, 0.5 * trR)
                     return x2, lam, nu, info
             info = self._pack_info(0.0, False, False, f0, theta0, kkt, ls_iters, alpha, rho)
             return x, lam, nu, info
@@ -556,5 +572,5 @@ class SQPStepper:
             "ls_iters": ls_iters,
             "alpha": alpha,
             "rho": rho,
-            "tr_radius": self.tr.radius if self.tr else 0.0,
+            "tr_radius": self.tr.delta if self.tr else 0.0,
         }
