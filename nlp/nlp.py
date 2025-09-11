@@ -26,7 +26,6 @@ from .blocks.reg import Regularizer, make_psd_advanced
 from .blocks.soc import *
 from .blocks.tr import *
 from .dfo import *
-from .dfo_model import *
 from .ip import *
 from .sqp import *
 
@@ -102,15 +101,7 @@ class NLPSolver:
         )
         mI = len(c_ineq) if c_ineq else 0
         mE = len(c_eq) if c_eq else 0
-        self.dfo_state = DFOExactState(self.n, mI, mE, self.cfg)
-        self.dfo_stepper = DFOExactPenaltyStepper(
-            self.cfg,
-            regularizer=self.regularizer,
-            n=self.n,
-            mI=mI,
-            mE=mE,
-            tr=self.tr,
-        )
+        self.dfo_stepper = None # #L1DFOStepper(func=f)
 
         _ensure_cfg_fields(self.cfg)  # add missing fields if needed
 

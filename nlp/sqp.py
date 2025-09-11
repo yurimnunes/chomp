@@ -26,9 +26,6 @@ from .blocks.qp import *
 from .blocks.reg import Regularizer, make_psd_advanced
 from .blocks.soc import *
 from .blocks.tr import *
-from .dfo import *
-from .dfo_model import *
-from .ip import *
 
 
 # Utility functions

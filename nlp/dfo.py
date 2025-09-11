@@ -1,338 +1,264 @@
+# python/l1_dfo_stepper.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
+import l1core as L1  # your pybind11 module
 import numpy as np
-from numpy.linalg import norm
-
-# your stack
-from .blocks.aux import Model, SQPConfig
-from .blocks.reg import Regularizer, make_psd_advanced
-from .blocks.tr import TrustRegionManager
-
-# compact DFO core (with RBF dy-derivatives + equality L1 support)
-from .dfo_model import DFOConfig, DFOExactPenalty, TRModel
 
 
-class DFOExactState:
-    """Exact-penalty state (kept small)."""
-    def __init__(self, n: int, m_ineq: int, m_eq: int, cfg: SQPConfig):
-        self.n = n
-        self.mI = m_ineq
-        self.mE = m_eq
-        self.cfg = cfg
-        self.mu = float(getattr(cfg, 'dfo_penalty_mu0', 10.0))
-        self.eps_active = float(getattr(cfg, 'dfo_penalty_eps_active', 1e-6))
-        self.radius = float(getattr(cfg, 'dfo_al_tr0', 0.1))
-        self.lam = np.ones(self.mI) * getattr(cfg, 'dfo_al_lam0', 0.1) if self.mI > 0 else np.zeros(0)
-        self.nu = np.zeros(self.mE)
-        self.penalty_updates = 0
-        self.violation_history: List[float] = []
+def _constraint_violation_from_fvalues(fvals: np.ndarray, con_lb: np.ndarray, con_ub: np.ndarray) -> float:
+    """
+    fvals layout assumed: [f, c1, c2, ..., cm]
+    Violation θ = ||[max(lb - c, 0); max(c - ub, 0)]||_1
+    (Same spirit as many NLP filters; feel free to swap to L∞ if you prefer.)
+    """
+    if fvals.ndim != 1:
+        fvals = fvals.ravel()
+    if con_lb.size == 0 and con_ub.size == 0:
+        return 0.0
+    cvals = fvals[1:]  # constraints slice
+    lb = con_lb if con_lb.size else np.full_like(cvals, -np.inf, dtype=float)
+    ub = con_ub if con_ub.size else np.full_like(cvals,  np.inf, dtype=float)
+    viol_lb = np.clip(lb - cvals, 0.0, np.inf)
+    viol_ub = np.clip(cvals - ub, 0.0, np.inf)
+    return float(np.sum(viol_lb) + np.sum(viol_ub))
 
-    def phi(self, f: float, cI: Optional[np.ndarray], cE: Optional[np.ndarray]) -> float:
-        cI_arr = np.asarray(cI) if cI is not None else np.zeros(self.mI)
-        cE_arr = np.asarray(cE) if cE is not None else np.zeros(self.mE)
-        return float(f + self.mu * (np.maximum(0.0, cI_arr).sum() + np.abs(cE_arr).sum()))
+class L1DFOStepper:
+    """
+    Single-step DFO analogue of SQPStepper.step:
+      step(model, x, lam, nu, it) -> (x_out, lam_out, nu_out, info)
 
-    def update_multipliers(self, cI: Optional[np.ndarray], cE: Optional[np.ndarray]):
-        max_mult = getattr(self.cfg, 'dfo_al_max_multiplier', 1e6)
-        if self.mI > 0 and cI is not None:
-            ci = np.asarray(cI).ravel()
-            self.lam = np.clip(np.maximum(0.0, self.lam + 0.1 * np.maximum(0.0, ci)), 0.0, max_mult)
-        if self.mE > 0 and cE is not None:
-            ce = np.asarray(cE).ravel()
-            self.nu = np.clip(self.nu + 0.1 * ce, -max_mult, max_mult)
+    Notes:
+    - `model` here is not used (DFO doesn’t need exact grads/Jacobians).
+      Pass any object with at least `n` (dimension) if you need symmetry with SQP.
+    - `lam` and `nu` are placeholders; returned unchanged (or updated if you later
+      add multiplier heuristics).
+    - Uses your l1core TR model, criticality test, TR step, and radius update.
+    """
 
-    def adaptive_mu_update(self, viol_current: float, viol_prev: float) -> bool:
-        self.violation_history.append(viol_current)
-        if len(self.violation_history) > 10:
-            self.violation_history.pop(0)
-        target = getattr(self.cfg, 'dfo_penalty_target_viol', 1e-6)
-        mu_inc = getattr(self.cfg, 'dfo_penalty_mu_inc', 5.0)
-        mu_max = getattr(self.cfg, 'dfo_penalty_mu_max', 1e6)
-        # If violation stalls above target, bump mu
-        if viol_current > target and viol_current > 0.9 * viol_prev:
-            old_mu = self.mu
-            self.mu = min(mu_max, mu_inc * self.mu)
-            if self.mu > old_mu:
-                self.penalty_updates += 1
-                return True
-        return False
+    def __init__(
+        self,
+        func: L1.Funcao,
+        trm: Optional[L1.TRModel] = None,
+        options: Optional[L1.TROptions] = L1.Options(),
+        mu: Optional[float] = 1.0,
+        epsilon: Optional[float] = 1.0,
+        delta: Optional[float] = 0.1,
+        lam_penalty: Optional[float] = 1.0,
+        var_lb: Optional[np.ndarray] = np.array([]),
+        var_ub: Optional[np.ndarray] = np.array([]),
+        con_lb: Optional[np.ndarray] = np.array([]),
+        con_ub: Optional[np.ndarray] = np.array([]) ,
+        x0: Optional[np.ndarray] = np.array([])
+    ):
+        self.func = func
+        self.trm = trm
+        self.opt = options
+        self.mu = float(mu)
+        self.epsilon = float(epsilon)
+        self.delta = float(delta)
+        self.lam_penalty = float(lam_penalty)
+        self.var_lb = np.asarray(var_lb, dtype=float)
+        self.var_ub = np.asarray(var_ub, dtype=float)
+        self.con_lb = np.asarray(con_lb, dtype=float)
+        self.con_ub = np.asarray(con_ub, dtype=float)
 
+        # cached thresholds
+        self.eta_1 = self.opt.eta_1
+        self.eta_2 = self.opt.eta_2
+        self.gamma_dec = self.opt.gamma_dec
+        self.gamma_inc = self.opt.gamma_inc
+        self.radius_max = self.opt.radius_max
+        self.tol_radius = self.opt.tol_radius
+        self.tol_measure = self.opt.tol_measure
+        self.eps_c = self.opt.eps_c
 
-def _make_dfo_cfg(cfg: SQPConfig) -> DFOConfig:
-    # Keep defaults robust; only override what you need from SQPConfig
-    return DFOConfig(
-        huber_delta=getattr(cfg, 'dfo_huber_delta', None),
-        ridge=float(getattr(cfg, 'dfo_ridge', 1e-6)),
-        dist_w_power=float(getattr(cfg, 'dfo_dist_w_power', 0.3)),
-        eig_floor=float(getattr(cfg, 'dfo_eig_floor', 1e-8)),
-        # max_pts=int(getattr(cfg, 'dfo_max_pts', 60)),
-        model_radius_mult=float(getattr(cfg, 'dfo_model_radius_mult', 2.0)),
-        use_quadratic_if=int(getattr(cfg, 'dfo_use_quadratic_if', 25)),
-        mu=float(getattr(cfg, 'dfo_penalty_mu0', 10.0)),               # will be synced from state.mu each step
-        eps_active=float(getattr(cfg, 'dfo_penalty_eps_active', 1e-6)),
-        tr_inc=float(getattr(cfg, 'dfo_tr_inc', 1.6)),
-        tr_dec=float(getattr(cfg, 'dfo_tr_dec', 0.5)),
-        eta0=float(getattr(cfg, 'dfo_eta0', 0.05)),
-        eta1=float(getattr(cfg, 'dfo_eta1', 0.25)),
-        gp_max_pts=int(getattr(cfg, 'dfo_rbf_max_pts', 100)),
-        crit_beta1=float(getattr(cfg, 'dfo_crit_beta1', 1.0)),
-        crit_beta2=float(getattr(cfg, 'dfo_crit_beta2', 2.0)),
-        min_pts_gp=int(getattr(cfg, 'dfo_rbf_min_pts', 5)),
-    )
+        n_functions = 1 + len(func.con)
+        initial_points = np.empty((func.n, 0), dtype=float)
+        bl = self.var_lb
+        bu = self.var_ub
+        if len(x0) == 0:
+            x0 = initial_points[:, 0].copy()
+            x1 = x0.copy()
+            rng = np.random.default_rng()
+            for i in range(n):
+                lbi = bl[i] if i < bl.size else -np.inf
+                ubi = bu[i] if i < bu.size else  np.inf
+                has_lb = np.isfinite(lbi)
+                has_ub = np.isfinite(ubi)
+                if has_lb and has_ub and lbi < ubi:
+                    x1[i] = rng.uniform(lbi, ubi)
+                else:
+                    x1[i] = x0[i] + rng.uniform(-0.25, 0.25)
+            x1 = L1.projectToBounds(x1, bl, bu)
+            initial_points = np.c_[initial_points, x1]
+            k = 2
 
+        # Evaluate f,con at initial points (project first)
+        initial_f_values = np.empty((n_functions, k))
+        for j in range(k):
+            initial_points[:, j] = L1.projectToBounds(initial_points[:, j], bl, bu)
+            initial_f_values[:, j] = func.calcAll(initial_points[:, j])
+        
 
-class DFOExactPenaltyStepper:
-    """Plugs SQP loop into the compact DFO core; TRModel geometry managed by the core."""
-    def __init__(self, cfg: SQPConfig, tr: Optional[TrustRegionManager], regularizer: Regularizer, n: int, mI: int, mE: int):
-        self.cfg = cfg
-        self.tr = tr
-        self.regularizer = regularizer
-        self.n = n
-        self.mI = mI
-        self.mE = mE
-        self.core = DFOExactPenalty(n, mI, mE, _make_dfo_cfg(cfg))
-        # Create a TRModel; attach to core so geometry is auto-maintained
-        q = 1 + mI + mE
-        trmodel = TRModel(self.n, q, _make_dfo_cfg(self.cfg))
-        self.core.attach_trmodel(trmodel)  # single attach; the core will maintain geometry
-        self._eval_cache: Dict[str, Dict[str, Any]] = {}
-        self._cache_hits = 0
+    def _project(self, x: np.ndarray) -> np.ndarray:
+        return L1.projectToBounds(x, self.var_lb, self.var_ub)
 
-    # ------------- utilities -------------
-    def _ckey(self, x: np.ndarray) -> str:
-        return str(hash(np.asarray(x, float).ravel().tobytes()))
+    def _pack_info(
+        self,
+        step_norm: float,
+        accepted: bool,
+        converged: bool,
+        f_val: float,
+        theta: float,
+        measure: float,
+        alpha: float,
+        rho: float,
+    ) -> Dict:
+        # Keep SQP-like keys; map DFO quantities accordingly.
+        return {
+            "step_norm": float(step_norm),
+            "accepted": bool(accepted),
+            "converged": bool(converged),
+            "f": float(f_val),
+            "theta": float(theta),     # aggregate constraint violation
+            "stat": float(measure),    # use l1 criticality measure as "stationarity"
+            "ineq": float(theta),      # same θ (no equality split in this DFO scaffold)
+            "eq": 0.0,
+            "comp": 0.0,               # no complementarity in L1DFO
+            "ls_iters": 0,             # no line search here
+            "alpha": float(alpha),     # we treat the TR step as full step (alpha = 1)
+            "rho": float(rho),         # ared/pred ratio
+            "tr_radius": float(self.trm.radius),
+        }
 
-    def _eval_cached(self, nlp_model: Model, x: np.ndarray) -> Dict[str, Any]:
-        k = self._ckey(x)
-        if k not in self._eval_cache:
-            self._eval_cache[k] = nlp_model.eval_all(x)
-        else:
-            self._cache_hits += 1
-        return self._eval_cache[k]
+    def step(
+        self,
+        model: Optional[object],
+        x: np.ndarray,
+        lam: Optional[np.ndarray],
+        nu: Optional[np.ndarray],
+        it: int,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Dict]:
+        """
+        Perform one L1-DFO trust-region step around current TR center.
+        Returns: (x_out, lam_out, nu_out, info)
+        """
+        x = np.asarray(x, dtype=float).copy()
+        x = self._project(x)
 
-    # ------------- public API -------------
-    def step(self, nlp_model: Model, x: np.ndarray, state: DFOExactState, it: int):
-        # ---------------- registrar/oracle ----------------
-        def make_model_oracle(model: Model, mI: int, mE: int):
-            def oracle(x_in: np.ndarray):
-                out = model.eval_all(x_in, components=['f', 'cI', 'cE'])
-                f = float(out['f'])
-                cI = out['cI'] if out['cI'] is not None else np.zeros(mI)
-                cE = out['cE'] if out['cE'] is not None else np.zeros(mE)
-                return f, cI, cE
-            return oracle
+        # Ensure TR polynomials are fresh at this iteration
+        self.trm.computePolynomialModels()
+        fx_model, fmodel_g, fmodel_H = self.trm.getModelMatrices(0)  # model of f at center
+        cmodel = self.trm.extractConstraintsFromTRModel(self.con_lb, self.con_ub)
 
-        self.core.set_oracle(make_model_oracle(nlp_model, self.mI, self.mE))
-
-        # Sync penalty with core (mu, eps_active)
-        self.core.cfg.mu = float(state.mu)
-        self.core.cfg.eps_active = float(state.eps_active)
-
-        # ---------------- trust-region radius ----------------
-        tr_min = float(getattr(self.cfg, 'dfo_al_tr_min', 1e-10))
-        Delta = self.tr.get_radius() if self.tr is not None else state.radius
-        Delta = max(tr_min, float(Delta))
-        if self.tr is not None:
-            self.tr.set_radius(Delta)
-        else:
-            state.radius = Delta
-
-        # ---------------- ensure center sample ----------------
-        d0 = self._eval_cached(nlp_model, x)
-        cI0 = np.asarray(d0.get('cI', np.zeros(self.mI))) if self.mI else np.zeros(0)
-        cE0 = np.asarray(d0.get('cE', np.zeros(self.mE))) if self.mE else np.zeros(0)
-        self.core.add_sample(x, float(d0['f']), cI0, cE0)
-
-        # ---------------- criticality loop ----------------
-        Delta, eps_new, sigma_crit = self.core.criticality_loop(xk=x, eps=state.eps_active, Delta_in=Delta)
-        state.eps_active = float(eps_new)
-
-        # ---------------- local model + proposal ----------------
-        fit = self.core.fit_local(center=x, Delta=Delta)
-        h, step_info = self.core.propose_step(x, Delta, fit, cI0=cI0, cE0=cE0)
-        step_norm_inf = float(norm(h, ord=np.inf))
-        sigma = float(step_info.get('sigma', sigma_crit))
-        step_info['sigma'] = sigma
-        H_reg, _ = make_psd_advanced(fit.H, self.regularizer, it)
-
-        # ---------------- predicted reduction (penalty model) ----------------
-        # Use a conservative penalty-model prediction for the acceptance ratio and TR update,
-        # mirroring the C++ flow (pred from l1TrustRegionStep).
-        pred_red_cons = float(self.core._conservative_pred_red(sigma=max(sigma, 0.0), Delta=Delta, n=self.n))
-        print(" it", it, "step_inf", step_norm_inf, "Delta", Delta,
-              "pred_red_cons", pred_red_cons, "sigma", sigma)
-        # Guard: if no predicted decrease, reject without evaluating expensive oracle at trial
-        if not np.isfinite(pred_red_cons) or pred_red_cons <= 0.0:
-            # shrink TR and return no move
-            if self.tr is not None:
-                self.tr.update(pred_red=0.0, act_red=0.0, step_norm=0.0,
-                            theta0=nlp_model.constraint_violation(x), kkt=None, act_sz=0, H=H_reg, step=np.zeros_like(x))
-                curR = self.tr.get_radius()
-            else:
-                state.radius = max(tr_min, self.core.cfg.tr_dec * Delta)
-                curR = state.radius
-            info = {
-                'step_norm': 0.0,
-                'accepted': False,
-                'converged': False,
-                'f': float(d0['f']),
-                'theta': nlp_model.constraint_violation(x),
-                'stat': nlp_model.kkt_residuals(x, state.lam, state.nu).get('stat', 1e6),
-                'ineq': 0.0, 'eq': 0.0, 'comp': 0.0,
-                'ls_iters': 0,
-                'alpha': float(step_info.get('t', 0.0)),
-                'rho': float('-inf'),
-                'sigma': float(sigma),
-                'pred_red_cons': 0.0,
-                'pred_red_quad': float(step_info.get('pred_red_quad', 0.0)),
-                'tr_radius': float(curR),
-                'mode': 'dfo_exact_penalty_core',
-                'solve_success': True,
-                'solve_info': {'core': step_info},
-                'model_samples': int(self.core.arrays()[0].shape[0]),
-                'cache_hits': int(self._cache_hits),
-                'penalty_mu': float(state.mu),
-                'used_multiplier_step': bool(step_info.get('used_multiplier_step', False)),
-            }
-            return x, state.lam, state.nu, info
-
-        # ---------------- trial evaluation (only if pred > 0) ----------------
-        x_trial = x + h
-        d1 = self._eval_cached(nlp_model, x_trial)
-        f0 = float(d0['f'])
-        f1 = float(d1['f'])
-        cI1 = np.asarray(d1.get('cI', np.zeros(self.mI))) if self.mI else np.zeros(0)
-        cE1 = np.asarray(d1.get('cE', np.zeros(self.mE))) if self.mE else np.zeros(0)
-
-        # Exact penalty values and actual red.
-        phi0 = state.phi(f0, cI0, cE0)
-        phi1 = state.phi(f1, cI1, cE1)
-        act_red = float(phi0 - phi1)
-
-        # ρ uses penalty-model prediction (consistent units)
-        eps_rho = 1e-16
-        rho = float(act_red / max(pred_red_cons, eps_rho))
-
-        eta0 = float(getattr(self.cfg, 'dfo_eta0', self.core.cfg.eta0))
-        eta1 = float(getattr(self.cfg, 'dfo_eta1', self.core.cfg.eta1))
-        is_FL = bool(step_info.get('is_FL', fit.diag.get('is_FL', True)))
-
-        # ---------------- accept / reject ----------------
-        if rho >= eta1:
-            accepted = True
-            Delta_new = max(Delta, self.core.cfg.tr_inc * step_norm_inf)
-        elif rho >= eta0:
-            accepted = True
-            Delta_new = max(Delta, step_norm_inf) if is_FL else Delta
-        else:
-            accepted = False
-            Delta_new = self.core.cfg.tr_dec * Delta
-
-        # ---------------- criticality-aware cap ----------------
-        sig = max(float(sigma), 0.0)
-        beta1 = float(getattr(self.core.cfg, 'crit_beta1', 1.0))
-        beta2 = float(getattr(self.core.cfg, 'crit_beta2', 2.0))
-        cap1 = max(1e-12, beta1 * max(sig, 1e-16))
-        cap2 = beta2 * max(sig, 1e-16)
-        Delta_new = min(Delta_new, cap1, cap2)
-
-        # ---------------- feasibility filter ----------------
-        theta0 = nlp_model.constraint_violation(x)
-        theta1 = nlp_model.constraint_violation(x_trial)
-        filter_theta_min = float(getattr(self.cfg, 'filter_theta_min', 1e-6))
-        if theta0 > filter_theta_min:
-            if not (theta1 <= 1.05 * theta0 + 1e-16):
-                accepted = False
-
-        # ---------------- apply TR update ----------------
-        if self.tr is not None:
-            # Use penalty-model prediction for TR update (consistent with rho)
-            self.tr.update(pred_red=pred_red_cons, act_red=act_red, step_norm=step_norm_inf if accepted else 0.0,
-                        theta0=theta0, kkt=None, act_sz=0, H=H_reg, step=h if accepted else np.zeros_like(h))
-            curR = self.tr.get_radius()
-        else:
-            state.radius = max(tr_min, float(Delta_new))
-            curR = state.radius
-
-        self.core.trmodel.radius = curR
-
-        # ---------------- state/model updates ----------------
-        if accepted:
-            # Only add the trial sample when accepted (avoid polluting geometry with rejects)
-            self.core.add_sample(x_trial, f1, cI1, cE1)
-            self.core.on_accept(x_trial, f1, cI1, cE1)
-            x_out = x_trial
-        else:
-            x_out = x  # stay
-
-        # Adaptive μ if feasibility stalls
-        vcur = max(np.maximum(0.0, cI1).max() if cI1.size else 0.0,
-                np.abs(cE1).max() if cE1.size else 0.0)
-        vprev = max(np.maximum(0.0, cI0).max() if cI0.size else 0.0,
-                    np.abs(cE0).max() if cE0.size else 0.0)
-        if state.adaptive_mu_update(vcur, vprev):
-            self.core.cfg.mu = float(state.mu)
-
-        # ---------------- KKT + convergence ----------------
-        kkt = nlp_model.kkt_residuals(x_out, state.lam, state.nu)
-        stat = float(kkt.get('stat', 1e6))
-        ineq = float(kkt.get('ineq', 0.0))
-        eq   = float(kkt.get('eq', 0.0))
-        comp = float(kkt.get('comp', 0.0))
-
-        tol = getattr(self.cfg, 'tol', 1e-8)
-        max_stagnation = getattr(self.cfg, 'max_stagnation', 10)
-
-        # Track short history for simple stagnation detection
-        state.f_history = getattr(state, 'f_history', [])
-        state.f_history.append(float(self._eval_cached(nlp_model, x_out)['f']))
-        if len(state.f_history) > max_stagnation:
-            state.f_history.pop(0)
-
-        # Step, objective-change, feasibility, criticality, KKT
-        step_criterion = (step_norm_inf if accepted else 0.0) <= tol * max(1.0, norm(x_out))
-        obj_criterion  = (abs(f1 - f0) if accepted else 0.0) <= tol * max(1.0, abs(f1 if accepted else f0))
-        viol_criterion = vcur <= tol
-        crit_criterion = sig <= tol
-        rejection_streak = getattr(state, 'rejection_streak', 0)
-        if not accepted:
-            state.rejection_streak = rejection_streak + 1
-        else:
-            state.rejection_streak = 0
-        stagnation_criterion = state.rejection_streak >= max_stagnation
-        kkt_criterion = (stat <= tol) and (ineq <= tol) and (eq <= tol) and (comp <= tol)
-
-        converged = (
-            (step_criterion and viol_criterion and crit_criterion) or
-            (obj_criterion  and viol_criterion and crit_criterion) or
-            kkt_criterion or
-            stagnation_criterion
+        # Criticality measure and direction (uses your C++ core)
+        measure, d, is_eactive = L1.l1CriticalityMeasureAndDescentDirection(
+            self.trm, cmodel, x, self.mu, self.epsilon, self.var_lb, self.var_ub
         )
 
-        # ---------------- info ----------------
-        info = {
-            'step_norm': float(step_norm_inf if accepted else 0.0),
-            'accepted': bool(accepted),
-            'converged': bool(converged),
-            'f': float(self._eval_cached(nlp_model, x_out)['f']),
-            'theta': nlp_model.constraint_violation(x_out),
-            'stat': stat, 'ineq': ineq, 'eq': eq, 'comp': comp,
-            'ls_iters': 0,
-            'alpha': float(step_info.get('t', 0.0)),
-            'rho': float(rho),
-            'sigma': float(sig),
-            'pred_red_cons': float(pred_red_cons),
-            'pred_red_quad': float(step_info.get('pred_red_quad', 0.0)),  # kept for logging/comparison only
-            'tr_radius': float(curR),
-            'mode': 'dfo_exact_penalty_core',
-            'solve_success': True,
-            'solve_info': {'core': step_info},
-            'model_samples': int(self.core.arrays()[0].shape[0]),
-            'cache_hits': int(self._cache_hits),
-            'penalty_mu': float(state.mu),
-            'used_multiplier_step': bool(step_info.get('used_multiplier_step', False)),
-        }
-        return x_out, state.lam, state.nu, info
+        # Optional criticality step (epsilon reduction) if measure is tiny
+        if measure <= self.eps_c:
+            thr_m = 1e3 * self.tol_measure
+            thr_r = self.opt.initial_radius
+            self.epsilon, _, _ = self.trm.trCriticalityStep(
+                self.func, self.mu, self.epsilon,
+                self.var_lb, self.var_ub, self.con_lb, self.con_ub,
+                thr_m, thr_r, self.opt
+            )
+            # Rebuild models after epsilon change
+            self.trm.computePolynomialModels()
+            fx_model, fmodel_g, fmodel_H = self.trm.getModelMatrices(0)
+            cmodel = self.trm.extractConstraintsFromTRModel(self.con_lb, self.con_ub)
+            measure, d, is_eactive = L1.l1CriticalityMeasureAndDescentDirection(
+                self.trm, cmodel, x, self.mu, self.epsilon, self.var_lb, self.var_ub
+            )
+
+        # If near-stationary (for the L1 penalty subproblem), stop
+        # (caller can treat info["converged"] to drive outer loop)
+        # We still compute info at current x:
+        p_now, fvals_now = L1.l1_function(self.func, self.con_lb, self.con_ub, self.mu, x.copy())
+        theta_now = _constraint_violation_from_fvalues(fvals_now, self.con_lb, self.con_ub)
+        if measure < self.tol_measure:
+            info = self._pack_info(
+                step_norm=0.0,
+                accepted=False,
+                converged=True,
+                f_val=float(fvals_now[0]),
+                theta=theta_now,
+                measure=measure,
+                alpha=0.0,
+                rho=0.0,
+            )
+            return x, lam, nu, info
+
+        # Propose TR step (model QP inside l1core); returns x_step (already “x+s”) or a raw step?
+        # Your binding returns the next point; we’ll project it and treat as trial:
+        x_step, pred, lam_out = L1.l1TrustRegionStep(
+            self.trm, cmodel, x, self.epsilon, self.lam_penalty, self.mu, self.trm.radius, self.var_lb, self.var_ub
+        )
+        # Update the internal penalty lambda if changed by core:
+        self.lam_penalty = float(lam_out)
+
+        x_trial = self._project(x_step)
+        s = x_trial - x
+        pred = float(pred) if np.isfinite(pred) else -np.inf
+
+        # Evaluate trial (true black-box composite)
+        rho = -np.inf
+        accepted = False
+        if pred > 0.0 and np.all(np.isfinite(x_trial)):
+            p_trial, fvals_trial = L1.l1_function(self.func, self.con_lb, self.con_ub, self.mu, x_trial.copy())
+            if np.all(np.isfinite(fvals_trial)):
+                ared = L1.evaluatePDescent(self.trm.fValues[:, self.trm.trCenter], fvals_trial, self.con_lb, self.con_ub, self.mu)
+                rho = float(ared / max(pred, 1e-16))
+                # Accept rules (match your driver)
+                geom_ok = self.trm.isLambdaPoised(self.opt)
+                if (rho >= self.eta_2) or (rho > self.eta_1 and geom_ok):
+                    # accept and recenter
+                    x = x_trial
+                    accepted = True
+                    _ = L1.changeTRCenter(self.trm, x_trial, fvals_trial, self.opt)
+                elif np.isinf(rho):
+                    _ = L1.ensureImprovement(self.trm, self.func, self.var_lb, self.var_ub, self.opt)
+                else:
+                    _ = L1.try2addPoint(self.trm, x_trial, fvals_trial, self.func, self.var_lb, self.var_ub, self.opt)
+            else:
+                # non-finite trial eval: force model repair
+                _ = L1.ensureImprovement(self.trm, self.func, self.var_lb, self.var_ub, self.opt)
+        else:
+            # No predictive decrease: force a model improvement
+            _ = L1.ensureImprovement(self.trm, self.func, self.var_lb, self.var_ub, self.opt)
+
+        # TR radius update (match your rules)
+        if pred > 0.0 and np.isfinite(rho):
+            if rho < self.eta_2:
+                # shrink
+                self.trm.radius *= self.gamma_dec
+            else:
+                # grow (capped)
+                s_inf = min(self.trm.radius, float(np.max(np.abs(s))) if s.size else 0.0)
+                growth = max(1.0, self.gamma_inc * (s_inf / max(1e-16, self.trm.radius)))
+                self.trm.radius = min(growth * self.trm.radius, self.radius_max)
+
+        # Final info (true f, θ at current x)
+        p_now, fvals_now = L1.l1_function(self.func, self.con_lb, self.con_ub, self.mu, x.copy())
+        f_true = float(fvals_now[0])
+        theta = _constraint_violation_from_fvalues(fvals_now, self.con_lb, self.con_ub)
+
+        step_norm = float(np.linalg.norm(s, ord=2))
+        alpha = 1.0 if accepted else 0.0
+        converged = (step_norm <= self.tol_radius) or (measure < self.tol_measure)
+
+        info = self._pack_info(
+            step_norm=step_norm,
+            accepted=accepted,
+            converged=converged,
+            f_val=f_true,
+            theta=theta,
+            measure=measure,
+            alpha=alpha,
+            rho=rho if np.isfinite(rho) else -np.inf,
+        )
+        return x, lam, nu, info

@@ -608,7 +608,7 @@ class InteriorPointStepper:
             K, _ = make_psd_advanced(K, self.reg, attempts)
             K_upper = _upper_csc(K)
             nsys = K_upper.shape[0]
-            from .amd import AMDReorderingArray
+            from .aux.amd import AMDReorderingArray
 
             amd_ = AMDReorderingArray(aggressive_absorption=True)
             perm, stats = amd_.compute_fill_reducing_permutation(K_upper)
