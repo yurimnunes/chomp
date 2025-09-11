@@ -59,4 +59,10 @@ public:
     
     void reserve(size_t capacity);
 
+    // define empty method
+    bool empty() const { return data.empty(); }
+
+    // define resize
+    void resize(size_t newSize) { data.resize(newSize); }
+
 };

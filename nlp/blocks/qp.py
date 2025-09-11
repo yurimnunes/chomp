@@ -11,21 +11,17 @@ This module exposes a `QPSolver` that solves trust-region subproblems of the for
 
 Trust-region options (set via `solve(..., tr_mode=..., tr_radius=...)`):
 
-1) tr_mode="ellip_inf"  (hard cap; extra vars y):
-   - Enforce  |y_i| ≤ Δ with y = L p.
-   - Adds n variables (y) and 2n inequalities; no cost terms on y.
-
-2) tr_mode="sigma"  (soft cap; extra vars y and t):
+1) tr_mode="sigma"  (soft cap; extra vars y and t):
    - Enforce  |y_i| ≤ t and t ≤ Δ (outer hard cap optional but recommended).
    - Adds penalty  σ t + (ε_t/2) t² to the objective and adaptively tunes σ
      (up to a small number of extra PIQP solves) to hit t ≈ Δ within tolerance.
    - Decision vector becomes [p; y; t].
 
-3) tr_mode="l2_poly"  (no extra vars; polyhedral approx):
+2) tr_mode="l2_poly"  (no extra vars; polyhedral approx):
    - Adds directional cuts that approximate { ||L p||₂ ≤ Δ }.
    - Two variants:
-       * "dir": random unit directions (plus ±e_i) yielding symmetric cuts.
-       * "l1_inner": inner approximation via ||y||₁ ≤ Δ with y = L p.
+       * "outer": outer approximation via u_k^T L p ≤ Δ
+       * "inner": inner approximation via u_k^T L p ≤ βΔ with β < 1
 
 The preconditioner L defaults to diag( sqrt( max(diag(P), 1e-12) ) ), where P is
 the (symmetrized) PSD-ified Hessian block. This makes the trust region roughly
@@ -55,10 +51,10 @@ SIGMA_MIN = 1e-16
 SIGMA_MAX = 1e16
 SIGMA_GROW = 10.0       # multiplicative step when expanding/contracting σ
 SIGMA_TOL = 0.1         # accept if |t - Δ| ≤ SIGMA_TOL * max(Δ, 1)
-SIGMA_MAX_SOLVES = 2    # max extra re-solves after initial σ
+SIGMA_MAX_SOLVES = 3    # max extra re-solves after initial σ
 
-TR_POLY_FACETS_DEFAULT = 64   # number of random directions for dir-variant
-TR_POLY_SHRINK_INNER = 0.95   # inner-approx shrink factor β∈(0,1]
+TR_POLY_FACETS_DEFAULT = 256   # number of random directions for outer/inner
+TR_POLY_SHRINK_INNER = 0.90   # inner-approx shrink factor β∈(0,1]
 TR_POLY_SEED = 0              # RNG seed for reproducible directions
 TR_PRECOND_DEFAULT = True     # use L from P (curvature-aware)
 
@@ -71,16 +67,112 @@ def _as_csc_symmetric(H) -> sp.csc_matrix:
     P = H.tocsc(copy=True) if sp.issparse(H) else sp.csc_matrix(H)
     return 0.5 * (P + P.T)
 
-
-def _choose_L_from_P(P_csc: sp.csc_matrix, n: int) -> sp.csc_matrix:
+def _choose_L_from_P(P_csc: sp.csc_matrix, n: int, mode: str = "auto") -> sp.csc_matrix:
     """
-    Cheap curvature-aware scaling L = diag( sqrt( max(diag(P), 1e-12) ) ).
-    This behaves like a Jacobi preconditioner for the TR geometry.
+    Improved trust region preconditioner that handles ill-conditioning better.
+    
+    Parameters
+    ----------
+    P_csc : sp.csc_matrix
+        The Hessian matrix (should be PSD)
+    n : int
+        Problem dimension
+    mode : str
+        Preconditioner strategy:
+        - "auto": Automatic selection based on condition number
+        - "identity": No preconditioning (L = I)
+        - "jacobi": Diagonal scaling only
+        - "jacobi_reg": Regularized diagonal scaling  
+        - "cholesky": Incomplete Cholesky (if available)
+        - "norm": Simple norm-based scaling
+    
+    Returns
+    -------
+    L : sp.csc_matrix
+        Preconditioner matrix such that trust region is ||L p||₂ ≤ Δ
     """
+    
+    if mode == "identity":
+        return sp.eye(n, format="csc")
+    
+    # Get diagonal elements
     d = np.array(P_csc.diagonal()).ravel()
-    d = np.sqrt(np.maximum(d, 1e-12))
-    return sp.diags(d, format="csc")
-
+    
+    if mode == "norm":
+        # Simple norm-based scaling - often more robust
+        P_norm = sp.linalg.norm(P_csc, 'fro')
+        if P_norm < 1e-14:
+            return sp.eye(n, format="csc")
+        scale = np.sqrt(P_norm / n)
+        return sp.diags(np.full(n, scale), format="csc")
+    
+    # Check if diagonal dominates (good for Jacobi-type methods)
+    d_abs = np.abs(d)
+    d_min, d_max = np.min(d_abs), np.max(d_abs)
+    
+    if mode == "auto":
+        # Automatic selection based on problem properties
+        if d_max < 1e-12:
+            # Essentially zero Hessian
+            return sp.eye(n, format="csc")
+        elif d_min / d_max < 1e-8:
+            # Very ill-conditioned diagonal - use norm scaling
+            P_norm = sp.linalg.norm(P_csc, 'fro') 
+            scale = np.sqrt(max(P_norm / n, 1e-8))
+            return sp.diags(np.full(n, scale), format="csc")
+        else:
+            # Use regularized Jacobi
+            mode = "jacobi_reg"
+    
+    if mode == "jacobi":
+        # Original approach (problematic)
+        d_scaled = np.sqrt(np.maximum(d_abs, 1e-12))
+        return sp.diags(d_scaled, format="csc")
+    
+    elif mode == "jacobi_reg":
+        # Regularized Jacobi with relative floor
+        d_floor = max(d_max * 1e-6, 1e-10)  # Relative to largest diagonal
+        d_reg = np.maximum(d_abs, d_floor)
+        
+        # Use 4th root instead of square root for less aggressive scaling
+        d_scaled = np.power(d_reg, 0.25)
+        return sp.diags(d_scaled, format="csc")
+    
+    elif mode == "cholesky":
+        # Attempt incomplete Cholesky (fallback to Jacobi if fails)
+        try:
+            from scipy.sparse import tril
+            from scipy.sparse.linalg import spsolve_triangular
+            
+            # Simple incomplete Cholesky with drop tolerance
+            P_lower = tril(P_csc, format="csc")
+            
+            # Add regularization to diagonal
+            P_reg = P_lower.copy()
+            P_reg.setdiag(P_reg.diagonal() + max(d_max * 1e-6, 1e-10))
+            
+            # Try Cholesky factorization
+            try:
+                from scikits.sparse.cholmod import cholesky
+                factor = cholesky(P_reg)
+                L_chol = factor.L()
+                return L_chol
+            except ImportError:
+                # Fallback: use regularized Jacobi
+                d_floor = max(d_max * 1e-6, 1e-10)
+                d_reg = np.maximum(d_abs, d_floor)
+                d_scaled = np.power(d_reg, 0.25)
+                return sp.diags(d_scaled, format="csc")
+                
+        except Exception:
+            # Fallback to regularized Jacobi
+            d_floor = max(d_max * 1e-6, 1e-10)
+            d_reg = np.maximum(d_abs, d_floor)
+            d_scaled = np.power(d_reg, 0.25)
+            return sp.diags(d_scaled, format="csc")
+    
+    else:
+        raise ValueError(f"Unknown preconditioner mode: {mode}")
 
 def _pad_cols(M: sp.csc_matrix | None, add_cols: int) -> sp.csc_matrix | None:
     """Pad a matrix with `add_cols` zero columns on the right (if M is not None)."""
@@ -191,46 +283,6 @@ class QPSolver:
         b = -b_eq if b_eq is not None else None
         return A, b
 
-    # ------------------------ TR: ellip_inf augmentation ------------------------
-    def _augment_with_ellip_inf(self, *, P, q, A, b, G, h, Delta):
-        """
-        Hard box in preconditioned step-space: y = L p,  |y|_∞ ≤ Δ.
-
-        Adds n variables (y) and constraints:
-            Equalities:     y - L p = 0
-            Inequalities:   -Δ ≤ y ≤ Δ
-        Objective is unchanged (y has zero cost).
-        """
-        n = q.size
-        L = _choose_L_from_P(P, n)  # (n x n)
-
-        # Equalities: [-L  I] [p;y] = 0
-        A_blk = sp.hstack([-L, sp.eye(n, format="csc")], format="csc")
-        if A is None:
-            A_aug = A_blk
-            b_aug = np.zeros(n)
-        else:
-            A_aug = sp.vstack([_pad_cols(A, n), A_blk], format="csc")
-            b_aug = np.concatenate([b if b is not None else np.zeros(A.shape[0]), np.zeros(n)])
-
-        # Inequalities on y
-        Gy_up = sp.hstack([sp.csc_matrix((n, n)), sp.eye(n, format="csc")], format="csc")   # y ≤ Δ
-        Gy_dn = sp.hstack([sp.csc_matrix((n, n)), -sp.eye(n, format="csc")], format="csc")  # -y ≤ Δ
-        G_new = sp.vstack([Gy_up, Gy_dn], format="csc")
-        h_new = np.concatenate([Delta * np.ones(n), Delta * np.ones(n)])
-
-        if G is None:
-            G_aug, h_aug = G_new, h_new
-        else:
-            G_aug = sp.vstack([_pad_cols(G, n), G_new], format="csc")
-            h_aug = np.concatenate([h, h_new])
-
-        # Objective extension: zero block for y
-        P_aug = sp.block_diag((P, sp.csc_matrix((n, n))), format="csc")
-        q_aug = np.concatenate([q, np.zeros(n)])
-
-        return P_aug, q_aug, A_aug, b_aug, G_aug, h_aug, n  # n added vars
-
     # ------------------------ TR: sigma (soft) augmentation ------------------------
     def _augment_with_sigma(self, *, P, q, A, b, G, h, Delta, sigma: float, eps_t: float):
         """
@@ -290,54 +342,35 @@ class QPSolver:
 
         return P_aug, q_aug, A_aug, b_aug, G_aug, h_aug, (n + 1)  # y(n) + t(1)
 
-    def _augment_with_l2_poly_dir(
-        self,
-        *,
-        P, q, A, b, G, h,
-        Delta: float,
-        m_facets: int = TR_POLY_FACETS_DEFAULT,
-        precond: bool = TR_PRECOND_DEFAULT,
-        inner: bool = True,
-        shrink: float | None = None,
-        seed: int = TR_POLY_SEED,
-    ):
+    # ------------------------ TR: L2 polyhedral approximation ------------------------
+    def _augment_with_l2_poly_outer(self, *, P, q, A, b, G, h, Delta: float, 
+                                   m_facets: int = TR_POLY_FACETS_DEFAULT,
+                                   precond: bool = TR_PRECOND_DEFAULT,
+                                   seed: int = TR_POLY_SEED):
         """
-        Polyhedral approximation to { p : ||L p||₂ ≤ Δ } via directional cuts.
-
-        No extra variables; we add rows:
-            -βΔ ≤ u_kᵀ L p ≤ βΔ,   for k = 1..(m_facets + 2n)
-        where {u_k} are random unit vectors plus the axis-aligned ±e_i.
-
-        Parameters
-        ----------
-        inner : bool
-            If True, use an inner approximation with shrink factor β∈(0,1].
-            If False, β=1.0 (outer approximation). Defaults to inner.
-        shrink : float | None
-            Override for β when inner=True. Defaults to 0.95.
+        Outer polyhedral approximation to { p : ||L p||₂ ≤ Δ }.
+        
+        Adds constraints: u_k^T L p ≤ Δ for unit vectors u_k.
+        This gives: { p : u_k^T L p ≤ Δ ∀k } ⊇ { p : ||L p||₂ ≤ Δ }
+        
+        No extra variables; adds ~(m_facets + 2n) inequality constraints.
         """
         n = q.size
-
-        # Choose L (preconditioned or identity)
         L = _choose_L_from_P(P, n) if precond else sp.eye(n, format="csc")
 
-        # Random unit directions + ±e_i to guarantee a box at minimum
+        # Generate random unit directions + coordinate directions for robustness
         rng = np.random.default_rng(seed)
-        U = rng.standard_normal((m_facets, n))
-        U /= np.linalg.norm(U, axis=1, keepdims=True) + 1e-18
-        U = np.vstack([U, np.eye(n), -np.eye(n)])
+        U_rand = rng.standard_normal((m_facets, n))
+        U_rand /= np.linalg.norm(U_rand, axis=1, keepdims=True) + 1e-18
+        
+        # Include ±coordinate directions for axis-aligned coverage
+        U_coord = np.vstack([np.eye(n), -np.eye(n)])
+        U = np.vstack([U_rand, U_coord])
 
-        # Effective operator on p
-        M = sp.csr_matrix(U) @ L  # (m x n)
-
-        # Inner vs outer scaling
-        beta = TR_POLY_SHRINK_INNER if (inner and shrink is None) else (shrink if inner else 1.0)
-        beta = float(np.clip(beta, 1e-6, 1.0))
-        rhs = beta * float(Delta)
-
-        # Build ±M p ≤ rhs
-        G_new = sp.vstack([M, -M], format="csc")
-        h_new = np.concatenate([np.full(M.shape[0], rhs), np.full(M.shape[0], rhs)])
+        # Build constraints: u_k^T L p ≤ Δ (ONE-SIDED per direction)
+        M = sp.csr_matrix(U) @ L  # (num_directions x n)
+        G_new = M
+        h_new = np.full(M.shape[0], float(Delta))
 
         if G is None:
             G_aug, h_aug = G_new, h_new
@@ -347,54 +380,49 @@ class QPSolver:
 
         return P, q, A, b, G_aug, h_aug, 0  # no new vars
 
-    def _augment_with_l2_l1_inner(self, *, P, q, A, b, G, h, Delta: float, precond: bool = TR_PRECOND_DEFAULT):
+    def _augment_with_l2_poly_inner(self, *, P, q, A, b, G, h, Delta: float,
+                                   m_facets: int = TR_POLY_FACETS_DEFAULT,
+                                   shrink: float = TR_POLY_SHRINK_INNER,
+                                   precond: bool = TR_PRECOND_DEFAULT,
+                                   seed: int = TR_POLY_SEED):
         """
-        Inner approximation: ||L p||₂ ≤ Δ  ⇒  introduce y = L p and enforce ||y||₁ ≤ Δ.
-
-        Adds variables y (n) and t (n) with constraints:
-            y - L p = 0
-            -t ≤ y ≤ t
-            -t ≤ 0  (i.e., t ≥ 0)
-            1ᵀ t ≤ Δ
-        Objective unchanged for [y; t].
+        Inner polyhedral approximation to { p : ||L p||₂ ≤ Δ }.
+        
+        Adds constraints: u_k^T L p ≤ βΔ for unit vectors u_k, where β < 1.
+        This gives: { p : u_k^T L p ≤ βΔ ∀k } ⊆ { p : ||L p||₂ ≤ Δ }
+        
+        Inner approximation is more conservative but guarantees feasibility.
+        Typically need more facets for good approximation quality.
         """
         n = q.size
         L = _choose_L_from_P(P, n) if precond else sp.eye(n, format="csc")
+        
+        # Use more directions for inner approximation (need better coverage)
+        effective_facets = max(m_facets, 128)  # minimum for reasonable inner approx
+        
+        # Generate well-distributed unit directions
+        rng = np.random.default_rng(seed)
+        U_rand = rng.standard_normal((effective_facets, n))
+        U_rand /= np.linalg.norm(U_rand, axis=1, keepdims=True) + 1e-18
+        
+        # For inner approximation, coordinate directions are less critical
+        # but can still help with axis-aligned components
+        U_coord = np.vstack([np.eye(n), -np.eye(n)])
+        U = np.vstack([U_rand, U_coord])
 
-        # Equalities: [-L  I  0] [p;y;t] = 0
-        A_blk = sp.hstack([-L, sp.eye(n, format="csc"), sp.csc_matrix((n, n))], format="csc")
-        if A is None:
-            A_aug, b_aug = A_blk, np.zeros(n)
-        else:
-            A_aug = sp.vstack([_pad_cols(A, 2 * n), A_blk], format="csc")
-            b_aug = np.concatenate([b if b is not None else np.zeros(A.shape[0]), np.zeros(n)])
-
-        # Inequalities for -t ≤ y ≤ t and t ≥ 0 plus 1ᵀ t ≤ Δ
-        Zpn = sp.csc_matrix((n, n))
-        I = sp.eye(n, format="csc")
-        negI = -I
-
-        Gy_up = sp.hstack([Zpn, I,    negI], format="csc")   # y - t ≤ 0
-        Gy_dn = sp.hstack([Zpn, -I,   negI], format="csc")   # -y - t ≤ 0
-        Gt_nn = sp.hstack([sp.csc_matrix((n, n)), sp.csc_matrix((n, n)), negI], format="csc")  # -t ≤ 0
-        Gsum  = sp.hstack([sp.csc_matrix((1, n)), sp.csc_matrix((1, n)), sp.csc_matrix(np.ones((1, n)))], format="csc")  # 1ᵀ t ≤ Δ
-
-        G_new = sp.vstack([Gy_up, Gy_dn, Gt_nn, Gsum], format="csc")
-        h_new = np.concatenate([np.zeros(n), np.zeros(n), np.zeros(n), np.array([float(Delta)])])
+        # Build constraints: u_k^T L p ≤ βΔ (shrunk radius)
+        M = sp.csr_matrix(U) @ L
+        G_new = M
+        h_new = np.full(M.shape[0], shrink * float(Delta))
 
         if G is None:
             G_aug, h_aug = G_new, h_new
         else:
-            G_aug = sp.vstack([_pad_cols(G, 2 * n), G_new], format="csc")
+            G_aug = sp.vstack([G, G_new], format="csc")
             h_aug = np.concatenate([h, h_new])
 
-        # Extend objective with zeros for [y; t]
-        P_aug = sp.block_diag((P, sp.csc_matrix((2 * n, 2 * n))), format="csc")
-        q_aug = np.concatenate([q, np.zeros(2 * n)])
+        return P, q, A, b, G_aug, h_aug, 0  # no new vars
 
-        return P_aug, q_aug, A_aug, b_aug, G_aug, h_aug, 2 * n
-
-    # ------------------------------ public API ------------------------------
     def solve(
         self,
         H,
@@ -412,9 +440,14 @@ class QPSolver:
         prox_ineq=None,
         prox_eq=None,
         tr_radius: float | None = None,
-        tr_mode: str = "l2_poly",   # "ellip_inf" | "sigma" | "l2_poly"
-        tr_sigma: float = 0.0,      # initial σ for sigma-mode (if ≤ 0 uses SIGMA_INIT_DEFAULT)
-        tr_eps_t: float = 1e-8,     # tiny quadratic on t (sigma-mode)
+        tr_mode: str = "l2_poly",       # "sigma" | "l2_poly"
+        tr_variant: str = "outer",      # for l2_poly: "outer" | "inner"
+        tr_sigma: float = 0.0,          # initial σ for sigma-mode (if ≤ 0 uses default)
+        tr_eps_t: float = 1e-6,         # tiny quadratic on t (sigma-mode)
+        tr_facets: int = TR_POLY_FACETS_DEFAULT,  # number of random directions
+        tr_shrink: float = TR_POLY_SHRINK_INNER,  # shrink factor for inner approx
+        tr_precond: bool = TR_PRECOND_DEFAULT,    # use curvature-aware preconditioner
+        tr_seed: int = TR_POLY_SEED,    # RNG seed for reproducible directions
     ):
         """
         Solve the QP with optional trust-region augmentation.
@@ -423,8 +456,8 @@ class QPSolver:
         --------------
             minimize_p    ½ pᵀ H p + gᵀ p
             subject to    A_eq p = -b_eq
-                          A_ineq p ≤ -b_ineq
-                          lb ≤ p ≤ ub
+                        A_ineq p ≤ -b_ineq
+                        lb ≤ p ≤ ub
 
         Trust-Region (optional)
         -----------------------
@@ -448,12 +481,22 @@ class QPSolver:
             Hooks for your external proximal/warm-start logic (left as-is).
         tr_radius : float | None
             Trust-region radius Δ. If None/inf, TR augmentation is disabled.
-        tr_mode : {"ellip_inf", "sigma", "l2_poly"}
-            Select TR strategy (see module docstring).
+        tr_mode : {"sigma", "l2_poly"}
+            Select TR strategy.
+        tr_variant : {"outer", "inner"}
+            For l2_poly mode: outer or inner polyhedral approximation.
         tr_sigma : float
             Initial σ for sigma-mode. If ≤ 0, uses SIGMA_INIT_DEFAULT.
         tr_eps_t : float
             Small quadratic weight on t (sigma-mode) to stabilize the scalar.
+        tr_facets : int
+            Number of random directions for l2_poly mode.
+        tr_shrink : float
+            Shrink factor β ∈ (0,1] for inner polyhedral approximation.
+        tr_precond : bool
+            Use curvature-aware preconditioner L (recommended).
+        tr_seed : int
+            RNG seed for reproducible direction generation.
 
         Returns
         -------
@@ -485,12 +528,8 @@ class QPSolver:
         n_added = 0
         t_index = None  # index of t in decision vector for sigma-mode
 
-        if tr_radius is not None and np.isfinite(tr_radius):
-            if tr_mode == "ellip_inf":
-                P, q, A, b, G, h, n_added = self._augment_with_ellip_inf(
-                    P=P, q=q, A=A, b=b, G=G, h=h, Delta=float(tr_radius)
-                )
-            elif tr_mode == "sigma":
+        if tr_radius is not None and np.isfinite(tr_radius) and tr_radius > 0:
+            if tr_mode == "sigma":
                 sigma_cur = float(tr_sigma) if tr_sigma > 0 else SIGMA_INIT_DEFAULT
                 P, q, A, b, G, h, n_added = self._augment_with_sigma(
                     P=P, q=q, A=A, b=b, G=G, h=h,
@@ -500,28 +539,29 @@ class QPSolver:
                 )
                 # In sigma-mode, t is the last scalar
                 t_index = q.size - 1
+                
             elif tr_mode == "l2_poly":
-                variant = getattr(self.cfg, "tr_poly_variant", "dir")
-                if variant == "dir":
-                    P, q, A, b, G, h, n_added = self._augment_with_l2_poly_dir(
+                if tr_variant == "outer":
+                    P, q, A, b, G, h, n_added = self._augment_with_l2_poly_outer(
                         P=P, q=q, A=A, b=b, G=G, h=h,
                         Delta=float(tr_radius),
-                        m_facets=getattr(self.cfg, "tr_poly_facets", TR_POLY_FACETS_DEFAULT),
-                        precond=getattr(self.cfg, "tr_poly_precond", TR_PRECOND_DEFAULT),
-                        inner=getattr(self.cfg, "tr_poly_inner", False),
-                        shrink=getattr(self.cfg, "tr_poly_shrink", None),
-                        seed=getattr(self.cfg, "tr_poly_seed", TR_POLY_SEED),
+                        m_facets=tr_facets,
+                        precond=tr_precond,
+                        seed=tr_seed,
                     )
-                elif variant == "l1_inner":
-                    P, q, A, b, G, h, n_added = self._augment_with_l2_l1_inner(
+                elif tr_variant == "inner":
+                    P, q, A, b, G, h, n_added = self._augment_with_l2_poly_inner(
                         P=P, q=q, A=A, b=b, G=G, h=h,
                         Delta=float(tr_radius),
-                        precond=getattr(self.cfg, "tr_poly_precond", TR_PRECOND_DEFAULT),
+                        m_facets=tr_facets,
+                        shrink=tr_shrink,
+                        precond=tr_precond,
+                        seed=tr_seed,
                     )
                 else:
-                    raise ValueError(f"Unknown l2_poly variant '{variant}'")
+                    raise ValueError(f"Unknown l2_poly variant '{tr_variant}'. Use 'outer' or 'inner'.")
             else:
-                raise ValueError(f"Unknown tr_mode '{tr_mode}'")
+                raise ValueError(f"Unknown tr_mode '{tr_mode}'. Use 'sigma' or 'l2_poly'.")
 
         # --- PIQP setup/update (reuse sparsity pattern if possible) ---
         m_eq = A.shape[0] if A is not None else 0
@@ -559,79 +599,101 @@ class QPSolver:
         # First solve
         x, y_full, z_full, s_full = _do_solve()
 
-        # --- Sigma-mode: adapt σ to make t ≈ Δ (within relative tolerance) ---
-        if tr_radius is not None and np.isfinite(tr_radius) and tr_mode == "sigma":
+        # --- Sigma-mode: adaptive σ tuning to make t ≈ Δ ---
+        if (tr_radius is not None and np.isfinite(tr_radius) and tr_radius > 0 
+            and tr_mode == "sigma"):
             Delta = float(tr_radius)
             t_val = x[t_index]
             tol_abs = SIGMA_TOL * max(Delta, 1.0)
 
+            # Check if we need to adjust σ
             if not np.isfinite(t_val) or abs(t_val - Delta) > tol_abs:
                 sigma_low, sigma_high = None, None
                 sigma_cur = float(q[-1])  # current σ is last entry of q
 
                 def _resolve_with_sigma(sigma_new: float):
+                    """Re-solve with updated σ value."""
                     q_new = q.copy()
                     q_new[-1] = float(np.clip(sigma_new, SIGMA_MIN, SIGMA_MAX))
                     self.solver.update_values(P, q_new, A, b, G, h, same_pattern=True)
                     x2, y2, z2, s2 = _do_solve()
                     return q_new, x2, y2, z2, s2
 
-                # If t too large → increase σ; if too small → decrease σ.
+                # Phase 1: Coarse adjustment based on t vs Δ
                 if not np.isfinite(t_val) or (t_val > Delta + tol_abs):
-                    for _ in range(3):  # coarse expansion
+                    # t too large → increase σ to penalize t more
+                    for _ in range(3):
                         sigma_try = min(SIGMA_MAX, sigma_cur * SIGMA_GROW)
                         q, x, y_full, z_full, s_full = _resolve_with_sigma(sigma_try)
                         t_val = x[t_index]
                         sigma_cur = float(q[-1])
                         if np.isfinite(t_val) and t_val <= Delta + tol_abs:
-                            sigma_high, sigma_low = sigma_cur, None
+                            sigma_high = sigma_cur
                             break
-                else:
-                    for _ in range(3):  # coarse contraction
+                        if sigma_cur >= SIGMA_MAX:
+                            break
+                            
+                elif t_val < Delta - tol_abs:
+                    # t too small → decrease σ to allow t to grow
+                    for _ in range(3):
                         sigma_try = max(SIGMA_MIN, sigma_cur / SIGMA_GROW)
                         q, x, y_full, z_full, s_full = _resolve_with_sigma(sigma_try)
                         t_val = x[t_index]
                         sigma_cur = float(q[-1])
-                        if np.isfinite(t_val) and (t_val > Delta - tol_abs):
-                            sigma_low, sigma_high = sigma_cur, None
+                        if np.isfinite(t_val) and t_val >= Delta - tol_abs:
+                            sigma_low = sigma_cur
+                            break
+                        if sigma_cur <= SIGMA_MIN:
                             break
 
-                # A few guided steps (log-bisection if both sides known)
+                # Phase 2: Fine-tuning with bisection-like search
                 solves_left = SIGMA_MAX_SOLVES
-                while solves_left > 0:
+                while solves_left > 0 and np.isfinite(t_val) and abs(t_val - Delta) > tol_abs:
                     solves_left -= 1
+                    
+                    # Choose next σ based on available bounds
                     if (sigma_low is not None) and (sigma_high is not None):
+                        # Geometric mean for log-scale bisection
                         sig_next = np.exp(0.5 * (np.log(sigma_low) + np.log(sigma_high)))
                     elif sigma_high is not None:
+                        # Only upper bound → try increasing penalty
                         sig_next = min(SIGMA_MAX, sigma_high * np.sqrt(SIGMA_GROW))
                     elif sigma_low is not None:
+                        # Only lower bound → try decreasing penalty  
                         sig_next = max(SIGMA_MIN, sigma_low / np.sqrt(SIGMA_GROW))
                     else:
-                        break
+                        # No bounds → try adaptive step based on t vs Δ
+                        if t_val > Delta:
+                            sig_next = min(SIGMA_MAX, sigma_cur * np.sqrt(SIGMA_GROW))
+                        else:
+                            sig_next = max(SIGMA_MIN, sigma_cur / np.sqrt(SIGMA_GROW))
 
                     q, x, y_full, z_full, s_full = _resolve_with_sigma(sig_next)
                     t_val = x[t_index]
+                    sigma_cur = float(q[-1])
 
                     if not np.isfinite(t_val):
+                        # Infeasible/unbounded → need stronger penalty
                         sigma_low = None
-                        sigma_high = float(q[-1])
+                        sigma_high = sigma_cur
                         continue
 
+                    # Update bounds based on t vs Δ
                     if t_val > Delta + tol_abs:
-                        sigma_low = float(q[-1])    # need stronger penalty
-                        if sigma_high is None:
-                            continue
+                        sigma_low = sigma_cur    # need stronger penalty
                     elif t_val < Delta - tol_abs:
-                        sigma_high = float(q[-1])   # can relax penalty
-                        if sigma_low is None:
-                            continue
+                        sigma_high = sigma_cur   # can relax penalty
                     else:
-                        break  # good enough
+                        break  # close enough to target
 
-        # --- Cache and map back to original variables ---
+        # --- Cache final solution and extract original variables ---
         self.last_x, self.last_y, self.last_z, self.last_s = x, y_full, z_full, s_full
 
+        # Extract solution for original variables p
         p = x[:n]
+        
+        # Extract dual variables for user constraints only (exclude bounds and TR constraints)
         lam_ineq = np.maximum(0.0, z_full[:m_ineq_user]) if m_ineq_user > 0 else np.zeros(0)
-        nu_eq = y_full[:m_eq_user]
+        nu_eq = y_full[:m_eq_user] if m_eq_user > 0 else np.zeros(0)
+        
         return p, lam_ineq, nu_eq

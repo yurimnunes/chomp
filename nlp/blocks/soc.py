@@ -19,7 +19,9 @@ def _safe_solve(J: np.ndarray, r: np.ndarray, reg: float = 1e-8) -> np.ndarray:
             y = np.linalg.solve(JJt + lam * np.eye(m), r)
             return J.T @ y
     except np.linalg.LinAlgError:
-        logging.debug("SOC: linear solve failed (singular/ill-conditioned), returning zero correction")
+        logging.debug(
+            "SOC: linear solve failed (singular/ill-conditioned), returning zero correction"
+        )
         return np.zeros(J.shape[1])
 
 
@@ -33,7 +35,7 @@ class SOCCorrector:
         self,
         model: "Model",
         x_trial: np.ndarray,
-        Delta: Optional[float] = None,   # <-- TR radius now optional
+        Delta: Optional[float] = None,  # <-- TR radius now optional
         s: Optional[np.ndarray] = None,
         mu: float = 0.0,
         funnel: Optional["Funnel"] = None,
@@ -52,7 +54,9 @@ class SOCCorrector:
         if not getattr(self.cfg, "use_soc", False):
             return np.zeros(model.n), False
 
-        if self._cached_x_trial is None or not np.allclose(self._cached_x_trial, x_trial):
+        if self._cached_x_trial is None or not np.allclose(
+            self._cached_x_trial, x_trial
+        ):
             d = model.eval_all(x_trial)
             self._cached_eval = d
             self._cached_x_trial = x_trial.copy()
@@ -83,7 +87,9 @@ class SOCCorrector:
                 rhs.append(-cI[maskI])
 
         if not rows:
-            logging.debug("SOC: nothing to correct (no violated constraints beyond thresholds)")
+            logging.debug(
+                "SOC: nothing to correct (no violated constraints beyond thresholds)"
+            )
             return np.zeros(model.n), False
 
         J = np.vstack(rows)
@@ -111,8 +117,10 @@ class SOCCorrector:
 
         if np.isfinite(cap) and nrm > max(cap, min_norm):
             corr *= cap / max(nrm, 1e-16)
-            logging.debug(f"SOC: scaled correction ‖Δx‖ {nrm:.2e} → {cap:.2e} "
-                          f"(Delta={'None' if Delta is None else f'{Delta:.3e}'})")
+            logging.debug(
+                f"SOC: scaled correction ‖Δx‖ {nrm:.2e} → {cap:.2e} "
+                f"(Delta={'None' if Delta is None else f'{Delta:.3e}'})"
+            )
 
         # ----- Acceptability checks (optional) -----
         needs_restoration = False
@@ -121,14 +129,21 @@ class SOCCorrector:
             d_corr = model.eval_all(x_corr)
             f_corr = float(d_corr["f"])
 
-            cE_c, cI_c, JE_c, JI_c = d_corr["cE"], d_corr["cI"], d_corr["JE"], d_corr["JI"]
+            cE_c, cI_c, JE_c, JI_c = (
+                d_corr["cE"],
+                d_corr["cI"],
+                d_corr["JE"],
+                d_corr["JI"],
+            )
 
             if s is not None and mu > 0 and (cI_c is not None):
                 inc_I = JI_c @ corr if (JI_c is not None and JI_c.size) else 0.0
                 # keep cI + s ≈ 0 around x_trial
                 s_tilde = s - (cI + inc_I)
                 if np.any(s_tilde <= 0.0):
-                    logging.debug("SOC: corrected slacks would be nonpositive; requesting restoration")
+                    logging.debug(
+                        "SOC: corrected slacks would be nonpositive; requesting restoration"
+                    )
                     return corr, True
                 rI_corr = cI_c + s_tilde
             else:
@@ -139,12 +154,16 @@ class SOCCorrector:
             theta_corr = thE + thI
 
             if funnel is not None:
-                ok = funnel.is_acceptable(theta0, f0, theta_corr, f_corr, pred_df, pred_dtheta)
+                ok = funnel.is_acceptable(
+                    theta0, f0, theta_corr, f_corr, pred_df, pred_dtheta
+                )
             else:
                 ok = filter.is_acceptable(theta_corr, f_corr)
 
             if not ok:
-                logging.debug("SOC: corrected point rejected by acceptor (Funnel/Filter)")
+                logging.debug(
+                    "SOC: corrected point rejected by acceptor (Funnel/Filter)"
+                )
                 needs_restoration = True
 
         return corr, needs_restoration

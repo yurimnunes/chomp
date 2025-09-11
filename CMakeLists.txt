@@ -228,6 +228,9 @@ if(AD_ENABLE_OSQP)
   ad_add_pybind_module(osqp_cpp src/osqp_bindings.cpp)
 endif()
 
+  ad_add_pybind_module(simplex_core src/simplex_bindings.cpp)
+
+
 if(AD_ENABLE_QDLDL)
   # qdldl_cpp
   ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)

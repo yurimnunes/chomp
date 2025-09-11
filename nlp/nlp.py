@@ -192,7 +192,13 @@ class NLPSolver:
                 self._print_iteration(k, info)
 
             # Global KKT terminate (works for any mode)
-            kkt = self.model.kkt_residuals(self.x, self.lam, self.nu)
+            kkt = {}
+            kkt["stat"] = info.get("stat", None)
+            kkt["eq"] = info.get("eq", None)
+            kkt["ineq"] = info.get("ineq", None)
+            kkt["comp"] = info.get("comp", None)
+            if kkt is None:
+                kkt = self.model.kkt_residuals(self.x, self.lam, self.nu)
             if (
                 kkt["stat"] <= self.cfg.tol_stat
                 and kkt["ineq"] <= self.cfg.tol_feas

@@ -23,6 +23,8 @@ import scipy.linalg as la
 import scipy.sparse as sp
 from scipy.sparse.linalg import ArpackNoConvergence, eigsh, svds
 
+from nlp.blocks.reg import Regularizer
+
 
 # ======================================
 # Enums
@@ -33,14 +35,6 @@ class RegMode(Enum):
     EIGEN_MOD = "eigen_mod"
     INERTIA_FIX = "inertia_fix"
     SPECTRAL = "spectral"
-
-
-# ======================================
-# Core utilities (symmetry / PIQP settings)
-# ======================================
-def _symmetrize(H) -> np.ndarray:
-    """Return 0.5 * (H + Hᵀ)."""
-    return 0.5 * (H + H.T)
 
 
 def _cfg_to_piqp(cfg: "SQPConfig") -> piqp.PIQPSettings:
@@ -84,7 +78,7 @@ class SQPConfig:
     use_soc: bool = False
     use_composite_step: bool = False
     use_funnel: bool = False
-    use_watchdog: bool = True
+    use_watchdog: bool = False
     use_nonmonotone_ls: bool = False
     use_active_set_prediction: bool = False
     hessian_mode: str = "exact"            # {"exact","bfgs","lbfgs","hybrid","gn"}

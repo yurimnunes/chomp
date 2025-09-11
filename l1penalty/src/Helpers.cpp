@@ -73,77 +73,55 @@ std::vector<int> argsort(const Eigen::VectorXd &v) {
     std::sort(idx.begin(), idx.end(), [&v](int i1, int i2) { return v(i1) < v(i2); });
     return idx;
 }
+// Optimized basis generation with compile-time constants and efficient memory allocation
 
-// PolynomialVector nfpBasis(int dimension) {
-//     const int poly_num    = (dimension + 1) * (dimension + 2) / 2;
-//     const int linear_size = dimension + 1; // constant (0) + linear terms (1..dimension)
-
-//     PolynomialVector basis(poly_num);
-
-//     // Constant + linear as one-hot coefficient vectors
-//     for (int k = 0; k < linear_size; ++k) {
-//         basis[k]               = std::make_shared<Polynomial>();
-//         Eigen::VectorXd coeffs = Eigen::VectorXd::Zero(poly_num);
-//         coeffs(k)              = 1.0;
-//         basis[k]->coefficients = std::move(coeffs);
-//     }
-
-//     // Quadratic block (c, g, H) representation
-//     int                   m = 0, n = 0;
-//     const double          c0 = 0.0;
-//     const Eigen::VectorXd g0 = Eigen::VectorXd::Zero(dimension);
-
-//     for (int poly_i = dimension + 1; poly_i < poly_num; ++poly_i) {
-//         Eigen::MatrixXd H = Eigen::MatrixXd::Zero(dimension, dimension);
-//         if (m == n) {
-//             // For 1/2 x^T H x, set H(mm)=2 to represent x_m^2
-//             H(m, n) = 2.0;
-//         } else {
-//             // Cross term x_m x_n
-//             H(m, n) = 1.0;
-//             H(n, m) = 1.0;
-//         }
-//         basis[poly_i] = std::make_shared<Polynomial>(c0, g0, H);
-
-//         if (n < dimension - 1) {
-//             ++n;
-//         } else {
-//             ++m;
-//             n = m;
-//         }
-//     }
-//     return basis;
-// }
-
-PolynomialVector nfpBasis(int dimension, double radius = 1.0) {
-    const int poly_num = (dimension + 1) * (dimension + 2) / 2;
-    const int linear_size = dimension + 1;
-    PolynomialVector basis(poly_num);
+PolynomialVector nfpBasis(int dimension, double radius) {
+    const int dim = dimension;
+    constexpr auto poly_count = [](int d) constexpr { return (d + 1) * (d + 2) / 2; };
+    const int poly_num = poly_count(dim);
+    const int linear_size = dim + 1;
+    
+    // Pre-allocate with exact capacity to avoid reallocations
+    PolynomialVector basis;
+    basis.reserve(poly_num);
+    
+    // Cache common values
+    const double inv_radius = 1.0 / radius;
+    const double inv_radius_sq = inv_radius * inv_radius;
+    const Eigen::VectorXd g0 = Eigen::VectorXd::Zero(dim);
+    
+    // Linear terms: use move semantics and direct construction
     for (int k = 0; k < linear_size; ++k) {
-        basis[k] = std::make_shared<Polynomial>();
+        basis.push_back(std::make_shared<Polynomial>());
         Eigen::VectorXd coeffs = Eigen::VectorXd::Zero(poly_num);
         coeffs(k) = 1.0;
         basis[k]->coefficients = std::move(coeffs);
     }
-    int m = 0, n = 0;
-    const double c0 = 0.0;
-    const Eigen::VectorXd g0 = Eigen::VectorXd::Zero(dimension);
-    for (int poly_i = dimension + 1; poly_i < poly_num; ++poly_i) {
-        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(dimension, dimension);
-        double scale = (m == n) ? 2.0 / (radius * radius) : 1.0 / radius;
-        if (m == n) {
-            H(m, n) = scale;
-        } else {
-            H(m, n) = scale;
-            H(n, m) = scale;
-        }
-        basis[poly_i] = std::make_shared<Polynomial>(c0, g0, H);
-        if (n < dimension - 1) {
-            ++n;
-        } else {
-            ++m;
-            n = m;
+    
+    // Quadratic terms: vectorized Hessian construction
+    const int quad_terms = poly_num - linear_size;
+    std::vector<std::pair<int, int>> indices;
+    indices.reserve(quad_terms);
+    
+    // Generate index pairs efficiently
+    for (int m = 0; m < dim; ++m) {
+        for (int n = m; n < dim; ++n) {
+            indices.emplace_back(m, n);
         }
     }
+    
+    // Batch create quadratic polynomials
+    for (int i = 0; i < quad_terms; ++i) {
+        const auto& [m, n] = indices[i];
+        
+        Eigen::MatrixXd H = Eigen::MatrixXd::Zero(dim, dim);
+        const double scale = (m == n) ? 2.0 * inv_radius_sq : inv_radius;
+        
+        H(m, n) = scale;
+        if (m != n) H(n, m) = scale;  // Symmetric fill
+        
+        basis.push_back(std::make_shared<Polynomial>(0.0, g0, std::move(H)));
+    }
+    
     return basis;
 }

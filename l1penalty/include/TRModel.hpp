@@ -39,6 +39,7 @@ public:
     Eigen::MatrixXd cachedFValues;
     Eigen::VectorXd pivotValues;
     Options         options;
+    double          modelConditionNumber = 0.0; // Optional: store condition number of the model matrix
 
     PolynomialVector pivotPolynomials;
     PolynomialVector modelingPolynomials;
