@@ -1,5 +1,3 @@
-#include "gurobi_c++.h"
-
 #include "../include/Definitions.hpp"
 #include "../include/Helpers.hpp"
 #include "../include/PolynomialVector.hpp"
@@ -233,7 +231,7 @@ Eigen::VectorXd l1FeasibilityCorrection(CModel &cmodel, const std::vector<bool> 
                           .cwiseMin(ub - tr_center - h);
     Eigen::VectorXd v0 = 0.5 * (v_lb + v_ub);
 
-    GurobiSolver solver;
+    GenericSolver solver;
     auto [v, obj, optimal] = solver.solveQuadraticProblem(
         H, g, 0, 
         Eigen::VectorXd::Zero(0), Eigen::VectorXd::Zero(0),
@@ -575,7 +573,7 @@ l1CriticalityMeasureAndDescentDirection(TRModelPtr &fmodel, CModel &cmodel, cons
     pub_assembled << dub, Eigen::VectorXd::Constant(n_eactive, std::numeric_limits<double>::infinity());
 
     // Solve LP
-    GurobiSolver solver;
+    GenericSolver solver;
     auto dt = solver.solveLinearProblem(
         f_assembled, Aineq_assembled, bineq_assembled,
         Eigen::MatrixXd::Zero(0, 0), Eigen::VectorXd::Zero(0),
@@ -771,7 +769,7 @@ Eigen::VectorXd l1StepWithMultipliers(TRModelPtr &fmodel_x, CModel &cmodel_x, Ei
     }
     Eigen::VectorXd z = Eigen::VectorXd::Zero(n_eactive);
 
-    GurobiSolver solver;
+    GenericSolver solver;
     auto [h, _, __] = solver.solveQuadraticProblem(
         H, g, 0.0, J, z,
         Eigen::MatrixXd::Zero(0, 0), Eigen::VectorXd::Zero(0),

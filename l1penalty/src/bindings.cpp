@@ -260,6 +260,4 @@ PYBIND11_MODULE(l1core, m) {
           },
           py::arg("c"), py::arg("g"), py::arg("H"));
 
-    // Optional: expose Gurobi environment bootstrap if you call it once.
-    m.def("initialize_gurobi_env", &GurobiSolver::initializeEnvironment);
 }

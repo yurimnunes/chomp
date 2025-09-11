@@ -394,7 +394,7 @@ std::tuple<Eigen::VectorXd, double, int> minimizeTr(const PolynomialPtr &polynom
 
     // Try enhanced solver first
     try {
-        GurobiSolver solver;
+        GenericSolver solver;
         auto [solution, objectiveValue, success] =
             solver.solveQuadraticProblem(regularizedH, g, c, Eigen::VectorXd(), Eigen::VectorXd(), Eigen::VectorXd(),
                                          Eigen::VectorXd(), blMod, buMod, x0);

@@ -113,7 +113,7 @@ std::tuple<Eigen::VectorXd, double> l1_penalty_solve(
     Funcao fphi = func; // copy as in your original
 
     // Gurobi env once
-    GurobiSolver::initializeEnvironment();
+    GenericSolver::initializeEnvironment();
 
     // Log header
     fmt::print("\n");

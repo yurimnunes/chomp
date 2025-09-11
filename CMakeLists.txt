@@ -23,7 +23,7 @@ option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"   ON)
 option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"  ON)
 option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"     ON)
 option(AD_ENABLE_L1CORE   "Build l1core Python bindings"     ON)
-option(AD_ENABLE_GUROBI   "Link GUROBI to ad module"         ON)
+option(AD_ENABLE_GUROBI   "Link GUROBI to ad module"         OFF)
 
 # ------------------------------------------------------------------
 # Dependencies via CPM or system packages
@@ -191,9 +191,6 @@ target_link_libraries(ad PRIVATE
   dl
 )
 
-# Link GUROBI if requested
-_ad_link_gurobi(ad)
-
 set(L1_SOURCES
         l1penalty/src/bindings.cpp
         l1penalty/src/Solvers.cpp
@@ -210,8 +207,7 @@ set(L1_SOURCES
 # Optional extra Python modules
 # ------------------------------------------------------------------
 if(AD_ENABLE_L1CORE)
-ad_add_pybind_module(l1core ${L1_SOURCES})
-_ad_link_gurobi(l1core)
+  ad_add_pybind_module(l1core ${L1_SOURCES})
 endif()
 
 if(AD_ENABLE_PIQP)
