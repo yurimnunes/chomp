@@ -75,8 +75,8 @@ class SQPConfig:
     use_filter: bool = True
     use_line_search: bool = False
     use_trust_region: bool = True
-    use_soc: bool = False
-    use_composite_step: bool = False
+    use_soc: bool = True
+    use_composite_step: bool = True
     use_funnel: bool = False
     use_watchdog: bool = False
     use_nonmonotone_ls: bool = False

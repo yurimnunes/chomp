@@ -278,29 +278,37 @@ private:
 
     void apply_dense_postponement_() {
         const i32 n = n_;
-        i32 dense_cut = 0;
-        if (dense_cutoff_ == -1) {
-            dense_cut = std::max<i32>(
-                16,
-                std::min(n - 1, (i32)std::floor(10.0 * std::sqrt((double)n))));
-        } else if (dense_cutoff_ == 0) {
+        if (dense_cutoff_ == 0)
             return;
-        } else {
-            dense_cut = dense_cutoff_;
-        }
+
+        // Compute avg degree quickly
+        i64 degsum = 0;
+        for (i32 i = 0; i < n; ++i)
+            degsum += degree_[i];
+        double avg_deg = n ? double(degsum) / double(n) : 0.0;
+
+        i32 dense_cut =
+            (dense_cutoff_ > 0)
+                ? dense_cutoff_
+                : std::max<i32>(
+                      16, std::min(n - 1,
+                                   (i32)std::floor(0.5 * avg_deg +
+                                                   10.0 * std::sqrt(std::max(
+                                                              1.0, avg_deg)))));
+
         std::vector<i32> dense_nodes;
         dense_nodes.reserve(n / 8 + 1);
-        for (i32 i = 0; i < n; ++i) {
+        for (i32 i = 0; i < n; ++i)
             if (var_active_[i] && degree_[i] >= dense_cut)
                 dense_nodes.push_back(i);
-        }
+
         if (dense_nodes.empty())
             return;
         for (i32 v : dense_nodes) {
             bucket_remove_(v);
             where_[v] = -1;
         }
-        dense_queue_ = dense_nodes;
+        dense_queue_ = std::move(dense_nodes);
     }
 
     // ---------------------- degree buckets ----------------------
@@ -378,35 +386,27 @@ private:
     // inside AMDReorderingArray
     i32 select_pivot_() {
         const i32 n = n_;
-        // Fast path: if buckets are empty, serve a dense node (if any)
-        while (mindeg_ <= n && head_[mindeg_] == -1)
-            ++mindeg_;
-        if (mindeg_ > n) {
-            while (!dense_queue_.empty()) {
-                i32 v = dense_queue_.front();
-                dense_queue_.erase(dense_queue_.begin());
-                if (var_active_[v] && nv_[v] > 0)
-                    return v;
+        while (true) {
+            while (mindeg_ <= n && head_[mindeg_] == -1)
+                ++mindeg_;
+            if (mindeg_ > n) {
+                // fall back to dense queue
+                while (!dense_queue_.empty()) {
+                    i32 v = dense_queue_.front();
+                    dense_queue_.erase(dense_queue_.begin());
+                    if (var_active_[v] && nv_[v] > 0)
+                        return v;
+                }
+                return -1;
             }
-            return -1;
-        }
-        i32 best = -1, best_nv = -1, best_id = std::numeric_limits<i32>::max();
-        for (i32 v = head_[mindeg_]; v != -1; v = next_[v]) {
-            if (var_active_[v] && elen_[v] == -1 && nv_[v] > 0) {
-                i32 nv = nv_[v];
-                if (nv > best_nv || (nv == best_nv && v < best_id)) {
-                    best = v;
-                    best_nv = nv;
-                    best_id = v;
+            for (i32 v = head_[mindeg_]; v != -1; v = next_[v]) {
+                if (var_active_[v] && elen_[v] == -1 && nv_[v] > 0) {
+                    bucket_remove_(v);
+                    return v;
                 }
             }
+            ++mindeg_;
         }
-        if (best != -1) {
-            bucket_remove_(best);
-            return best;
-        }
-        ++mindeg_;
-        return select_pivot_();
     }
 
     void eliminate_all_() {
@@ -449,13 +449,14 @@ private:
         var_active_[piv] = 0;
         nv_[piv] = 0;
 
-        // neighbors snapshot
+        // Snapshot neighbors of piv
         std::vector<i32> neigh;
         neigh.reserve(len_[piv]);
         for (i32 p = pe_[piv], e = pe_[piv] + len_[piv]; p < e; ++p)
             neigh.push_back(iw_[p]);
 
         std::vector<i32> varN, elemN;
+        varN.reserve(neigh.size());
         for (i32 u : neigh) {
             if (u < 0 || u >= nsym_)
                 continue;
@@ -468,7 +469,7 @@ private:
             }
         }
 
-        // clean elements (drop piv / dead vars)
+        // Clean elements: drop piv and dead vars
         std::vector<i32> cleaned;
         cleaned.reserve(elemN.size());
         for (i32 e : elemN) {
@@ -480,55 +481,66 @@ private:
             }
         }
 
-        // hashed absorption among elements
         if (aggressive_absorption_ && !cleaned.empty())
             absorb_elements_hashed_(cleaned);
 
-        // build union mark of variables in (varN ∪ vars(elem cleaned))
+        // --- Frontier-based union: mark & collect directly, no global scan ---
         bump_wflg_();
         i32 tag = wflg_;
-        for (i32 v : varN)
-            w_[v] = tag;
-        for (i32 e : cleaned) {
-            if (!elem_active_[e])
-                continue;
-            for (i32 p = pe_[e], E = pe_[e] + elen_[e]; p < E; ++p) {
-                i32 v = iw_[p];
-                if (0 <= v && v < n_ && elen_[v] == -1 && var_active_[v] &&
-                    nv_[v] > 0)
-                    w_[v] = tag;
-            }
-        }
-
         std::vector<i32> new_vars;
-        new_vars.reserve(16);
-        for (i32 v = 0; v < n_; ++v)
-            if (w_[v] == tag && var_active_[v] && nv_[v] > 0)
+        new_vars.reserve((i32)varN.size() + 8);
+
+        auto try_push = [&](i32 v) {
+            if (0 <= v && v < n_ && elen_[v] == -1 && var_active_[v] &&
+                nv_[v] > 0 && w_[v] != tag) {
+                w_[v] = tag;
                 new_vars.push_back(v);
+            }
+        };
+
+        // Add direct variable neighbors first
+        for (i32 v : varN)
+            try_push(v);
+
+        // Then variables from cleaned elements
+        for (i32 e : cleaned)
+            if (elem_active_[e]) {
+                for (i32 p = pe_[e], E = pe_[e] + elen_[e]; p < E; ++p)
+                    try_push(iw_[p]);
+            }
 
         if (!new_vars.empty()) {
             i32 e_new = alloc_new_element_();
             store_element_varlist_(e_new, new_vars);
             elem_active_[e_new] = 1;
 
+            // Update var lists and degrees only for the frontier
             for (i32 v : new_vars)
                 rebuild_var_list_after_fill_(v, piv, e_new);
 
+            // Coalesce variables that are element-equivalent among just the
+            // frontier
             coalesce_variables_by_element_signature_(new_vars);
 
+            // Recompute approx degrees for the touched variables and re-bucket
             bump_wflg_();
             i32 tag2 = wflg_;
-            for (i32 v : new_vars) {
+            for (i32 v : new_vars)
                 if (var_active_[v] && nv_[v] > 0) {
-                    i32 d = approx_external_degree_(v, tag2);
-                    degree_[v] = std::max(0, std::min(n_, d));
-                    bucket_move_(v, degree_[v]);
-                    if (degree_[v] < mindeg_)
-                        mindeg_ = degree_[v];
+                    i32 d = std::max(
+                        0, std::min(n_, approx_external_degree_(v, tag2)));
+                    if (d != degree_[v]) {
+                        degree_[v] = d;
+                        bucket_move_(v, d);
+                        if (d < mindeg_)
+                            mindeg_ = d;
+                    }
                     maybe_refresh_degree_(v, (i32)order_.size());
                 }
-            }
         }
+
+        // Periodic compaction (unchanged)
+        maybe_compact_iw_();
     }
 
     // ---------------------- coalescence ----------------------

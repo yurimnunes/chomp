@@ -102,14 +102,8 @@ parse_ordering_or_compute(py::object perm_or_str, const SparseMatrixD &A,
         for (auto &c : s)
             c = static_cast<char>(::tolower(c));
 
-        if (s == "amd") {
-            return qdldl::simple_minimum_degree_ordering<double, std::int64_t>(
-                A);
-        } else if (s == "rcm") {
+        if (s == "rcm") {
             return qdldl::rcm_ordering<double, std::int64_t>(A);
-        } else if (s == "minimum_degree" || s == "md") {
-            return qdldl::simple_minimum_degree_ordering<double, std::int64_t>(
-                A);
         } else {
             throw std::invalid_argument(
                 "Unknown ordering string: " + s +
@@ -214,7 +208,7 @@ PYBIND11_MODULE(qdldl_cpp, m) {
             qdldl::Ordering<std::int64_t> ord;
             {
                 ord =
-                    qdldl::simple_minimum_degree_ordering<double, std::int64_t>(
+                    qdldl::rcm_ordering<double, std::int64_t>(
                         A);
             }
             return py::array(ord.perm.size(), ord.perm.data());
@@ -258,7 +252,7 @@ Returns 'perm' array.
             qdldl::Ordering<std::int64_t> ord;
             {
                 ord =
-                    qdldl::simple_minimum_degree_ordering<double, std::int64_t>(
+                    qdldl::rcm_ordering<double, std::int64_t>(
                         A);
             }
             return py::array(ord.perm.size(), ord.perm.data());

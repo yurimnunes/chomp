@@ -181,6 +181,202 @@ def _make_blocks(n: int, block_size: int) -> Tuple[np.ndarray, np.ndarray]:
     return starts, ends
 
 
+# ---------- minimal Smoothed-Aggregation AMG (no pyamg) ----------
+class MiniAMG:
+    """
+    Tiny Smoothed-Aggregation AMG builder and one V-cycle applier.
+    Assumptions: A is real symmetric positive definite (SPD), CSR.
+    Design goals: robustness over ultimate speed; no external deps.
+    """
+
+    def __init__(
+        self,
+        A: csr_matrix,
+        theta: float = 0.08,        # strength threshold in [0,1)
+        jacobi_omega: float = 0.7,  # smoother weight for Jacobi and P-smoothing
+        presmooth: int = 1,
+        postsmooth: int = 1,
+        max_levels: int = 10,
+        min_coarse: int = 40,       # stop when n <= min_coarse
+    ):
+        if not sp.isspmatrix_csr(A):
+            A = A.tocsr()
+        self.A0 = A
+        self.theta = float(theta)
+        self.jw = float(jacobi_omega)
+        self.presmooth = int(presmooth)
+        self.postsmooth = int(postsmooth)
+        self.max_levels = int(max_levels)
+        self.min_coarse = int(min_coarse)
+
+        self.levels = []  # each: dict(A, D, P, R)
+        self._build_hierarchy()
+
+    # ----- public API: apply M^{-1} approximately via one V-cycle -----
+    def solve(self, rhs: np.ndarray) -> np.ndarray:
+        if rhs.ndim != 1:
+            rhs = np.asarray(rhs).ravel()
+        x = np.zeros_like(rhs)
+        return self._vcycle(0, x, rhs)
+
+    # ----- hierarchy construction -----
+    def _build_hierarchy(self):
+        A = self.A0
+        for lev in range(self.max_levels):
+            n = A.shape[0]
+            D = A.diagonal().astype(float)
+            D[D == 0] = 1.0
+            level = {"A": A.tocsr(), "D": D}
+            self.levels.append(level)
+
+            if n <= self.min_coarse or lev == self.max_levels - 1:
+                # stop; no prolongation at coarsest level
+                break
+
+            # strength of connection: |a_ij| >= theta * sqrt(a_ii a_jj)
+            S = self._strength_graph(A, self.theta)
+
+            # greedy aggregation
+            agg = self._greedy_aggregate(S)  # size n, values in [0, ncoarse-1]
+            Nc = int(agg.max()) + 1
+            if Nc <= 0 or Nc >= n:
+                # failed coarsening -> stop
+                break
+
+            # tentative prolongator T: P_ij = 1 if i in aggregate j
+            P = self._tentative_prolongator(agg, Nc, n)
+
+            # smooth prolongator: P = (I - ω D^{-1} A) T
+            Dinv = 1.0 / D
+            PT = P  # rename
+            # y = A @ T  (sparse @ sparse -> sparse; but we need dense columns)
+            # We'll compute A*(each column of T). Since T has one 1 per row, we can do:
+            AT_cols = []
+            PT_csr = PT.tocsr()
+            for j in range(Nc):
+                # column j of T is indicator of aggregate j: t_j[i] = 1 if agg[i]==j
+                idx = PT_csr[:, j].nonzero()[0]  # rows with 1
+                v = np.zeros(n)
+                v[idx] = 1.0
+                AT_cols.append(A @ v)
+            AT = np.vstack(AT_cols).T  # shape (n, Nc)
+            Psm = PT - sp.diags(self.jw * Dinv) @ sp.csr_matrix(AT)
+
+            # coarse matrix: Ac = P^T A P
+            Ac = (Psm.T @ (A @ Psm)).tocsr()
+
+            # save and continue
+            level["P"] = Psm.tocsr()
+            level["R"] = level["P"].T  # symmetric case
+            A = Ac
+
+    # ----- components -----
+    @staticmethod
+    def _strength_graph(A: csr_matrix, theta: float) -> csr_matrix:
+        A = A.tocsr()
+        n = A.shape[0]
+        D = A.diagonal()
+        # s_ij = |a_ij| / sqrt(a_ii a_jj) >= theta
+        # We form a mask on off-diagonals.
+        rows, cols = A.nonzero()
+        mask = rows != cols
+        rows = rows[mask]; cols = cols[mask]
+        data = np.abs(A.data[A.has_sorted_indices and mask or np.isin(np.arange(A.nnz), np.where(mask)[0])])
+        # robust denom
+        denom = np.sqrt(np.maximum(D[rows], 1e-32) * np.maximum(D[cols], 1e-32))
+        val = np.zeros_like(data)
+        nz = denom > 0
+        val[nz] = (data[nz] / denom[nz]) >= theta
+        # build 0/1 strength matrix on off-diagonals; keep symmetric
+        S = sp.csr_matrix((val.astype(float), (rows, cols)), shape=A.shape)
+        S = S.maximum(S.T)
+        return S
+
+    @staticmethod
+    def _greedy_aggregate(S: csr_matrix) -> np.ndarray:
+        n = S.shape[0]
+        agg = -np.ones(n, dtype=int)
+        visited = np.zeros(n, dtype=bool)
+        cur = 0
+        indptr, indices = S.indptr, S.indices
+
+        for i in range(n):
+            if visited[i]:
+                continue
+            # make i a seed
+            agg[i] = cur
+            visited[i] = True
+            # attach strong neighbors to this aggregate
+            start, end = indptr[i], indptr[i + 1]
+            nbrs = indices[start:end]
+            for j in nbrs:
+                if not visited[j]:
+                    agg[j] = cur
+                    visited[j] = True
+            cur += 1
+
+        # any leftover (isolated) nodes: assign singleton aggregate
+        for i in range(n):
+            if agg[i] < 0:
+                agg[i] = cur
+                cur += 1
+
+        return agg
+
+    @staticmethod
+    def _tentative_prolongator(agg: np.ndarray, Nc: int, n: int) -> csr_matrix:
+        # one 1 per row, mapping fine node -> its aggregate
+        rows = np.arange(n, dtype=int)
+        cols = agg
+        data = np.ones(n, dtype=float)
+        return sp.csr_matrix((data, (rows, cols)), shape=(n, Nc))
+
+    # ----- smoothing helpers -----
+    @staticmethod
+    def _jacobi(A: csr_matrix, D: np.ndarray, x: np.ndarray, b: np.ndarray, w: float, iters: int):
+        # x <- x + w D^{-1}(b - A x)
+        Dinv = 1.0 / D
+        for _ in range(max(0, iters)):
+            r = b - A @ x
+            x += w * (Dinv * r)
+        return x
+
+    # ----- V-cycle -----
+    def _vcycle(self, k: int, x: np.ndarray, b: np.ndarray) -> np.ndarray:
+        level = self.levels[k]
+        A, D = level["A"], level["D"]
+
+        # pre-smooth
+        x = self._jacobi(A, D, x, b, self.jw, self.presmooth)
+
+        # coarse correction or solve
+        if "P" not in level:
+            # coarsest: dense solve fallback
+            try:
+                Ad = A.toarray()
+                x = la.solve(Ad, b, assume_a="sym")
+            except Exception:
+                # a few extra Jacobi if solve fails
+                x = self._jacobi(A, D, x, b, self.jw, 12)
+            return x
+
+        # compute residual
+        r = b - A @ x
+        # restrict
+        R = level["R"]
+        bc = R @ r
+        # coarse solve via recursion (zero initial guess)
+        xc = np.zeros_like(bc)
+        xc = self._vcycle(k + 1, xc, bc)
+        # prolongate and correct
+        P = level["P"]
+        x += P @ xc
+
+        # post-smooth
+        x = self._jacobi(A, D, x, b, self.jw, self.postsmooth)
+        return x
+
+
 # ---------- main class ----------
 class Regularizer:
     """
@@ -189,7 +385,7 @@ class Regularizer:
       - Optional RCM permutation (improves bandwidth/conditioning)
       - Symmetric Ruiz equilibration
       - Inertia via LDLᵀ (qdldl) when available (optional)
-      - Cached shift-invert, ILU, and small-block LU preconditioners
+      - Cached shift-invert, ILU, Block-Jacobi, SSOR, and MINI-AMG preconditioners
       - Trust-region & gradient-aware σ adaptation
       - Spectral floor via low-rank PSD bump
       - Fallback Tikhonov/SVD regularization
@@ -198,6 +394,153 @@ class Regularizer:
       regularize(H, iteration=0, model_quality=None, constraint_count=0, grad_norm=None, tr_radius=None)
         -> (H_reg, RegInfo)
     """
+
+    # ---------------- minimal Smoothed-Aggregation AMG (no pyamg) ----------------
+    class _MiniAMG:
+        """
+        Tiny Smoothed-Aggregation AMG and one V-cycle apply.
+        Assumes A is real SPD, CSR. Focus: robustness & no external deps.
+        """
+        def __init__(
+            self,
+            A: csr_matrix,
+            theta: float = 0.08,
+            jacobi_omega: float = 0.7,
+            presmooth: int = 1,
+            postsmooth: int = 1,
+            max_levels: int = 10,
+            min_coarse: int = 40,
+        ):
+            if not sp.isspmatrix_csr(A):
+                A = A.tocsr()
+            self.A0 = A
+            self.theta = float(theta)
+            self.jw = float(jacobi_omega)
+            self.presmooth = int(presmooth)
+            self.postsmooth = int(postsmooth)
+            self.max_levels = int(max_levels)
+            self.min_coarse = int(min_coarse)
+            self.levels = []  # dicts with A, D, P, R
+            self._build_hierarchy()
+
+        def solve(self, rhs: np.ndarray) -> np.ndarray:
+            rhs = np.asarray(rhs).ravel()
+            x = np.zeros_like(rhs)
+            return self._vcycle(0, x, rhs)
+
+        def _build_hierarchy(self):
+            A = self.A0
+            for lev in range(self.max_levels):
+                n = A.shape[0]
+                D = A.diagonal().astype(float)
+                D[D == 0] = 1.0
+                L = {"A": A.tocsr(), "D": D}
+                self.levels.append(L)
+
+                if n <= self.min_coarse or lev == self.max_levels - 1:
+                    break
+
+                S = self._strength_graph(A, self.theta)
+                agg = self._greedy_aggregate(S)
+                Nc = int(agg.max()) + 1
+                if Nc <= 0 or Nc >= n:
+                    break
+
+                P = self._tentative_prolongator(agg, Nc, n)  # (n, Nc), 0/1
+                # Smooth: P = (I - ω D^{-1} A) T
+                Dinv = 1.0 / D
+                # Compute A @ each column of T (indicator vectors)
+                # (sparse-friendly but dense in columns; fine for small Nc per level)
+                AT_cols = []
+                PT_csr = P.tocsr()
+                for j in range(Nc):
+                    idx = PT_csr[:, j].nonzero()[0]
+                    v = np.zeros(n)
+                    v[idx] = 1.0
+                    AT_cols.append(A @ v)
+                AT = np.vstack(AT_cols).T  # (n, Nc)
+                Psm = P - sp.diags(self.jw * Dinv) @ sp.csr_matrix(AT)
+
+                Ac = (Psm.T @ (A @ Psm)).tocsr()
+                L["P"] = Psm.tocsr()
+                L["R"] = L["P"].T
+                A = Ac
+
+        @staticmethod
+        def _strength_graph(A: csr_matrix, theta: float) -> csr_matrix:
+            A = A.tocsr()
+            n = A.shape[0]
+            D = A.diagonal()
+            rows, cols = A.nonzero()
+            mask = rows != cols
+            rows = rows[mask]
+            cols = cols[mask]
+            # pull the corresponding abs(data) safely
+            # (handle unsorted indices conservatively)
+            data = np.abs(A[rows, cols]).A1
+            denom = np.sqrt(np.maximum(D[rows], 1e-32) * np.maximum(D[cols], 1e-32))
+            val = (denom > 0) & ((data / denom) >= theta)
+            S = sp.csr_matrix((val.astype(float), (rows, cols)), shape=A.shape)
+            S = S.maximum(S.T)
+            return S
+
+        @staticmethod
+        def _greedy_aggregate(S: csr_matrix) -> np.ndarray:
+            n = S.shape[0]
+            agg = -np.ones(n, dtype=int)
+            visited = np.zeros(n, dtype=bool)
+            indptr, indices = S.indptr, S.indices
+            cur = 0
+            for i in range(n):
+                if visited[i]:
+                    continue
+                agg[i] = cur
+                visited[i] = True
+                nbrs = indices[indptr[i]:indptr[i+1]]
+                for j in nbrs:
+                    if not visited[j]:
+                        agg[j] = cur
+                        visited[j] = True
+                cur += 1
+            for i in range(n):
+                if agg[i] < 0:
+                    agg[i] = cur
+                    cur += 1
+            return agg
+
+        @staticmethod
+        def _tentative_prolongator(agg: np.ndarray, Nc: int, n: int) -> csr_matrix:
+            rows = np.arange(n, dtype=int)
+            cols = agg
+            data = np.ones(n, dtype=float)
+            return sp.csr_matrix((data, (rows, cols)), shape=(n, Nc))
+
+        @staticmethod
+        def _jacobi(A: csr_matrix, D: np.ndarray, x: np.ndarray, b: np.ndarray, w: float, iters: int):
+            Dinv = 1.0 / D
+            for _ in range(max(0, iters)):
+                r = b - A @ x
+                x += w * (Dinv * r)
+            return x
+
+        def _vcycle(self, k: int, x: np.ndarray, b: np.ndarray) -> np.ndarray:
+            L = self.levels[k]
+            A, D = L["A"], L["D"]
+            x = self._jacobi(A, D, x, b, self.jw, self.presmooth)
+            if "P" not in L:
+                try:
+                    x = la.solve(A.toarray(), b, assume_a="sym")
+                except Exception:
+                    x = self._jacobi(A, D, x, b, self.jw, 12)
+                return x
+            r = b - A @ x
+            bc = L["R"] @ r
+            xc = np.zeros_like(bc)
+            xc = self._vcycle(k + 1, xc, bc)
+            x += L["P"] @ xc
+            x = self._jacobi(A, D, x, b, self.jw, self.postsmooth)
+            return x
+    # ---------------- end mini AMG ----------------
 
     def __init__(self, cfg):
         # config getter supporting dict or object
@@ -226,7 +569,7 @@ class Regularizer:
 
         # preconditioning strategy
         self.use_preconditioning = bool(_cfg("use_preconditioning", True))
-        # auto|none|jacobi|bjacobi|ssor|ilu|shift_invert
+        # auto|none|jacobi|bjacobi|ssor|ilu|shift_invert|amg
         self.precond_type = str(_cfg("precond_type", "auto"))
         self.ilu_drop_tol = float(_cfg("ilu_drop_tol", 1e-3))
         self.ilu_fill_factor = float(_cfg("ilu_fill_factor", 10))
@@ -236,7 +579,7 @@ class Regularizer:
         self.bjacobi_block_size = int(_cfg("bjacobi_block_size", 64))
 
         # ssor
-        self.ssor_omega = float(_cfg("ssor_omega", 1.0))  # 0<ω<2 typically; ω=1 is symmetric Gauss-Seidel
+        self.ssor_omega = float(_cfg("ssor_omega", 1.0))
 
         # trust-region aware damping
         self.use_tr_aware = bool(_cfg("reg_tr_aware", True))
@@ -262,7 +605,6 @@ class Regularizer:
         grad_norm: Optional[float] = None,
         tr_radius: Optional[float] = None,
     ) -> Tuple[ArrayLike, RegInfo]:
-        """Main entry. Returns (H_reg, RegInfo)."""
         n = H.shape[0]
         if H.shape[0] != H.shape[1]:
             raise ValueError(f"Hessian must be square, got {H.shape}")
@@ -348,7 +690,7 @@ class Regularizer:
             except Exception:
                 pass
 
-        precond_type = self._select_precond(H)
+        precond_type = self._select_precond(H, inertia_hint=inertia)
         lmin, lmax, psetup = self._extents_sparse(H, precond_type)
 
         cond = _cond_from_extents(lmin, lmax)
@@ -361,18 +703,61 @@ class Regularizer:
             "precond_setup_time": psetup,
         }
 
-    def _select_precond(self, H: csr_matrix) -> str:
+    # ---------- improved AUTO preconditioner selection ----------
+    def _select_precond(self, H: csr_matrix, inertia_hint: Tuple[int, int, int] = (0, 0, 0)) -> str:
         if not self.use_preconditioning or self.precond_type == "none":
             return "none"
         if self.precond_type != "auto":
             return self.precond_type
-        # Heuristics
+
         n = H.shape[0]
-        density = H.nnz / max(1, n * n)
-        if density < 0.02:
-            return "shift_invert"  # good for extremal eigs, very sparse
-        if density < 0.15:
+        nnz = H.nnz
+        density = nnz / max(1, n * n)
+        avg_deg = nnz / max(1, n)
+        diag = H.diagonal()
+        diag_nz_ratio = float(np.mean(np.abs(diag) > 1e-14))
+        weak_diag = float(np.mean(np.abs(diag) < 1e-10))
+        # quick band proxy: mean |i-j| of nonzeros (sampled)
+        sample = min(nnz, 20000)
+        if sample > 0:
+            rows, cols = H.nonzero()
+            idx = np.random.RandomState(0).choice(len(rows), size=sample, replace=False)
+            band_mean = float(np.mean(np.abs(rows[idx] - cols[idx])))
+        else:
+            band_mean = 0.0
+
+        # SPD hint from inertia (if available)
+        npos, nneg, nzero = inertia_hint if all(isinstance(x, (int, np.integer)) for x in inertia_hint) else (0, 0, 0)
+        spd_hint = (nneg == 0 and (nzero == 0 or nzero < max(1, 0.01 * n)))
+
+        # Heuristics:
+        # 1) Very sparse & large & (SPD-ish): AMG
+        if (n >= 1500 and density < 0.01 and avg_deg < 20 and spd_hint):
+            return "amg"
+
+        # 2) Very sparse but SPD unknown / indefinite: shift-invert helps eigen edges; ILU often strong
+        if density < 0.01:
+            # if diagonal is weak, ILU can be better than simple point smoothers
+            return "ilu" if weak_diag > 0.05 else "shift_invert"
+
+        # 3) Sparse to moderate density: ILU tends to be a robust default
+        if density < 0.10:
             return "ilu"
+
+        # 4) Moderately banded (low band_mean) and diagonally present: SSOR can help
+        if band_mean < 0.1 * n and diag_nz_ratio > 0.95:
+            return "ssor"
+
+        # 5) Blocky structures (heuristic): if many short dense windows along diagonal -> Block-Jacobi
+        #    We detect via average local density in windows of size b
+        b = min(self.bjacobi_block_size, n)
+        # crude local density proxy: nnz / (#blocks * b^2)
+        num_blocks = int(np.ceil(n / b))
+        approx_block_density = nnz / max(1, num_blocks * (b * b))
+        if approx_block_density > 0.2 and density < 0.35:
+            return "bjacobi"
+
+        # 6) Fallbacks
         if density < 0.35:
             return "bjacobi"
         return "jacobi"
@@ -380,7 +765,7 @@ class Regularizer:
     # ---------- preconditioners ----------
     def _jacobi_operator(self, H: csr_matrix) -> LinearOperator:
         d = H.diagonal().astype(float)
-        d[np.abs(d) < 1e-16] = 1.0  # avoid zeros
+        d[np.abs(d) < 1e-16] = 1.0
         invd = 1.0 / d
         return LinearOperator(H.shape, matvec=lambda x: invd * x)
 
@@ -390,20 +775,18 @@ class Regularizer:
         n = H.shape[0]
 
         if cache is None:
-            starts, ends = _make_blocks(n, self.bjacobi_block_size)
+            starts = np.arange(0, n, self.bjacobi_block_size)
+            ends = np.minimum(starts + self.bjacobi_block_size, n)
             blocks = []
             for s, e in zip(starts, ends):
                 Hi = (H[s:e, s:e]).tocsc()
                 try:
                     lu = splu(Hi)  # exact LU of small block
+                    blocks.append(("lu", s, e, lu))
                 except Exception:
-                    # Fallback: diagonal of block
                     diag = Hi.diagonal()
                     diag[np.abs(diag) < 1e-16] = 1.0
-                    lu = None
                     blocks.append(("diag", s, e, diag))
-                    continue
-                blocks.append(("lu", s, e, lu))
             self._bjacobi_cache[key] = blocks
             cache = blocks
 
@@ -420,7 +803,6 @@ class Regularizer:
         return LinearOperator(H.shape, matvec=matvec)
 
     def _ssor_operator(self, H: csr_matrix) -> LinearOperator:
-        # M ≈ (D + ωL) D^{-1} (D + ωU); we apply M^{-1} via one forward and one backward sweep
         omega = self.ssor_omega
         if not (0.0 < omega < 2.0):
             omega = 1.0
@@ -429,15 +811,11 @@ class Regularizer:
         D = Hc.diagonal().astype(float)
         D[np.abs(D) < 1e-16] = 1.0
         invD = 1.0 / D
-
-        # Extract strictly lower and upper
         L = sp.tril(Hc, k=-1).tocsc()
         U = sp.triu(Hc, k=1).tocsc()
 
-        # We won't form (D+ωL) factors; we implement Gauss–Seidel style sweeps
         def forward(x):
             y = np.zeros_like(x)
-            # y solves (D + ωL) y = x  (forward)
             for i in range(Hc.shape[0]):
                 s = x[i] - omega * L[i, :i].toarray().ravel().dot(y[:i])
                 y[i] = s / (D[i])
@@ -445,17 +823,13 @@ class Regularizer:
 
         def backward(y):
             z = np.zeros_like(y)
-            # z solves (D + ωU) z = y' with y' = D^{-1} y (backward)
             yprime = invD * y
             for i in range(Hc.shape[0] - 1, -1, -1):
                 s = yprime[i] - omega * U[i, i + 1 :].toarray().ravel().dot(z[i + 1 :])
                 z[i] = s / (D[i])
             return z
 
-        def matvec(x):
-            return backward(forward(x))
-
-        return LinearOperator(H.shape, matvec=matvec)
+        return LinearOperator(H.shape, matvec=lambda x: backward(forward(x)))
 
     def _ilu_operator(self, H: csr_matrix) -> LinearOperator:
         key = _perm_signature(H)
@@ -468,6 +842,22 @@ class Regularizer:
                 warnings.warn(f"ILU failed: {e}; using identity preconditioner.")
                 return LinearOperator(H.shape, matvec=lambda x: x)
         return LinearOperator(H.shape, matvec=lambda x: ilu.solve(x))
+
+    def _amg_operator(self, H: csr_matrix) -> LinearOperator:
+        try:
+            amg = self._MiniAMG(
+                H,
+                theta=0.08,
+                jacobi_omega=0.7,
+                presmooth=1,
+                postsmooth=1,
+                max_levels=10,
+                min_coarse=40,
+            )
+        except Exception as e:
+            warnings.warn(f"AMG setup failed: {e}; using identity preconditioner.")
+            return LinearOperator(H.shape, matvec=lambda x: x)
+        return LinearOperator(H.shape, matvec=lambda x: amg.solve(x))
 
     def _factorize_shift(self, H: csr_matrix, sigma: float):
         key = (_perm_signature(H), float(sigma))
@@ -533,6 +923,8 @@ class Regularizer:
                     M = self._ssor_operator(H)
                 elif precond_type == "ilu":
                     M = self._ilu_operator(H)
+                elif precond_type == "amg":
+                    M = self._amg_operator(H)
                 # else: M=None
 
                 lmin = self._eig_edge(H, which="SA", M=M)
@@ -611,7 +1003,6 @@ class Regularizer:
         floor = max(self.sigma, self.min_eig_floor)
         try:
             if is_sparse or n > 800:
-                # Prefer symmetric eigen route for symmetric H; svds is general but fine as fallback
                 try:
                     vals, vecs = eigsh(H, k=min(self.k_eigs, max(1, n - 2)), which="SA",
                                        tol=self.iter_tol, maxiter=self.max_iter)
@@ -674,17 +1065,14 @@ class Regularizer:
         grad_norm: Optional[float],
         tr_radius: Optional[float],
     ) -> None:
-        # condition-based
         if analysis["cond_num"] > self.target_cond:
             self.sigma = min(self.sigma_max, self.sigma * self.adapt_factor)
         elif analysis["cond_num"] < max(1.0, self.target_cond * 1e-2) and analysis["min_eig"] >= -1e-12:
             self.sigma = max(self.sigma_min, self.sigma / self.adapt_factor)
 
-        # trust-region aware (Levenberg)
         if self.use_tr_aware and grad_norm is not None and tr_radius is not None and tr_radius > 0:
             self.sigma = max(self.sigma, self.tr_c * float(grad_norm) / float(tr_radius))
 
-        # early iters: avoid too small
         if iteration < 3:
             self.sigma = max(self.sigma, 1e-8)
 
@@ -701,7 +1089,6 @@ class Regularizer:
                 "rank_def": int(np.sum(np.abs(la.eigvalsh(Hd)) < 1e-10)),
                 "inertia": (np.nan, np.nan, np.nan),
             }
-        # sparse endpoints
         try:
             lmin = float(eigsh(H, k=1, which="SA", return_eigenvectors=False))
             lmax = float(eigsh(H, k=1, which="LA", return_eigenvectors=False))
@@ -738,7 +1125,6 @@ class Regularizer:
         self._bjacobi_cache.clear()
         self._factor_cache.clear()
         self.sigma = float(getattr(self.cfg, "reg_sigma", 1e-8))
-
 
 # ---------- convenience API ----------
 def make_psd_advanced(

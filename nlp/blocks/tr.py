@@ -579,82 +579,6 @@ def _boundary_intersection(p: Vec, d: Vec, Delta: float) -> float:
         return 0.0
     disc = max(0.0, pTd**2 - dTd * (pTp - Delta**2))
     return (-pTd + np.sqrt(disc)) / dTd
-def _project_to_tangent(self, g: np.ndarray, A_eq: np.ndarray) -> np.ndarray:
-    """Return P_T g where T is the tangent space of {A_eq p + b = 0}."""
-    if A_eq is None or A_eq.size == 0:
-        return g.copy()
-    A = np.asarray(A_eq, dtype=float)
-    # P = I - A^T (A A^T + reg I)^{-1} A
-    reg = max(self.cfg.reg_floor, 1e-12)
-    Ag = A @ g
-    try:
-        y = la.solve(A @ A.T + reg * np.eye(A.shape[0]), Ag, assume_a="pos")
-    except la.LinAlgError:
-        y = la.lstsq(A @ A.T + reg * np.eye(A.shape[0]), Ag, cond=self.cfg.rcond)[0]
-    return g - A.T @ y
-
-
-def _constrained_cauchy_in_tangent(
-    self,
-    H_op: spla.LinearOperator,
-    g: np.ndarray,
-    A_eq: np.ndarray,
-    radius: float,
-) -> np.ndarray:
-    """
-    Robust fallback: Cauchy step in tangent space.
-    Direction d = -P_T g; step = argmin_{t in [0, τ]} m(td) with ||td|| <= radius.
-    """
-    d = -self._project_to_tangent(g, A_eq)
-    dn = safe_norm(d)
-    if dn <= 1e-14:
-        return np.zeros_like(g)
-    d /= dn
-    Hd = H_op @ d
-    dHd = float(d @ Hd)
-    # If nonpositive curvature in tangent, go to boundary
-    if dHd <= 1e-14:
-        return -radius * d
-    # Cauchy step length along d for quadratic model
-    t_star = float((d @ g) / dHd)  # note d = -P_T g / ||·||
-    t_star = max(0.0, t_star)      # safeguard
-    t = min(t_star, radius)
-    return -t * d  # minus because d points along -grad_tan
-
-
-def _kkt_equality_step(
-    self, H: MatLike, g: np.ndarray, A_eq: np.ndarray, b_eq: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Direct equality-constrained QP step: solve
-        min  g^T p + 0.5 p^T H p  s.t.  A_eq p + b_eq = 0
-    via block elimination with light regularization.
-    """
-    n = g.size
-    m = A_eq.shape[0]
-    reg = max(self.cfg.reg_floor, 1e-10)
-    Hm = np.asarray(H) if isinstance(H, np.ndarray) else None
-    if Hm is not None:
-        # symmetric solve with (H + reg I)
-        Hi_g = la.solve(Hm + reg * np.eye(n), -g, assume_a="pos")
-        Hi_AT = la.solve(Hm + reg * np.eye(n), A_eq.T, assume_a="pos")
-    else:
-        # generic operator path
-        H_op = make_operator(H, n)
-        Hi = spla.cg  # iterative inverse application
-        Hi_g = Hi(lambda x: H_op @ x + reg * x, -g, maxiter=500, atol=1e-12)[0]
-        Hi_AT = np.column_stack(
-            [Hi(lambda x: H_op @ x + reg * x, A_eq.T[:, j], maxiter=500, atol=1e-12)[0] for j in range(m)]
-        )
-
-    S = A_eq @ Hi_AT
-    rhs = A_eq @ Hi_g - b_eq
-    try:
-        lam = la.solve(S + reg * np.eye(m), rhs, assume_a="pos")
-    except la.LinAlgError:
-        lam = la.lstsq(S + reg * np.eye(m), rhs, cond=self.cfg.rcond)[0]
-    p = Hi_g - Hi_AT @ lam
-    return p, lam
 
 
 # ---------------------------- Main TR Manager ---------------------------- #
@@ -1074,11 +998,24 @@ class TrustRegionManager:
         )
         return min(0.95, base_zeta + 0.05 * (1 + np.log1p(avg_viol)))
 
-    def _model_reduction(self, H_op: spla.LinearOperator, g: Vec, p: Vec) -> float:
-        """Compute predicted model reduction."""
-        if p.size == 0:
+    def _model_reduction(self, H: MatLike, g: Vec, p: Vec) -> float:
+        """Predicted reduction for the quadratic model at step p."""
+        H_op = make_operator(H, p.size)
+        return -(float(np.dot(g, p)) + 0.5 * float(np.dot(p, H_op @ p)))
+
+    def model_reduction_alpha(self, H: MatLike, g: Vec, p: Vec, alpha: float) -> float:
+        """
+        Predicted reduction for α p:
+        m(0) - m(αp) = α (-gᵀp) - 0.5 α² pᵀHp
+        Uses a single Hp multiplication if not cached by caller.
+        """
+        if p.size == 0 or alpha == 0.0:
             return 0.0
-        return -(np.dot(g, p) + 0.5 * np.dot(p, H_op @ p))
+        H_op = make_operator(H, p.size)
+        Hp = H_op @ p
+        gTp = float(np.dot(g, p))
+        pTHp = float(np.dot(p, Hp))
+        return alpha * (-gTp) - 0.5 * (alpha * alpha) * pTHp
 
     def _estimate_sigma(self, H_op: spla.LinearOperator, g: Vec, p: Vec) -> float:
         """Estimate trust region multiplier."""

@@ -357,6 +357,7 @@ private:
             return "stable";
     }
 };
+
 // ==============================
 // True Steepest-Edge pricer (FT-consistent)
 // ==============================

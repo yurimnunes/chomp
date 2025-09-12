@@ -93,13 +93,14 @@ class NLPSolver:
 
         # IP stepper + state
         self.ip_state = IPState.from_model(self.model, self.x, self.cfg)
+        ip_funnel = Funnel(self.cfg)
         self.ip_stepper = InteriorPointStepper(
             self.cfg,
             self.hess,
-            funnel=Funnel(self.cfg),
-            ls=LineSearcher(self.cfg, self.filter, self.funnel),
+            funnel=ip_funnel,
+            ls=LineSearcher(self.cfg, None, ip_funnel),
             regularizer=self.regularizer,
-            soc=self.soc,
+            soc=None,
         )
         mI = len(c_ineq) if c_ineq else 0
         mE = len(c_eq) if c_eq else 0
