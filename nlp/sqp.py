@@ -28,6 +28,41 @@ from .blocks.soc import *
 from .blocks.tr import *
 
 
+def _norm_mat(mat, n_expected: int) -> Tuple[np.ndarray | sp.spmatrix, int, int]:
+    """Return (M, m, n) with M 2-D, ensuring n == n_expected when possible.
+    Accepts dense/sparse and 1-D vectors (row). Transposes (n,1) to (1,n)."""
+    if mat is None:
+        return None, 0, n_expected
+    if sp.issparse(mat):
+        M = mat.tocsr()
+        m, n = M.shape
+        # Handle accidental column vector (n,1) representing a single row
+        if n != n_expected and m == n_expected and n == 1:
+            M = M.T.tocsr()
+            m, n = M.shape
+        return M, m, n
+    # dense
+    M = np.asarray(mat, dtype=float)
+    if M.ndim == 1:
+        # treat as a single row
+        M = M.reshape(1, -1)
+    m, n = M.shape
+    if n != n_expected and m == n_expected and n == 1:
+        # mistaken column vector; make it a row
+        M = M.T
+        m, n = M.shape
+    return M, m, n
+
+def _norm_vec(vec, m_expected: int) -> np.ndarray:
+    """Return 1-D vector of length m_expected."""
+    if vec is None:
+        return None
+    v = np.asarray(vec, dtype=float).reshape(-1)
+    if v.size != m_expected:
+        raise ValueError(f"RHS length mismatch: expected {m_expected}, got {v.size}")
+    return v
+
+
 # Utility functions
 def _to_sparse(matrix, format="csr"):
     """Convert matrix to sparse CSR format if not already sparse."""
@@ -64,6 +99,7 @@ class SQPStepper:
         self.hess = hess
         self.tr = tr
         self.ls = ls
+        self.flt = ls.filter if ls is not None else None
         self.qp = qp
         self.soc = soc
         self.regularizer = regularizer
@@ -126,226 +162,192 @@ class SQPStepper:
             lambda_min = np.min(np.abs(eigvals))
         return lambda_max / max(lambda_min, 1e-8)
 
-    def _tr_solve_with_radius(
+    def _composite_step(
         self,
+        model: "Model",
+        x: np.ndarray,
         H: sp.spmatrix | np.ndarray,
-        g: np.ndarray,
+        g0: np.ndarray,
         JE: Optional[sp.spmatrix | np.ndarray],
         cE: Optional[np.ndarray],
         JI: Optional[sp.spmatrix | np.ndarray],
         cI: Optional[np.ndarray],
         Delta: float,
+        lam_hint: Optional[np.ndarray] = None,
+        nu_hint: Optional[np.ndarray] = None,
         tol: Optional[float] = None,
         act_tol: Optional[float] = None,
-    ) -> np.ndarray:
-        """Solve trust-region subproblem with radius Delta."""
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        One-pass composite step using self.tr.solve.
+        Returns (p, lam_new, nu_new).
+        """
+        if self.tr is None:
+            raise RuntimeError("Trust-region solver (self.tr) is required for composite step.")
+        print("Using composite step (TR-SQP)...")
+        # --- config ---
+        cfg = getattr(self, "cfg", None)
+        act_tol = act_tol if act_tol is not None else getattr(cfg, "act_tol", 1e-6)
+        byrd_omojokun = bool(getattr(cfg, "use_byrd_omojokun", False))
+        tol = tol if tol is not None else getattr(cfg, "tr_l2_sigma_tol", 1e-6)
+        w_ineq = float(getattr(cfg, "cs_ineq_weight", 1.0))
+        mu_damp = float(getattr(cfg, "cs_damping", 1e-8))
+        mu_penalty = float(getattr(cfg, "byrd_omojokun_penalty", 1e2))
+        kappa = float(getattr(cfg, "byrd_omojokun_kappa", 0.8))
+
+        # --- normalize inputs ---
         H = _to_sparse(H)
         JE = _to_sparse(JE) if JE is not None else None
         JI = _to_sparse(JI) if JI is not None else None
+        g0 = np.asarray(g0)
         cE = np.asarray(cE) if cE is not None else None
         cI = np.asarray(cI) if cI is not None else None
-        g = np.asarray(g)
 
-        if self.tr is None:
-            lb = -Delta * np.ones_like(g)
-            ub = Delta * np.ones_like(g)
-            p, _, _ = self.qp.solve(
-                _to_dense_if_needed(H, self.requires_dense),
-                g,
-                _to_dense_if_needed(JI, self.requires_dense),
-                cI,
-                _to_dense_if_needed(JE, self.requires_dense),
-                cE,
-                lb,
-                ub,
-            )
-            return p
+        def _as_backend(mat):
+            return _to_dense_if_needed(mat, getattr(self.tr, "requires_dense", False))
 
+        # --- temporarily set trust-region radius ---
         old_radius = float(self.tr.delta)
         self.tr.delta = float(Delta)
         try:
-            p, _, _ = self.tr.solve(
-                _to_dense_if_needed(H, getattr(self.tr, "requires_dense", False)),
-                g,
-                JE=_to_dense_if_needed(JE, getattr(self.tr, "requires_dense", False)),
-                cE=cE,
-                JI=_to_dense_if_needed(JI, getattr(self.tr, "requires_dense", False)),
-                cI=cI,
-                tol=tol or getattr(self.cfg, "tr_l2_sigma_tol", 1e-6),
-                act_tol=act_tol or getattr(self.cfg, "act_tol", 1e-6),
+            # 1) Byrd–Omojokun fast path
+            if byrd_omojokun:
+                theta0 = float(model.constraint_violation(x))
+                xi = min(theta0, kappa * float(Delta))
+
+                # residual-bound path
+                if getattr(self.tr, "supports_residual_bound", False):
+                    p, _, lam_new, nu_new = self.tr.solve(
+                        _as_backend(H), g0,
+                        A_ineq=_as_backend(JI) if JI is not None else None, b_ineq=cI,
+                        A_eq=_as_backend(JE) if JE is not None else None, b_eq=cE,
+                        #tol=tol, act_tol=act_tol,
+                        #residual_bound=xi,
+                    )
+                    if p is not None and np.all(np.isfinite(p)):
+                        return p, lam_new, nu_new
+
+                # penalty fallback (relax equalities)
+                H_pen = H + (mu_penalty * (JE.T @ JE) if JE is not None else sp.csr_matrix(H.shape))
+                g_pen = g0 + (mu_penalty * (JE.T @ cE) if (JE is not None and cE is not None) else 0.0)
+                p, _, lam_new, nu_new = self.tr.solve(
+                    _as_backend(H_pen), g_pen,
+                    A_ineq=_as_backend(JI) if JI is not None else None, b_ineq=cI,
+                    #tol=tol, act_tol=act_tol,
+                )
+                if p is not None and np.all(np.isfinite(p)):
+                    return p, lam_new, nu_new
+                # else: fall through to N+T
+
+            # 2) Normal step (reduce violation on active subset)
+            A_blocks, r_blocks = [], []
+            if JE is not None and cE is not None and JE.size and cE.size:
+                A_blocks.append(JE)
+                r_blocks.append(-cE)
+
+            JI_act_mask = None
+            if JI is not None and cI is not None and JI.size and cI.size:
+                cI_arr = np.asarray(cI)
+                JI_arr = JI if sp.issparse(JI) else np.asarray(JI)
+                JI_act_mask = cI_arr > -act_tol
+                if np.any(JI_act_mask):
+                    JI_active = _to_sparse(JI_arr[JI_act_mask])
+                    w = float(np.sqrt(max(w_ineq, 1e-16)))
+                    A_blocks.append(w * JI_active)
+                    r_blocks.append(w * (-cI_arr[JI_act_mask]))
+
+            if A_blocks:
+                A = sp.vstack(A_blocks, format="csr")
+                r = np.concatenate(r_blocks)
+                Hn = A.T @ A + mu_damp * sp.eye(A.shape[1], format="csr")
+                gn = -(A.T @ r)
+                n, _, _, _ = self.tr.solve(_as_backend(Hn), _to_dense_if_needed(gn, getattr(self.tr, "requires_dense", False)))
+                                        #tol=tol, act_tol=act_tol)
+            else:
+                n = np.zeros_like(g0)
+
+            # 3) Tangential step (optimize Lagrangian in remaining radius with active constraints)
+            # Determine active inequalities AFTER taking n
+            JI_act = None
+            rhs_active = None
+            if JI is not None and cI is not None and JI.size and cI.size:
+                JI_arr = JI if sp.issparse(JI) else np.asarray(JI)
+                cI_arr = np.asarray(cI)
+                ci_n = cI_arr + (JI_arr @ n)
+                act2 = ci_n >= -act_tol
+                if np.any(act2):
+                    JI_act = _to_sparse(JI_arr[act2])
+                    rhs_active = -(cI_arr[act2] + ((JI_act @ n) if sp.issparse(JI_act) else (JI_act @ n)))
+                    rhs_active = np.asarray(rhs_active).reshape(-1)  # ensure 1D
+
+            # Lagrangian gradient with hints
+            gL = g0.copy()
+            if JI is not None and lam_hint is not None and lam_hint.size:
+                gL += (JI.T @ lam_hint) if sp.issparse(JI) else (np.asarray(JI).T @ lam_hint)
+            if JE is not None and nu_hint is not None and nu_hint.size:
+                gL += (JE.T @ nu_hint) if sp.issparse(JE) else (np.asarray(JE).T @ nu_hint)
+
+            # remaining TR for tangential move
+            n_norm = float(self.tr._tr_norm(n)) if hasattr(self.tr, "_tr_norm") else float(np.linalg.norm(n))
+            Delta_rem = float(np.sqrt(max(0.0, Delta * Delta - n_norm * n_norm)))
+
+            if Delta_rem <= 1e-16:
+                t = np.zeros_like(n)
+            else:
+                # dimension n from gradient (or use H.shape[0] if you prefer)
+                n_dim = int(np.asarray(gL).reshape(-1).size)
+
+                # Equalities for tangential step: JE * t = 0
+                if JE is not None and getattr(JE, "size", 0):
+                    A_eq_raw = _as_backend(JE)
+                    A_eq, me, ne = _norm_mat(A_eq_raw, n_dim)
+                    if ne != n_dim:
+                        raise ValueError(f"A_eq must have {n_dim} columns; got {ne}")
+                    b_eq = np.zeros(me, dtype=float)
+                else:
+                    A_eq, b_eq = None, None
+
+                # Inequalities: only active set after n (JI_act * t <= rhs_active)
+                if JI_act is not None and getattr(JI_act, "size", 0):
+                    A_ineq_raw = _as_backend(JI_act)
+                    A_ineq, mi, ni = _norm_mat(A_ineq_raw, n_dim)
+                    if ni != n_dim:
+                        raise ValueError(f"A_ineq must have {n_dim} columns; got {ni}")
+                    b_ineq = _norm_vec(rhs_active, mi)
+                else:
+                    A_ineq, b_ineq = None, None
+
+                # Solve tangential QP
+                t, _, _, _ = self.tr.solve(
+                    _as_backend(H),
+                    _to_dense_if_needed(gL, getattr(self.tr, "requires_dense", False)),
+                    A_ineq=A_ineq,
+                    b_ineq=b_ineq,
+                    A_eq=A_eq,
+                    b_eq=b_eq,
+                    # tol=tol, act_tol=act_tol,
+                )
+
+            p = n + t
+
+            # 4) Refresh multipliers for reporting (full KKT system, no extra constraints)
+            _, lam_new, nu_new = self.qp.solve(
+                _as_backend(H), g0,
+                 _to_dense_if_needed(JI, self.requires_dense),
+                cI,
+                 _to_dense_if_needed(JE, self.requires_dense),
+                cE,
+                #tol=tol, act_tol=act_tol,
             )
+
+            if not np.all(np.isfinite(p)):
+                p = np.zeros_like(g0)
+
+            return p, lam_new, nu_new
+
         finally:
             self.tr.delta = old_radius
-        return p
 
-    def _normal_step(
-        self,
-        model: Model,
-        x: np.ndarray,
-        JE: Optional[sp.spmatrix | np.ndarray],
-        cE: Optional[np.ndarray],
-        JI: Optional[sp.spmatrix | np.ndarray],
-        cI: Optional[np.ndarray],
-        Delta: float,
-    ) -> np.ndarray:
-        """Compute normal step to reduce constraint violation."""
-        act_tol = getattr(self.cfg, "act_tol", 1e-6)
-        w_ineq = getattr(self.cfg, "cs_ineq_weight", 1.0)
-        mu_damp = getattr(self.cfg, "cs_damping", 1e-8)
-
-        A_blocks, r_blocks = [], []
-        if JE is not None and cE is not None and JE.size > 0 and cE.size > 0:
-            A_blocks.append(_to_sparse(JE))
-            r_blocks.append(np.asarray(-cE))
-        if JI is not None and cI is not None and JI.size > 0 and cI.size > 0:
-            cI = np.asarray(cI)
-            active = cI > -act_tol
-            if np.any(active):
-                JI_active = _to_sparse(JI[active] if sp.issparse(JI) else np.asarray(JI)[active])
-                r_ia = -cI[active]
-                w = float(np.sqrt(w_ineq))
-                A_blocks.append(w * JI_active)
-                r_blocks.append(w * r_ia)
-
-        if not A_blocks:
-            return np.zeros(model.n)
-
-        A = sp.vstack(A_blocks, format="csr")
-        r = np.concatenate(r_blocks)
-        Hn = A.T @ A + mu_damp * sp.eye(A.shape[1], format="csr")
-        gn = -(A.T @ r)
-        n, _, _ = self.qp.solve(Hn, gn, tr_radius=Delta)
-        return n
-
-    def _tangential_step(
-        self,
-        H: sp.spmatrix | np.ndarray,
-        gL: np.ndarray,
-        JE: Optional[sp.spmatrix | np.ndarray],
-        JI_active: Optional[sp.spmatrix | np.ndarray],
-        rhs_active: Optional[np.ndarray],
-        Delta: float,
-        n: np.ndarray,
-    ) -> np.ndarray:
-        """Compute tangential step to optimize Lagrangian."""
-        H = _to_sparse(H)
-        JE = _to_sparse(JE) if JE is not None else None
-        JI_active = _to_sparse(JI_active) if JI_active is not None else None
-        n_tr = float(self.tr._tr_norm(n)) if self.tr and hasattr(self.tr, "_tr_norm") else float(np.linalg.norm(n))
-        Delta_rem = float(np.sqrt(max(0.0, Delta * Delta - n_tr * n_tr)))
-        if Delta_rem <= 1e-16:
-            return np.zeros_like(n)
-
-        cI_t = -np.asarray(rhs_active) if rhs_active is not None and rhs_active.size > 0 else None
-        JE_eq = JE if JE is not None and JE.size > 0 else None
-        cE_eq = np.zeros(JE_eq.shape[0]) if JE_eq is not None else None
-
-        t, _, _ = self.qp.solve(
-            H,
-            gL,
-            A_eq=JE_eq,
-            b_eq=cE_eq,
-            A_ineq=JI_active,
-            b_ineq=cI_t,
-            tr_radius=Delta_rem,
-        )
-        return t
-
-    def _compute_xi(self, theta0: float, Delta: float) -> float:
-        """Compute relaxation parameter xi for Byrd-Omojokun."""
-        kappa = getattr(self.cfg, "byrd_omojokun_kappa", 0.8)
-        return min(theta0, kappa * Delta)
-
-    def _byrd_omojokun_step(
-        self,
-        model: Model,
-        x: np.ndarray,
-        H: sp.spmatrix | np.ndarray,
-        g0: np.ndarray,
-        JE: Optional[sp.spmatrix | np.ndarray],
-        cE: Optional[np.ndarray],
-        JI: Optional[sp.spmatrix | np.ndarray],
-        cI: Optional[np.ndarray],
-        Delta: float,
-        lam_hint: np.ndarray,
-        nu_hint: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Byrd-Omojokun composite step with relaxed equality constraints."""
-        theta0 = model.constraint_violation(x)
-        xi = self._compute_xi(theta0, Delta)
-        H = _to_sparse(H)
-        JE = _to_sparse(JE) if JE is not None else None
-        JI = _to_sparse(JI) if JI is not None else None
-        cE = np.asarray(cE) if cE is not None else None
-        cI = np.asarray(cI) if cI is not None else None
-        g0 = np.asarray(g0)
-
-        H_input = _to_dense_if_needed(H, self.requires_dense)
-        JE_input = _to_dense_if_needed(JE, self.requires_dense)
-        JI_input = _to_dense_if_needed(JI, self.requires_dense)
-
-        if getattr(self.qp, "supports_residual_bound", False):
-            p, lam_new, nu_new = self.qp.solve(
-                H_input, g0, JI=JI_input, cI=cI, JE=JE_input, cE=cE, residual_bound=xi, tr_radius=Delta
-            )
-        else:
-            mu_penalty = getattr(self.cfg, "byrd_omojokun_penalty", 1e2)
-            H_penalty = H + mu_penalty * (JE.T @ JE if JE is not None else sp.csr_matrix((model.n, model.n)))
-            g_penalty = g0 + mu_penalty * (JE.T @ cE if JE is not None and cE is not None else np.zeros_like(g0))
-            p, lam_new, nu_new = self.qp.solve(
-                _to_dense_if_needed(H_penalty, self.requires_dense),
-                g_penalty,
-                A_ineq=JI_input,
-                b_ineq=cI,
-                tr_radius=Delta,
-            )
-
-        if p is None or not np.all(np.isfinite(p)):
-            return self._composite_step(model, x, H, g0, JE, cE, JI, cI, Delta, lam_hint, nu_hint)
-        return p, lam_new, nu_new
-
-    def _composite_step(
-        self,
-        model: Model,
-        x: np.ndarray,
-        H: sp.spmatrix | np.ndarray,
-        g0: np.ndarray,
-        JE: Optional[sp.spmatrix | np.ndarray],
-        cE: Optional[np.ndarray],
-        JI: Optional[sp.spmatrix | np.ndarray],
-        cI: Optional[np.ndarray],
-        Delta: float,
-        lam_hint: np.ndarray,
-        nu_hint: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Wrapper for composite step: Uses Byrd-Omojokun or normal + tangential step."""
-        if getattr(self.cfg, "use_byrd_omojokun", False):
-            return self._byrd_omojokun_step(model, x, H, g0, JE, cE, JI, cI, Delta, lam_hint, nu_hint)
-
-        act_tol = getattr(self.cfg, "act_tol", 1e-6)
-        n = self._normal_step(model, x, JE, cE, JI, cI, Delta)
-        JI_act, rhs_active = None, None
-        if JI is not None and cI is not None and JI.size > 0 and cI.size > 0:
-            cI = np.asarray(cI)
-            ci_n = cI + (JI @ n if sp.issparse(JI) else np.asarray(JI) @ n)
-            active = ci_n >= -act_tol
-            if np.any(active):
-                JI_act = _to_sparse(JI[active] if sp.issparse(JI) else np.asarray(JI)[active])
-                rhs_active = -(cI[active] + (JI_act @ n if sp.issparse(JI_act) else JI_act @ n))
-
-        gL = g0.copy()
-        if JI is not None and lam_hint is not None and lam_hint.size > 0:
-            gL += JI.T @ lam_hint if sp.issparse(JI) else np.asarray(JI).T @ lam_hint
-        if JE is not None and nu_hint is not None and nu_hint.size > 0:
-            gL += JE.T @ nu_hint if sp.issparse(JE) else np.asarray(JE).T @ nu_hint
-
-        t = self._tangential_step(H, gL, JE, JI_act, rhs_active, Delta, n)
-        p = n + t
-        H_input = _to_dense_if_needed(H, self.requires_dense)
-        JE_input = _to_dense_if_needed(JE, self.requires_dense)
-        JI_input = _to_dense_if_needed(JI, self.requires_dense)
-        _, lam_new, nu_new = self.qp.solve(H_input, g0, JI_input, cI, JE_input, cE)
-        return p, lam_new, nu_new
 
     def step(
         self,
@@ -382,18 +384,18 @@ class SQPStepper:
 
         # Compute step
         if use_cs:
-            p, _ = self._composite_step(
+            p, lam_new, nu_new = self._composite_step(
                 model, x, H, g0, data["JE"], data["cE"], data["JI"], data["cI"], Delta, lam, nu
             )
         else:
-            p, lam_new, nu_new = self.qp.solve(
+            p, _, lam_new, nu_new = self.tr.solve(
                 _to_dense_if_needed(H, self.requires_dense),
                 g0,
                 _to_dense_if_needed(data["JI"], self.requires_dense),
                 data["cI"],
                 _to_dense_if_needed(data["JE"], self.requires_dense),
                 data["cE"],
-                tr_radius=Delta,
+                #tr_radius=Delta,
             )
             if p is None or not np.all(np.isfinite(p)):
                 if self.tr:
@@ -427,7 +429,7 @@ class SQPStepper:
             Hp = H.dot(p) if sp.issparse(H) else H @ p
             pred_red_cs = -(float(np.dot(gL_tmp, p)) + 0.5 * float(np.dot(p, Hp)))
             if p_norm <= 1e-10 or pred_red_cs <= 1e-16 or not np.isfinite(pred_red_cs):
-                p, _, _, lam_new, nu_new = self.tr.solve(
+                p, _, lam_new, nu_new = self.tr.solve(
                     _to_dense_if_needed(H, self.requires_dense),
                     g0,
                     _to_dense_if_needed(data["JI"], self.requires_dense),
@@ -466,6 +468,7 @@ class SQPStepper:
         s = alpha * p
         x_trial = x + s
         if self.cfg.use_soc and alpha < 1.0:
+            print("Applying SOC correction...")
             Delta_for_soc = self.tr.delta if self.tr else float(np.linalg.norm(s))
             dx_corr, _needs_rest = self.soc.compute_correction(model, x_trial, Delta_for_soc)
             s += dx_corr
@@ -495,10 +498,13 @@ class SQPStepper:
             return x_trial, lam_new, nu_new, info
 
         # Trust-region update
-        need_rest = self.tr.update(pred_red, act_red, step_norm, theta0=theta0) if self.tr else False
+        need_rest = self.tr.update(pred_red, act_red, step_norm) if self.tr else False
         accept = (rho >= self.cfg.tr_eta_lo and act_red > -1e-16) if self.tr else True
-        if theta0 >= self.cfg.filter_theta_min:
-            accept = accept and (theta_new <= theta0 * 1.05)
+        if self.flt:
+            accept = accept and self.flt.is_acceptable(theta_new, f_new, trust_radius=Delta)
+        else:
+            if theta0 >= self.cfg.filter_theta_min:
+                accept = accept and (theta_new <= theta0 * 1.05)
 
         if not accept or need_rest:
             if self.restoration:

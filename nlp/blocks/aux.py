@@ -72,7 +72,7 @@ class SQPConfig:
     # ---------------- Core toggles ----------------
     mode: str = "auto"                     # {"auto","ip","sqp"}
     verbose: bool = True
-    use_filter: bool = False
+    use_filter: bool = True
     use_line_search: bool = False
     use_trust_region: bool = True
     use_soc: bool = False
@@ -218,6 +218,15 @@ class SQPConfig:
     rho_max: float = 1e6
     rho_inc: float = 10.0
     # verbose already defined above
+    
+    delta0: float = 1.0
+    cg_tol: float = 1e-4
+    cg_tol_rel: bool = True
+    cg_maxiter: int = 1000
+    neg_curv_tol: float = 1e-8
+    constraint_tol: float = 1e-6
+    feasibility_emphasis: float = 1.0
+    curvature_aware: bool = True
     
 
 

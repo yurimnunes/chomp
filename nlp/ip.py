@@ -365,9 +365,9 @@ class InteriorPointStepper:
         self.hess = hess
         self.reg = regularizer
         self.tr = tr
-        self.filter = None
-        self.funnel = Funnel(self.cfg)
-        self.ls = LineSearcher(self.cfg, None, self.funnel) if ls is None else ls
+        self.filter = flt
+        self.funnel = funnel
+        self.ls = ls
         self.soc = soc  # may be None; if None we skip SOC rescue
         self._ensure_cfg_defaults()
 

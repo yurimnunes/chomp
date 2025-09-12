@@ -1,4 +1,4 @@
-<img src="logo.png" alt="logo" width="400"/>
+<img src="docs/logo.png" alt="logo" width="400"/>
 
 # CHOMP — *C*HOMP *H*andles *O*ptimization of *M*any *P*roblems (recurrently)
 

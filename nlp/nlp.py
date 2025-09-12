@@ -74,16 +74,16 @@ class NLPSolver:
             LineSearcher(self.cfg, self.filter, self.funnel) if self.cfg.use_line_search else None
         )
         self.qp = QPSolver(self.cfg, Regularizer(self.cfg))
-        self.soc = SOCCorrector(self.cfg)
+        self.soc = SOCCorrector(self.cfg) if self.cfg.use_soc else None
 
         # SQP stepper
         self.sqp_stepper = SQPStepper(
             self.cfg,
             self.hess,
             TrustRegionManager(self.cfg),
-            self.ls,
+            LineSearcher(self.cfg, Filter(self.cfg), None),
             self.qp,
-            self.soc,
+            SOCCorrector(self.cfg),
             self.regularizer,
             self.rest,
         )
@@ -96,7 +96,9 @@ class NLPSolver:
         self.ip_stepper = InteriorPointStepper(
             self.cfg,
             self.hess,
-            self.regularizer,
+            funnel=Funnel(self.cfg),
+            ls=LineSearcher(self.cfg, self.filter, self.funnel),
+            regularizer=self.regularizer,
             soc=self.soc,
         )
         mI = len(c_ineq) if c_ineq else 0
