@@ -4,9 +4,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CHOMP — Modern NLP Solver (SQP • Interior-Point • Auto)</title>
+  <title>CHOMP — Modern NLP Solver (SQP • Interior-Point • DFO-L1 • Auto)</title>
+
   <!-- Tailwind CSS -->
   <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Prism.js (CSS + core + autoloader + line-numbers) -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1/themes/prism.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1/plugins/line-numbers/prism-line-numbers.css">
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/components/prism-core.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/plugins/autoloader/prism-autoloader.min.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1/plugins/line-numbers/prism-line-numbers.min.js" defer></script>
+
   <!-- MathJax (v3) -->
   <script>
     window.MathJax = {
@@ -19,79 +28,224 @@
   <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
 
   <style>
-    html { scroll-behavior: smooth }
-    .card { backdrop-filter: blur(4px) }
-    .theorem { background:#eff6ff;border-left:4px solid #3b82f6;padding:.75rem 1rem;border-radius:.5rem }
-    .def { background:#f0fdf4;border-left:4px solid #22c55e;padding:.75rem 1rem;border-radius:.5rem }
-    .warn { background:#fef2f2;border-left:4px solid #ef4444;padding:.75rem 1rem;border-radius:.5rem }
-    .insight { background:#fefce8;border-left:4px solid #eab308;padding:.75rem 1rem;border-radius:.5rem }
-    .step { background:#f8fafc;border:2px solid #e2e8f0;padding:1rem;border-radius:.75rem;margin:1rem 0 }
-    code { background:#f1f5f9;padding:.15rem .35rem;border-radius:.35rem }
-    .step-number{background:#3b82f6;color:white;border-radius:50%;width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;font-weight:bold;font-size:14px}
-    .lbl{font-size:12px;fill:#334155;font-weight:600}
-    .node{fill:#f8fafc;stroke:#3b82f6;stroke-width:2}
-    .edge{stroke:#94a3b8;stroke-width:2}
-    .math-nowrap{overflow-x:auto;white-space:nowrap}
+    html {
+      scroll-behavior: smooth
+    }
+
+    .card {
+      backdrop-filter: blur(4px)
+    }
+
+    .theorem {
+      background: #eff6ff;
+      border-left: 4px solid #3b82f6;
+      padding: .75rem 1rem;
+      border-radius: .5rem
+    }
+
+    .def {
+      background: #f0fdf4;
+      border-left: 4px solid #22c55e;
+      padding: .75rem 1rem;
+      border-radius: .5rem
+    }
+
+    .warn {
+      background: #fef2f2;
+      border-left: 4px solid #ef4444;
+      padding: .75rem 1rem;
+      border-radius: .5rem
+    }
+
+    .insight {
+      background: #fefce8;
+      border-left: 4px solid #eab308;
+      padding: .75rem 1rem;
+      border-radius: .5rem
+    }
+
+    .step {
+      background: #f8fafc;
+      border: 2px solid #e2e8f0;
+      padding: 1rem;
+      border-radius: .75rem;
+      margin: 1rem 0
+    }
+
+    code {
+      background: #f1f5f9;
+      padding: .15rem .35rem;
+      border-radius: .35rem
+    }
+
+    pre code {
+      background: transparent;
+      padding: 0
+    }
+
+    .step-number {
+      background: #3b82f6;
+      color: white;
+      border-radius: 50%;
+      width: 28px;
+      height: 28px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: bold;
+      font-size: 14px
+    }
+
+    .math-nowrap {
+      overflow-x: auto;
+      white-space: nowrap
+    }
+
+    .kbd {
+      border: 1px solid #cbd5e1;
+      background: #f8fafc;
+      border-radius: .375rem;
+      padding: .125rem .375rem;
+      font-size: .75rem
+    }
   </style>
 </head>
 
 <body class="min-h-screen text-slate-800 bg-gradient-to-br from-slate-50 to-indigo-50">
 
-  <!-- ======= Header ======= -->
+  <!-- ======= Header / Hero ======= -->
   <header class="bg-gradient-to-tr from-indigo-50 via-emerald-50 to-cyan-50 border-b border-slate-200">
     <div class="max-w-7xl mx-auto px-6 py-10 lg:py-14">
       <div class="flex flex-col lg:flex-row items-start gap-8">
         <div class="flex-1">
           <div class="flex items-center gap-4">
-            <img src="logo.png" alt="CHOMP logo" class="w-16 h-16 object-contain"/>
+            <img src="logo.png" alt="CHOMP logo" class="w-16 h-16 object-contain" />
             <div>
               <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight text-slate-900">CHOMP —
-                <span class="text-indigo-600">A Modern NLP Solver</span></h1>
-              <p class="mt-1 text-sm tracking-wide text-slate-500"><b>C</b>HOMP <b>H</b>andles <b>O</b>ptimization of <b>M</b>any <b>P</b>roblems</p>
+                <span class="text-indigo-600">A Modern NLP Solver</span>
+              </h1>
+              <p class="mt-1 text-sm tracking-wide text-slate-500"><b>C</b>HOMP <b>H</b>andles <b>O</b>ptimization of
+                <b>M</b>any <b>P</b>roblems</p>
             </div>
           </div>
-          <p class="mt-4 text-lg md:text-xl text-slate-700 max-w-3xl">A modular nonlinear programming solver that chomps through tough constrained problems using
-            <b>SQP</b>, <b>Interior-Point</b>, and an <b>Auto</b> strategy selector — with automatic differentiation,
-            sparse linear algebra, and robust regularization.</p>
+          <p class="mt-4 text-lg md:text-xl text-slate-700 max-w-3xl">
+            A modular nonlinear programming solver that chomps through tough constrained problems using
+            <b>SQP</b>, <b>Interior-Point</b>, and <b>DFO-L1 Exact Penalty</b>, plus an <b>Auto</b> strategy selector —
+            powered by automatic differentiation,
+            sparse linear algebra, and robust regularization.
+          </p>
+
           <div class="mt-6 flex flex-wrap gap-3">
-            <a href="#design" class="px-4 py-2 rounded-xl bg-indigo-600 text-white font-semibold shadow hover:bg-indigo-700">Design</a>
-            <a href="#algorithms" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Algorithms</a>
-            <a href="#kkt" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">KKT Systems</a>
-            <a href="#regularization" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Regularization</a>
-            <a href="#usage" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Usage</a>
-            <a href="#api" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">API</a>
-            <a href="#examples" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Examples</a>
-            <a href="#faq" class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">FAQ</a>
+            <a href="#get"
+              class="px-4 py-2 rounded-xl bg-indigo-600 text-white font-semibold shadow hover:bg-indigo-700">Get
+              CHOMP</a>
+            <a href="#l1"
+              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">DFO-L1
+              Method</a>
+            <a href="#build"
+              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Build</a>
+            <a href="#algorithms"
+              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Algorithms</a>
+            <a href="#usage"
+              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Usage</a>
+            <a href="#api"
+              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">API</a>
+            <a href="#examples"
+              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Examples</a>
           </div>
         </div>
+
+        <aside class="w-full lg:w-80">
+          <div class="bg-white/70 border border-slate-200 rounded-2xl p-5 shadow card">
+            <h3 class="text-lg font-semibold mb-2">Project Links</h3>
+            <div class="space-y-2">
+              <a target="_blank" rel="noopener" href="https://github.com/lseman/chomp"
+                class="flex items-center justify-between px-3 py-2 rounded-lg bg-slate-900 text-white hover:bg-black">
+                <span class="font-semibold">GitHub: lseman/chomp</span>
+                <span class="kbd">↗</span>
+              </a>
+              <a href="#get"
+                class="block px-3 py-2 rounded-lg bg-indigo-600 text-white text-center hover:bg-indigo-700">Install &
+                Build</a>
+            </div>
+            <p class="text-xs text-slate-500 mt-3">
+              Open-source research code. SQP • Interior-Point • DFO-L1 • Sparse KKT • AD
+            </p>
+          </div>
+        </aside>
       </div>
     </div>
   </header>
 
-  <!-- ======= Section: Design ======= -->
-  <section id="design" class="py-12">
+  <!-- ======= Section: Get / Install ======= -->
+  <section id="get" class="py-12">
     <div class="max-w-7xl mx-auto px-6">
-      <h2 class="text-3xl font-bold text-center mb-8">Why CHOMP?</h2>
-      <div class="grid lg:grid-cols-3 gap-6">
+      <h2 class="text-3xl font-bold text-center mb-8">Get CHOMP</h2>
+
+      <div class="grid lg:grid-cols-2 gap-6">
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-xl font-semibold mb-2">Multiple Strategies</h3>
-          <p class="text-slate-700">Use <b>SQP</b> for fast local superlinear convergence, <b>IP</b> for smooth handling of 
-          inequalities via log-barriers, or <b>AUTO</b> to switch based on structure/conditioning.</p>
+          <h3 class="text-xl font-semibold mb-3">📦 Quick Install (Python)</h3>
+          <p class="text-slate-700 mb-3">Editable install for development:</p>
+          <div class="relative">
+            <button
+              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre
+              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-bash">git clone https://github.com/lseman/chomp
+cd chomp
+pip install -e .</code></pre>
+          </div>
+          <p class="text-sm text-slate-600 mt-3"><b>Requires:</b> Python ≥ 3.9, NumPy, SciPy. Native extensions are
+            built automatically if your toolchain is available.</p>
         </article>
-        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-xl font-semibold mb-2">Sparse, Modular KKT</h3>
-          <p class="text-slate-700">Assemble saddle-point systems with block structure; factor with <b>LDL<sup>T</sup></b> or iterative CG; plug your own backend.</p>
-        </article>
-        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-xl font-semibold mb-2">Robust Regularization</h3>
-          <p class="text-slate-700">Inertia-aware damping, trust-region fixes, Ruiz equilibration, and spectral corrections for indefinite Hessians.</p>
+
+        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card" id="build">
+          <h3 class="text-xl font-semibold mb-3">🔨 Build from Source (CMake + pybind11)</h3>
+          <p class="text-slate-700 mb-3">Compile C++ kernels and Python bindings:</p>
+          <div class="relative">
+            <button
+              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre
+              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-bash">git clone https://github.com/lseman/chomp
+cd chomp
+mkdir build &amp;&amp; cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release \
+  -DAD_ENABLE_OPENMP=ON \
+  -DAD_ENABLE_QDLDL=ON -DAD_ENABLE_OSQP=ON -DAD_ENABLE_PIQP=ON -DAD_ENABLE_AMDQG=ON -DAD_ENABLE_L1CORE=ON
+cmake --build . -j</code></pre>
+          </div>
+
+          <div class="mt-3 grid sm:grid-cols-2 gap-3 text-sm">
+            <div class="bg-slate-50 border border-slate-200 rounded-lg p-3">
+              <div class="font-semibold">CMake Options</div>
+              <ul class="list-disc ml-5 mt-1 space-y-1">
+                <li><code>AD_ENABLE_OPENMP</code> (default OFF)</li>
+                <li><code>AD_ENABLE_QDLDL</code>, <code>AD_ENABLE_OSQP</code>, <code>AD_ENABLE_PIQP</code>,
+                  <code>AD_ENABLE_AMDQG</code>, <code>AD_ENABLE_L1CORE</code> (default ON)</li>
+              </ul>
+            </div>
+            <div class="bg-slate-50 border border-slate-200 rounded-lg p-3">
+              <div class="font-semibold">Build Deps</div>
+              <ul class="list-disc ml-5 mt-1 space-y-1">
+                <li>pybind11 ≥ 2.13, Eigen ≥ 3.3, fmt ≥ 11</li>
+                <li>Python dev headers (3.9+)</li>
+                <li>Optional: OpenMP</li>
+                <li>CPM.cmake auto-fetches if not found</li>
+              </ul>
+            </div>
+          </div>
+
+          <p class="text-xs text-slate-500 mt-3">
+            Platform: GCC ≥ 11 / Clang ≥ 14 (Linux/macOS), MSVC 2022 (Windows). Use <code>Release</code> builds for
+            speed.
+          </p>
         </article>
       </div>
     </div>
   </section>
 
-  <!-- ======= Section: Algorithms ======= -->
-  <section id="algorithms" class="py-12 bg-slate-50">
+
+  <!-- ======= Section: Algorithms (SQP/IP/AUTO) ======= -->
+  <section id="algorithms" class="py-12">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Core Algorithms</h2>
 
@@ -100,14 +254,14 @@
           <span class="step-number">1</span>
           <h3 class="text-xl font-semibold">SQP (Sequential Quadratic Programming)</h3>
         </div>
-        <p class="text-slate-700">At iterate $x_k$, solve a QP built from first-order constraint linearizations and a (possibly regularized) Hessian approximation $H_k$ of the Lagrangian:</p>
+        <p class="text-slate-700">At iterate $x_k$, solve a QP in $p$ with $H_k$ ≈ $\nabla^2 \mathcal L$ and linearized
+          constraints:</p>
         <div class="math-nowrap mt-2">$$\begin{aligned}
           \min_p\; & \tfrac12 p^\top H_k p + \nabla f(x_k)^\top p \\
-          \text{s.t.}\; & c_E(x_k) + J_E(x_k)p = 0,\\
-          & c_I(x_k) + J_I(x_k)p \le 0.
-        \end{aligned}$$</div>
-        <p class="text-slate-700 mt-3">We globalize with line search, trust region, and a filter/funnel acceptance test.</p>
-        <div class="def text-sm mt-3"><b>Step acceptance:</b> accept $(x_{k+1},\lambda_{k+1})$ if merit/filter improves; otherwise shrink TR radius or increase penalty.</div>
+          \text{s.t.}\; & c_E(x_k) + J_E(x_k)p = 0,\quad
+          c_I(x_k) + J_I(x_k)p \le 0.
+          \end{aligned}$$</div>
+        <p class="text-slate-700 mt-2">Globalization via trust-region, line search, and filter/funnel acceptance.</p>
       </div>
 
       <div class="step">
@@ -115,9 +269,10 @@
           <span class="step-number">2</span>
           <h3 class="text-xl font-semibold">Interior-Point (Slack + Log-Barrier)</h3>
         </div>
-        <p class="text-slate-700">Introduce slacks $s>0$ for inequalities $c_I(x) + s = 0$ and solve KKT Newton steps for the barrier Lagrangian with parameter $\mu$:</p>
-        <div class="math-nowrap">$$\min_{x,s}\; f(x) - \mu \sum_j \log s_j\quad \text{s.t.}\; c_E(x)=0,\; c_I(x)+s=0.$$</div>
-        <p class="text-slate-700 mt-3">Use Mehrotra predictor–corrector with fraction-to-boundary and filter line search.</p>
+        <p class="text-slate-700">Introduce slacks $s&gt;0$ with barrier parameter $\mu$:</p>
+        <div class="math-nowrap">$$\min_{x,s}\; f(x) - \mu \sum_j \log s_j\quad\text{s.t.}\; c_E(x)=0,\; c_I(x)+s=0.$$
+        </div>
+        <p class="text-slate-700 mt-2">Mehrotra predictor–corrector, fraction-to-boundary, and filter line search.</p>
       </div>
 
       <div class="step">
@@ -125,67 +280,99 @@
           <span class="step-number">3</span>
           <h3 class="text-xl font-semibold">AUTO Mode</h3>
         </div>
-        <p class="text-slate-700">Chooses SQP vs. IP based on <i>(i)</i> presence of active inequalities, <i>(ii)</i> Hessian conditioning/inertia, <i>(iii)</i> progress signals. Switches are stateful and include warm-starts for duals/slacks.</p>
+        <p class="text-slate-700">Chooses SQP vs IP vs DFO based on structure (active inequalities, conditioning,
+          progress). Warm-starts duals/slacks.</p>
       </div>
     </div>
   </section>
 
-  <!-- ======= Section: KKT ======= -->
-  <section id="kkt" class="py-12">
+  <!-- ======= Section: DFO-L1 Exact Penalty ======= -->
+  <section id="l1" class="py-12 bg-slate-50">
     <div class="max-w-7xl mx-auto px-6">
-      <h2 class="text-3xl font-bold text-center mb-8">KKT Systems (Saddle-Point)</h2>
-      <div class="grid lg:grid-cols-2 gap-8">
-        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-lg font-semibold">Form</h3>
-          <p class="text-slate-700">For equality-only iteration (after slack handling), Newton steps solve:</p>
-          <div class="math-nowrap">$$\begin{bmatrix} H & J^\top \\ J & 0 \end{bmatrix} \begin{bmatrix} \Delta x \\ \Delta \lambda \end{bmatrix} = - \begin{bmatrix} \nabla_x \mathcal{L} \\ c(x) \end{bmatrix}.$$</div>
-          <p class="text-slate-700 mt-3">We support sparse <b>LDL<sup>T</sup></b>, Schur-complement solves, and CG with block preconditioners.</p>
+      <h2 class="text-3xl font-bold text-center mb-8">Derivative-Free L1 Exact Penalty (Trust-Region)</h2>
+
+      <div class="grid lg:grid-cols-3 gap-6">
+        <article class="lg:col-span-2 bg-white border border-slate-200 rounded-2xl p-6 shadow card">
+          <h3 class="text-xl font-semibold mb-3">Problem & Idea</h3>
+          <p class="text-slate-700">
+            We solve constrained problems without derivatives:
+          </p>
+          <div class="math-nowrap my-3">$$
+            \min_{x\in\mathbb{R}^n} f(x) \quad \text{s.t.}\quad c_i(x)\le 0,\; i=1,\dots,m.
+            $$</div>
+          <p class="text-slate-700">
+            Use an <b>exact penalty</b> with parameter $\mu\!>\!0$:
+          </p>
+          <div class="math-nowrap my-3">$$
+            p(x) \;=\; f(x) \;+\; \mu \sum_{i=1}^m \max\{0,\,c_i(x)\}.
+            $$</div>
+          <p class="text-slate-700">
+            Under suitable conditions and sufficiently large $\mu$, minimizing $p(x)$ yields the constrained optimum
+            directly.
+            CHOMP builds local polynomial models of $f$ and $c_i$ in a trust-region, handles non-smoothness near active
+            constraints,
+            and accepts infeasible iterates when beneficial.
+          </p>
+
+          <div class="def text-sm mt-4">
+            <b>Nearly-active vs. clearly violated constraints.</b> Constraints with $|c_i(x)|\le \varepsilon$ are
+            treated specially to avoid
+            zig-zagging near the boundary; others contribute smoothly via model $p_1$.
+          </div>
+
+          <h3 class="text-lg font-semibold mt-6">Step Strategy (Sketch)</h3>
+          <ol class="list-decimal ml-6 text-slate-700 space-y-1">
+            <li><b>Direction:</b> Solve a small LP to get a “steepest” descent direction for the model of $p$ that
+              respects nearly-active gradients.</li>
+            <li><b>1-D Search with Breakpoints:</b> Line search along the direction across piecewise-quadratic segments
+              (breakpoints where constraints switch).</li>
+            <li><b>Project Nearly-Active to Zero:</b> Compute a small correction that drives nearly-active constraints
+              closer to $0$ (least-squares).</li>
+            <li><b>Trust-Region & Acceptance:</b> Compare predicted vs. actual reduction; adjust radius, and improve
+              models if agreement is poor.</li>
+          </ol>
+
+          <div class="insight text-sm mt-4">
+            <b>When to use:</b> Black-box objectives/constraints, limited $n$ (e.g., $n\le 50$), noisy derivatives, or
+            expensive simulations.
+          </div>
         </article>
-        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-lg font-semibold">Schur Complement</h3>
-          <p class="text-slate-700">Eliminate $\Delta x$ to form $S = J H^{-1} J^\top$; solve $S\,\Delta\lambda = r$ and back-substitute. Useful when $m \ll n$ or $H$ well-preconditioned.</p>
-          <div class="insight text-sm mt-3"><b>Tip:</b> Ruiz equilibration of rows/cols of $\begin{bmatrix}H & J^T\\J & 0\end{bmatrix}$ greatly improves stability before factorization.</div>
-        </article>
+
+        <aside class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
+          <h3 class="text-lg font-semibold mb-2">Highlights</h3>
+          <ul class="list-disc ml-5 text-sm text-slate-700 space-y-1">
+            <li>Exact penalty avoids sequences of subproblems.</li>
+            <li>Trust-region globalization with adaptive radius.</li>
+            <li>Descent directions that avoid boundary zig-zag.</li>
+            <li>Criticality measure & model accuracy checks.</li>
+          </ul>
+          <div class="theorem text-sm mt-4">
+            <b>Convergence (outline):</b> With fully-linear models, bounded Hessians, and standard TR acceptance rules,
+            the method converges to first-order points of $p$; increasing $\mu$ as needed recovers feasibility.
+          </div>
+          <p class="text-xs text-slate-500 mt-3">
+            See the paper in the References section for theory and computational studies.
+          </p>
+        </aside>
       </div>
     </div>
   </section>
 
-  <!-- ======= Section: Regularization ======= -->
-  <section id="regularization" class="py-12 bg-slate-50">
-    <div class="max-w-7xl mx-auto px-6">
-      <h2 class="text-3xl font-bold text-center mb-8">Regularization & Inertia Control</h2>
-      <div class="grid lg:grid-cols-2 gap-8">
-        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-lg font-semibold mb-2">Spectral & Trust-Region Fixes</h3>
-          <ul class="list-disc ml-6 text-slate-700 space-y-1 text-sm">
-            <li>Shift $H \leftarrow H + \delta I$ until desired inertia is reached (negative curvature fix).</li>
-            <li>Dogleg/Cauchy fallback when QP model is unreliable.</li>
-            <li>Filter/funnel to balance feasibility vs optimality.</li>
-          </ul>
-        </article>
-        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-lg font-semibold mb-2">Preconditioning</h3>
-          <ul class="list-disc ml-6 text-slate-700 space-y-1 text-sm">
-            <li>Ruiz equilibration for KKT blocks.</li>
-            <li>Block-diagonal or constraint preconditioners for CG on Schur.</li>
-            <li>AMD reordering to reduce fill-in before LDL<sup>T</sup>.</li>
-          </ul>
-        </article>
-      </div>
-    </div>
-  </section>
 
   <!-- ======= Section: Usage ======= -->
-  <section id="usage" class="py-12">
+  <section id="usage" class="py-12 bg-slate-50">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Quick Start</h2>
 
       <div class="grid md:grid-cols-2 gap-8">
+        <!-- Classic API -->
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-xl font-semibold mb-3">Classic API</h3>
           <div class="relative">
-            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre class="text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
+            <button
+              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre
+              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
 from chomp import NLPSolver, SQPConfig
 
 # Rosenbrock + circle inequality
@@ -199,41 +386,64 @@ print(x_opt, info.status)</code></pre>
           </div>
         </article>
 
+        <!-- Wrapper API (NEW) -->
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-xl font-semibold mb-3">Wrapper API (Symbolic)</h3>
+          <p class="text-sm text-slate-600 -mt-1 mb-2">Build with operator-overloaded expressions; AD-aware trigs and
+            reductions.</p>
           <div class="relative">
-            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre class="text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np, math
-from nlp.wrapper import Model, cos
+            <button
+              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre
+              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import math
+import numpy as np
+from nlp.wrapper import Model, cos   # AD-aware functions
 from chomp import NLPSolver, SQPConfig
 
+# Branin with circular inequality
 m = Model("branin")
-x = m.add_var("x", shape=2)
+x = m.add_var("x", shape=2)          # decision vars
 x1, x2 = x[0], x[1]
-a, b, c, r, s, t = 1.0, 5.1/(4*math.pi**2), 5.0/math.pi, 6.0, 10.0, 1/(8*math.pi)
 
-f = a*(x2 - b*(x1**2) + c*x1 - r)**2 + s*(1-t)*cos(x1) + s
+a, b, c, r, s, t = 1.0, 5.1/(4*math.pi**2), 5.0/math.pi, 6.0, 10.0, 1/(8*math.pi)
+f = a*(x2 - b*(x1**2) + c*x1 - r)**2 + s*(1 - t)*cos(x1) + s
 m.minimize(f)
 m.add_constr(x1**2 + x2**2 <= 60.0)
 
+# Compile to callables and solve with SQP
 f_fun, cI, cE, x0 = m.build()
-solver = NLPSolver(f_fun, c_ineq=cI, c_eq=cE, x0=np.array([-3.0,12.0]), config=SQPConfig())
-x_star, hist = solver.solve(mode="auto", max_iter=150, tol=1e-8, verbose=True)
-print("x*:", x_star)</code></pre>
+solver = NLPSolver(f_fun, c_ineq=cI, c_eq=cE, x0=np.array([-3.0, 12.0]),
+                   config=SQPConfig())
+x_star, info = solver.solve(mode="auto", max_iter=150, tol=1e-8, verbose=True)
+print("x* =", x_star, info.status)</code></pre>
           </div>
         </article>
       </div>
 
       <div class="mt-10 grid md:grid-cols-3 gap-4">
-        <div class="border border-slate-200 rounded-xl p-4 bg-slate-50"><div class="text-slate-500 text-xs font-semibold">STEP 1</div><h4 class="font-semibold">Choose mode</h4><p class="text-sm text-slate-700"><code>mode="sqp"</code>, <code>"ip"</code>, or <code>"auto"</code>.</p></div>
-        <div class="border border-slate-200 rounded-xl p-4 bg-slate-50"><div class="text-slate-500 text-xs font-semibold">STEP 2</div><h4 class="font-semibold">Configure</h4><p class="text-sm text-slate-700">Set trust-region / filter options, IPOPT‑style barrier, tolerances.</p></div>
-        <div class="border border-slate-200 rounded-xl p-4 bg-slate-50"><div class="text-slate-500 text-xs font-semibold">STEP 3</div><h4 class="font-semibold">Inspect</h4><p class="text-sm text-slate-700">Use <code>info</code>/<code>history</code> for residuals, inertia, step types, and timings.</p></div>
+        <div class="border border-slate-200 rounded-xl p-4 bg-white">
+          <div class="text-slate-500 text-xs font-semibold">STEP 1</div>
+          <h4 class="font-semibold">Choose mode</h4>
+          <p class="text-sm text-slate-700"><code>mode="sqp"</code>, <code>"ip"</code>, <code>"dfo"</code>, or
+            <code>"auto"</code>.</p>
+        </div>
+        <div class="border border-slate-200 rounded-xl p-4 bg-white">
+          <div class="text-slate-500 text-xs font-semibold">STEP 2</div>
+          <h4 class="font-semibold">Configure</h4>
+          <p class="text-sm text-slate-700">Trust-region / filter options, barrier parameters, tolerances.</p>
+        </div>
+        <div class="border border-slate-200 rounded-xl p-4 bg-white">
+          <div class="text-slate-500 text-xs font-semibold">STEP 3</div>
+          <h4 class="font-semibold">Inspect</h4>
+          <p class="text-sm text-slate-700">Use <code>info</code>/<code>history</code> for residuals, step types, and
+            timings.</p>
+        </div>
       </div>
     </div>
   </section>
 
   <!-- ======= Section: API ======= -->
-  <section id="api" class="py-12 bg-slate-50">
+  <section id="api" class="py-12">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">API Cheatsheet</h2>
       <div class="grid md:grid-cols-2 gap-6">
@@ -241,21 +451,22 @@ print("x*:", x_star)</code></pre>
           <h3 class="font-semibold mb-2">Key Classes</h3>
           <ul class="list-disc ml-6 text-sm text-slate-700 space-y-1">
             <li><code>NLPSolver(f, c_ineq, c_eq, x0, config)</code></li>
-            <li><code>SQPStepper</code>, <code>InteriorPointStepper</code></li>
+            <li><code>SQPStepper</code>, <code>InteriorPointStepper</code>, <code>DFOStepper</code></li>
             <li><code>Regularizer</code> (inertia-aware spectral fixes)</li>
             <li><code>KKT</code> (assembly/factorization, Schur)</li>
           </ul>
           <h3 class="font-semibold mt-4 mb-2">Configs</h3>
           <ul class="list-disc ml-6 text-sm text-slate-700 space-y-1">
-            <li><code>SQPConfig(tr_radius, filter, ls_armijo, dogleg, ...) </code></li>
-            <li><code>IPConfig(mu0, sigma, ftb, corrector, ...) </code></li>
+            <li><code>SQPConfig(tr_radius, filter, ls_armijo, dogleg, ...)</code></li>
+            <li><code>IPConfig(mu0, sigma, ftb, corrector, ...)</code></li>
+            <li><code>DFOConfig(tr_radius, mu, eps_active, ...)</code></li>
           </ul>
         </div>
         <div class="border border-slate-200 rounded-xl p-4 bg-white">
-          <h3 class="font-semibold mb-2">Hooks (Wrapper)</h3>
+          <h3 class="font-semibold mb-2">Wrapper (Symbolic)</h3>
           <ul class="list-disc ml-6 text-sm text-slate-700 space-y-1">
             <li><code>Model.add_var(name, shape, lb, ub, x0)</code></li>
-            <li><code>Model.add_constr(lhs <= rhs)</code>, <code>lhs == rhs</code></li>
+            <li><code>Model.add_constr(lhs &lt;= rhs)</code>, <code>lhs == rhs</code></li>
             <li><code>Model.minimize(expr)</code> / <code>maximize(expr)</code></li>
             <li><code>Model.build() → (f, c_ineq, c_eq, x0)</code></li>
           </ul>
@@ -265,16 +476,18 @@ print("x*:", x_star)</code></pre>
   </section>
 
   <!-- ======= Section: Examples ======= -->
-  <section id="examples" class="py-12">
+  <section id="examples" class="py-12 bg-slate-50">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Worked Examples</h2>
       <div class="grid lg:grid-cols-2 gap-8">
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-lg font-semibold mb-2">Quadratic with Linear Constraints (SQP)</h3>
-          <p class="text-slate-700">Demonstrates filter globalization + trust region on a small QP with active-set changes.</p>
+          <p class="text-slate-700">Filter globalization + trust region with active-set changes.</p>
           <div class="relative">
-            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre class="text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
+            <button
+              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre
+              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
 from chomp import NLPSolver, SQPConfig
 
 Q = np.diag([1.0, 10.0]); q = np.array([-1.0, -2.0])
@@ -288,12 +501,15 @@ x, lam, info = solver.solve(mode="sqp", verbose=True)
 print(x, info.status)</code></pre>
           </div>
         </article>
+
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-lg font-semibold mb-2">Inequalities via Slacks (IP)</h3>
-          <p class="text-slate-700">Log-barrier with Mehrotra predictor–corrector and fraction‑to‑boundary.</p>
+          <p class="text-slate-700">Log-barrier with Mehrotra predictor–corrector and fraction-to-boundary.</p>
           <div class="relative">
-            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre class="text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">from chomp import NLPSolver, IPConfig
+            <button
+              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre
+              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">from chomp import NLPSolver, IPConfig
 
 f = lambda x: (x[0]-1)**2 + (x[1]+2)**2
 c_ineq = [lambda x: x[0] + x[1] - 1]  # <= 0
@@ -304,17 +520,11 @@ print(x, info.status)</code></pre>
           </div>
         </article>
       </div>
-    </div>
-  </section>
-
-  <!-- ======= Section: FAQ ======= -->
-  <section id="faq" class="py-12 bg-slate-50">
-    <div class="max-w-7xl mx-auto px-6">
-      <h2 class="text-3xl font-bold text-center mb-8">FAQ</h2>
-      <div class="space-y-3 text-sm text-slate-700">
-        <details class="p-3 border border-slate-200 rounded-lg bg-white"><summary class="font-semibold cursor-pointer">How are Hessians handled?</summary><div class="pt-2">By default we use exact or AD-provided Hessians with inertia correction. You can switch to BFGS/L-BFGS or Gauss–Newton approximations.</div></details>
-        <details class="p-3 border border-slate-200 rounded-lg bg-white"><summary class="font-semibold cursor-pointer">Can I plug a custom linear solver?</summary><div class="pt-2">Yes — provide a backend to <code>KKT</code> or the Schur solver; iterative methods are supported with user preconditioners.</div></details>
-        <details class="p-3 border border-slate-200 rounded-lg bg-white"><summary class="font-semibold cursor-pointer">When to prefer IP over SQP?</summary><div class="pt-2">Many active inequalities or poor active-set identification → IP; small active set and good Hessian quality → SQP. AUTO tries to decide for you.</div></details>
+      <div class="text-center mt-6">
+        <a target="_blank" rel="noopener" href="https://github.com/lseman/chomp"
+          class="inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-900 text-white font-semibold hover:bg-black">
+          Browse more examples on GitHub <span class="kbd">↗</span>
+        </a>
       </div>
     </div>
   </section>
@@ -324,19 +534,22 @@ print(x, info.status)</code></pre>
     <div class="max-w-7xl mx-auto px-6">
       <div class="flex flex-col md:flex-row items-center justify-between gap-4">
         <p class="text-sm">© <span id="year"></span> CHOMP — Nonlinear Optimization Solver</p>
-        <div class="text-xs text-slate-400">SQP • Interior-Point • Auto • Sparse KKT • AD</div>
+        <div class="text-xs text-slate-400">SQP • Interior-Point • DFO-L1 • Auto • Sparse KKT • AD</div>
       </div>
       <div class="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-400">
         Trust-region & filter globalization • Slack/barrier IPM • Schur/LDL<sup>T</sup> • Ruiz equilibration
       </div>
+      <div class="mt-6 text-center text-xs text-slate-400">
+        References: Giuliani, Camponogara & Conn (2022); Nocedal & Wright; Wächter & Biegler; Gill, Murray & Wright.
+      </div>
     </div>
   </footer>
 
-  <!-- Copy-to-clipboard for code blocks in this page -->
+  <!-- Copy-to-clipboard for code blocks + Prism init -->
   <script>
-    (function () {
-      const btns = document.querySelectorAll('.copy-btn');
-      btns.forEach(btn => {
+    document.addEventListener("DOMContentLoaded", () => {
+      // Copy buttons
+      document.querySelectorAll('.copy-btn').forEach(btn => {
         btn.addEventListener('click', () => {
           const pre = btn.nextElementSibling;
           const code = pre && pre.querySelector('code');
@@ -348,31 +561,25 @@ print(x, info.status)</code></pre>
           });
         });
       });
-    })();
-  </script>
 
-  <!-- Prism.js highlighting -->
-  <link rel="preload" href="https://cdn.jsdelivr.net/npm/prismjs@1/themes/prism.min.css" as="style" onload="this.onload=null;this.rel='stylesheet'">
-  <noscript><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1/themes/prism.min.css"></noscript>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs/plugins/line-numbers/prism-line-numbers.css">
-  <script src="https://cdn.jsdelivr.net/npm/prismjs/prism.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/prismjs/components/prism-python.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/prismjs/components/prism-cpp.min.js" defer></script>
-  <script src="https://cdn.jsdelivr.net/npm/prismjs/plugins/line-numbers/prism-line-numbers.min.js" defer></script>
-  <script>
-    document.addEventListener("DOMContentLoaded", function () {
-      const y = document.getElementById('year'); if (y) y.textContent = new Date().getFullYear();
-      function waitForPrism() {
-        if (window.Prism && Prism.highlightAllUnder) {
-          document.querySelectorAll('pre').forEach(pre => pre.classList.add('line-numbers'));
-          Prism.highlightAllUnder(document.body);
-        } else { setTimeout(waitForPrism, 80); }
-      }
-      waitForPrism();
+      // Ensure line numbers on all <pre> with code blocks
+      document.querySelectorAll('pre').forEach(pre => pre.classList.add('line-numbers'));
+
+      // Update year
+      const y = document.getElementById('year');
+      if (y) y.textContent = new Date().getFullYear();
+
+      // Smooth scroll for anchor links
       document.querySelectorAll('a[href^="#"]').forEach(a => {
-        a.addEventListener('click', (e) => { e.preventDefault(); const t = document.querySelector(a.getAttribute('href')); if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' }); });
+        a.addEventListener('click', (e) => {
+          const href = a.getAttribute('href');
+          if (!href || href === '#') return;
+          const t = document.querySelector(href);
+          if (t) { e.preventDefault(); t.scrollIntoView({ behavior: 'smooth', block: 'start' }); }
+        });
       });
     });
   </script>
 </body>
+
 </html>

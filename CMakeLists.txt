@@ -23,7 +23,6 @@ option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"   ON)
 option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"  ON)
 option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"     ON)
 option(AD_ENABLE_L1CORE   "Build l1core Python bindings"     ON)
-option(AD_ENABLE_GUROBI   "Link GUROBI to ad module"         OFF)
 
 # ------------------------------------------------------------------
 # Dependencies via CPM or system packages
@@ -173,10 +172,10 @@ endfunction()
 # ------------------------------------------------------------------
 # Source list isolated; add/remove files here
 set(AD_SOURCES
-  src/ad.cpp
-  src/Variable.cpp
-  src/Expression.cpp
-  src/ADGraph.cpp
+  src/ad_bindings.cpp
+  src/ad/Variable.cpp
+  src/ad/Expression.cpp
+  src/ad/ADGraph.cpp
 )
 
 ad_add_pybind_module(ad ${AD_SOURCES})

@@ -112,11 +112,6 @@ class SQPConfig:
     ls_wolfe_c: float = 0.9
     ls_theta_restoration: float = 1e2
 
-    # ---------------- Trust-region ----------------
-    # σ-search (for L2/ellipsoidal boundary solves)
-    tr_l2_sigma_tol: float = 1e-2
-    tr_l2_sigma_maxit: int = 25
-
     # ---------------- Second-Order Correction (SOC) ----------------
     soc_kappa: float = 0.8
     soc_tol: float = 1e-8
@@ -146,13 +141,6 @@ class SQPConfig:
 
 
     # ---------------- Funnel (optional) ----------------
-    funnel_kappa_theta: float = 1e-5
-    funnel_kappa_f: float = 1e-5
-    funnel_theta_min: float = 1e-4
-    funnel_switching_s_theta: float = 1.1
-    funnel_switching_s_f: float = 2.3
-    funnel_switching_delta: float = 1.0
-
     funnel_initial_tau: float = 1.0
     funnel_delta: float = 0.1
     funnel_sigma: float = 1e-4

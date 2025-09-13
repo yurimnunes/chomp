@@ -4,7 +4,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
 
-#include "../include/simplex.h"
+#include "../include/simplex/simplex.h"
 
 namespace py = pybind11;
 

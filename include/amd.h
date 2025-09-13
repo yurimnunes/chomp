@@ -990,6 +990,7 @@ private:
         len_[v] = wr - start;
     }
 
+public:
     // inside AMDReorderingArray
     // A is n×n CSR (pattern-only). Return B = A[p, :][:, p].
     // If you don't need canonicalization, set sort_cols=false and dedup=false
@@ -1102,3 +1103,209 @@ private:
         return bw;
     }
 };
+
+// ====================== Supernode identification (structural)
+// ====================== Works on symmetric pattern (A ∪ A^T), lower triangle,
+// after applying a permutation p. Based on Liu's etree and Gilbert-Ng-Peyton
+// supernode criteria with relaxed amalgamation.
+
+struct SupernodeInfo {
+    // Supernode k covers columns [ranges[k].first, ranges[k].second] in
+    // permuted space
+    std::vector<std::pair<i32, i32>> ranges;
+    std::vector<i32> col2sn; // size n, maps column -> supernode id
+    std::vector<i32> etree;  // elimination tree parent (size n), -1 is root
+    std::vector<i32> post;   // postorder permutation of etree (size n)
+};
+
+// Build strictly lower-triangular symmetric pattern of A[p,p] ∪ A[p,p]^T
+static CSR make_lower_sym(const CSR &A, const std::vector<i32> &p) {
+    const i32 n = A.n;
+    CSR P =
+        AMDReorderingArray::permute_(A, p, /*sort_cols=*/true, /*dedup=*/true);
+    // symmetrize (pattern only) and keep strict lower
+    std::vector<std::vector<i32>> rows(n);
+    for (i32 i = 0; i < n; ++i) {
+        for (i32 k = P.indptr[i]; k < P.indptr[i + 1]; ++k) {
+            i32 j = P.indices[k];
+            if (j == i)
+                continue;
+            i32 r = std::max(i, j), c = std::min(i, j);
+            rows[r].push_back(c);
+        }
+    }
+    CSR L(n);
+    L.indptr[0] = 0;
+    for (i32 i = 0; i < n; ++i) {
+        auto &r = rows[i];
+        std::sort(r.begin(), r.end());
+        r.erase(std::unique(r.begin(), r.end()), r.end());
+        L.indptr[i + 1] = L.indptr[i] + (i32)r.size();
+    }
+    L.indices.resize(L.indptr.back());
+    for (i32 i = 0, w = 0; i < n; ++i) {
+        for (i32 v : rows[i])
+            L.indices[w++] = v;
+    }
+    return L;
+}
+
+// Liu’s elimination tree for symmetric (use lower triangle L: row i contains
+// cols < i)
+static std::vector<i32> etree_from_lower(const CSR &L) {
+    const i32 n = L.n;
+    std::vector<i32> parent(n, -1), ancestor(n, -1);
+    for (i32 j = 0; j < n; ++j) {
+        for (i32 p = L.indptr[j]; p < L.indptr[j + 1]; ++p) {
+            i32 i = L.indices[p]; // i < j in lower
+            // find with path compression
+            while (i != -1 && i < j) {
+                i32 next = ancestor[i];
+                ancestor[i] = j;
+                if (next == -1) {
+                    parent[i] = j;
+                    break;
+                }
+                i = next;
+            }
+        }
+    }
+    return parent;
+}
+
+// Postorder of a rooted forest (etree) — iterative DFS
+static std::vector<i32> postorder_etree(const std::vector<i32> &parent) {
+    const i32 n = (i32)parent.size();
+    std::vector<i32> head(n, -1), next(n, -1), root;
+    root.reserve(n);
+    for (i32 i = 0; i < n; ++i) {
+        i32 p = parent[i];
+        if (p == -1)
+            root.push_back(i);
+        else {
+            next[i] = head[p];
+            head[p] = i;
+        }
+    }
+    std::vector<i32> post;
+    post.reserve(n);
+    std::vector<std::pair<i32, i32>> st;
+    st.reserve(n);
+    // state: (node, it = child iterator index via next-list)
+    for (i32 r : root) {
+        st.emplace_back(r, head[r]);
+        while (!st.empty()) {
+            auto &[u, it] = st.back();
+            if (it == -2) { // done, emit
+                post.push_back(u);
+                st.pop_back();
+                if (!st.empty())
+                    st.back().second =
+                        next[st.back().second]; // advance parent iterator
+                continue;
+            }
+            if (it == -1) { // no children
+                it = -2;
+                continue;
+            }
+            // descend first child in adjacency list
+            st.emplace_back(it, head[it]);
+        }
+    }
+    return post;
+}
+
+// Compare two sorted index lists A (rows > cutA) and B (rows > cutB) with
+// relaxed amalgamation. Returns true if they are equal OR within relaxation
+// thresholds:
+//   - up to "relax" absolute extra/missing entries, AND
+//   - Jaccard >= tau (0..1).
+static bool structural_match_relaxed(const i32 *A, i32 lenA, i32 cutA,
+                                     const i32 *B, i32 lenB, i32 cutB,
+                                     int relax, double tau) {
+    // advance to strictly-greater-than-cut
+    while (lenA > 0 && *A <= cutA) {
+        ++A;
+        --lenA;
+    }
+    while (lenB > 0 && *B <= cutB) {
+        ++B;
+        --lenB;
+    }
+
+    // exact early-out
+    if (relax <= 0 && lenA == lenB && std::equal(A, A + lenA, B))
+        return true;
+
+    int i = 0, j = 0, inter = 0;
+    while (i < lenA && j < lenB) {
+        if (A[i] == B[j]) {
+            ++inter;
+            ++i;
+            ++j;
+        } else if (A[i] < B[j]) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    int uni = lenA + lenB - inter;
+    int diff = uni - inter; // total mismatched count
+    if (diff > relax)
+        return false;
+    double jac = (uni == 0) ? 1.0 : double(inter) / double(uni);
+    return jac >= tau;
+}
+
+// Identify supernodes on permuted pattern. Returns ranges in PERMUTED indices.
+static SupernodeInfo identify_supernodes(
+    const CSR &A, const std::vector<i32> &p,
+    int relax = 0,    // allow up to this many set diffs when merging
+    double tau = 1.0, // Jaccard threshold (1.0 = exact)
+    int max_size = std::numeric_limits<int>::max()) {
+    const i32 n = A.n;
+    SupernodeInfo out;
+    out.col2sn.assign(n, -1);
+
+    // 1) Symmetric lower pattern after permutation
+    CSR L = make_lower_sym(A, p);
+
+    // 2) Elimination tree and postorder (on permuted space)
+    out.etree = etree_from_lower(L);
+    out.post = postorder_etree(out.etree);
+
+    // For quick column access
+    auto col_ptr = [&](i32 j) { return &L.indices[L.indptr[j]]; };
+    auto col_len = [&](i32 j) { return (i32)(L.indptr[j + 1] - L.indptr[j]); };
+
+    // 3) Scan natural column order (0..n-1). Supernode criteria:
+    //    parent(k) = k+1 and structure(k)\{<=k} == structure(k+1)\{<=k+1}
+    i32 j = 0;
+    i32 sn_id = 0;
+    while (j < n) {
+        i32 t = j;
+        while (t + 1 < n) {
+            if (out.etree[t] != t + 1)
+                break; // must be a chain
+            // compare strictly-below patterns with relaxed match
+            const i32 *Aj = col_ptr(t);
+            const i32 *Ak = col_ptr(t + 1);
+            i32 Lj = col_len(t);
+            i32 Lk = col_len(t + 1);
+            bool ok = structural_match_relaxed(Aj, Lj, t,     // drop ≤ t
+                                               Ak, Lk, t + 1, // drop ≤ t+1
+                                               relax, tau);
+            if (!ok)
+                break;
+            if ((t + 1 - j + 1) >= max_size)
+                break;
+            ++t;
+        }
+        out.ranges.emplace_back(j, t);
+        for (i32 c = j; c <= t; ++c)
+            out.col2sn[c] = sn_id;
+        ++sn_id;
+        j = t + 1;
+    }
+    return out;
+}

@@ -1,6 +1,6 @@
 #pragma once
 #include "../../include/piqp.h"
-#include "../../include/simplex.h"
+#include "../../include/simplex/simplex.h"
 #include "SolversBase.hpp"
 #include <Eigen/Dense>
 #include <iostream>

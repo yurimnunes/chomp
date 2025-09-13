@@ -1,5 +1,5 @@
 # hykkt_pcg_numba.py
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 
