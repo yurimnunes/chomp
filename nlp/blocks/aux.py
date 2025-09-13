@@ -113,27 +113,9 @@ class SQPConfig:
     ls_theta_restoration: float = 1e2
 
     # ---------------- Trust-region ----------------
-    tr_delta0: float = 1.0
-    tr_delta_max: float = 100.0
-    tr_delta_min: float = 1e-8
-    tr_eta_lo: float = 1e-4
-    tr_eta_hi: float = 0.75
-    tr_gamma_dec: float = 0.25
-    tr_gamma_inc: float = 2.0
-    tr_norm_type: str = "2"                # {"ellip","2","inf","scaled"}
-    tr_boundary_tol: float = 0.05
-    tr_max_rejections: int = 3
-
     # σ-search (for L2/ellipsoidal boundary solves)
     tr_l2_sigma_tol: float = 1e-2
     tr_l2_sigma_maxit: int = 25
-
-    # TR inner solver (CG / working set)
-    cg_max_iter: int = 50
-    max_ws_add: int = 5
-    pr_threshold: float = 1e-1
-    rho_smooth: float = 0.1
-    act_tol: float = 1e-8
 
     # ---------------- Second-Order Correction (SOC) ----------------
     soc_kappa: float = 0.8
@@ -162,14 +144,6 @@ class SQPConfig:
     rest_weight_growth: float = 5.0
     rest_weight_decay: float = 0.8
 
-    # ---------------- Active-set & sensitivity ----------------
-    act_lambda_on: float = 1e-3
-    act_lambda_off: float = 1e-5
-    act_violation_on: float = 1e-5
-    act_violation_off: float = 1e-4
-    sens_beta: float = 0.3
-    sens_reg: float = 1e-10
-    lam_clip: float = 1e6
 
     # ---------------- Funnel (optional) ----------------
     funnel_kappa_theta: float = 1e-5
@@ -187,47 +161,6 @@ class SQPConfig:
     funnel_min_tau: float = 1e-8
     funnel_max_history: int = 100
 
-    # ---------------- Composite (optional) ----------------
-    composite_mode: str = "auglag"         # {"penalty","auglag"}
-    penalty_eps: float = 1e-8
-    penalty_mu_e: float = 10.0
-    penalty_mu_i: float = 10.0
-    tang_slack: float = 1e-8
-    al_mu_e: float = 10.0
-    al_mu_i: float = 10.0
-    cs_ineq_weight: float = 1.0
-    cs_damping: float = 0.1
-
-    # -----------------------------------------------
-    # Extra solver knobs (kept for compatibility)
-    max_iter: int = 200
-    tol_kkt: float = 1e-6
-    tol_step: float = 1e-12
-    mu_init: float = 1e-1
-    mu_min: float = 1e-12
-    mu_reduce: float = 0.2
-    tau: float = 0.995
-    alpha_max: float = 1.0
-    alpha_backtrack: float = 0.5
-    ls_max: int = 25
-    use_sparse_linear_solver: bool = True
-    hess_reg: float = 1e-4
-    hess_reg_max: float = 1e2
-    hess_reg_inc: float = 10.0
-    rho_init: float = 1.0
-    rho_max: float = 1e6
-    rho_inc: float = 10.0
-    # verbose already defined above
-    
-    delta0: float = 1.0
-    cg_tol: float = 1e-4
-    cg_tol_rel: bool = True
-    cg_maxiter: int = 1000
-    neg_curv_tol: float = 1e-8
-    constraint_tol: float = 1e-6
-    feasibility_emphasis: float = 1.0
-    curvature_aware: bool = True
-    
 
 
 # ======================================

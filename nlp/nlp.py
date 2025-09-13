@@ -104,7 +104,7 @@ class NLPSolver:
         )
         mI = len(c_ineq) if c_ineq else 0
         mE = len(c_eq) if c_eq else 0
-        self.dfo_stepper = None # #L1DFOStepper(func=f)
+        self.dfo_stepper = L1DFOStepper(self.model, self.cfg, x0=self.x, var_lb=lb, var_ub=ub)
 
         _ensure_cfg_fields(self.cfg)  # add missing fields if needed
 
@@ -157,8 +157,8 @@ class NLPSolver:
             elif self.mode == "sqp":
                 info = self._sqp_step(k)
             elif self.mode == "dfo":
-                x_out, lam_out, nu_out, info = self.dfo_stepper.step(
-                    self.model, self.x, self.dfo_state, k
+                x_out, _, _, info = self.dfo_stepper.step(
+                    self.model, self.x, it=k
                 )
                 # Update streaks / stats
                 self._update_streaks(info)
@@ -167,7 +167,8 @@ class NLPSolver:
                     if verbose:
                         print(f"✓ Converged at iteration {k}")
                     self.x = x_out
-                    self.lam, self.nu = lam_out, nu_out
+                    if self.mode != "dfo":
+                        self.lam, self.nu = lam_out, nu_out
                     hist.append(info)
                     break
 
@@ -175,7 +176,8 @@ class NLPSolver:
                     if self.cfg.use_watchdog:
                         self._watchdog_update(x_out)
                     self.x = x_out
-                    self.lam, self.nu = lam_out, nu_out
+                    if self.mode != "dfo":
+                        self.lam, self.nu = lam_out, nu_out
             else:
                 # should not happen; fallback to SQP
                 info = self._sqp_step(k)

@@ -28,46 +28,6 @@ from .blocks.soc import *
 from .blocks.tr import *
 
 
-def _norm_mat(mat, n_expected: int) -> Tuple[np.ndarray | sp.spmatrix, int, int]:
-    """Return (M, m, n) with M 2-D, ensuring n == n_expected when possible.
-    Accepts dense/sparse and 1-D vectors (row). Transposes (n,1) to (1,n)."""
-    if mat is None:
-        return None, 0, n_expected
-    if sp.issparse(mat):
-        M = mat.tocsr()
-        m, n = M.shape
-        # Handle accidental column vector (n,1) representing a single row
-        if n != n_expected and m == n_expected and n == 1:
-            M = M.T.tocsr()
-            m, n = M.shape
-        return M, m, n
-    # dense
-    M = np.asarray(mat, dtype=float)
-    if M.ndim == 1:
-        # treat as a single row
-        M = M.reshape(1, -1)
-    m, n = M.shape
-    if n != n_expected and m == n_expected and n == 1:
-        # mistaken column vector; make it a row
-        M = M.T
-        m, n = M.shape
-    return M, m, n
-
-def _norm_vec(vec, m_expected: int) -> np.ndarray:
-    """Return 1-D vector of length m_expected."""
-    if vec is None:
-        return None
-    v = np.asarray(vec, dtype=float).reshape(-1)
-    if v.size != m_expected:
-        raise ValueError(f"RHS length mismatch: expected {m_expected}, got {v.size}")
-    return v
-
-
-# Utility functions
-def _to_sparse(matrix, format="csr"):
-    """Convert matrix to sparse CSR format if not already sparse."""
-    return sp.csr_matrix(matrix, copy=False) if not sp.issparse(matrix) else matrix.tocsr()
-
 def _to_dense_if_needed(matrix, requires_dense: bool):
     """Convert sparse matrix to dense if required by solver."""
     return matrix.toarray() if sp.issparse(matrix) and requires_dense else matrix

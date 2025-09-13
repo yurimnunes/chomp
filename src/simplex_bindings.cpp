@@ -44,7 +44,6 @@ static RevisedSimplexOptions make_opts_from_kwargs(const py::kwargs& kw) {
     if (!get("rng_seed").is_none())                 o.rng_seed = py::cast<int>(kw["rng_seed"]);
     if (!get("refactor_every").is_none())           o.refactor_every = py::cast<int>(kw["refactor_every"]);
     if (!get("pricing_rule").is_none())             o.pricing_rule = py::cast<std::string>(kw["pricing_rule"]);
-    if (!get("steepest_edge_reset_freq").is_none()) o.steepest_edge_reset_freq = py::cast<int>(kw["steepest_edge_reset_freq"]);
     if (!get("max_basis_rebuilds").is_none())       o.max_basis_rebuilds = py::cast<int>(kw["max_basis_rebuilds"]);
     return o;
 }
@@ -66,7 +65,6 @@ PYBIND11_MODULE(simplex_core, m) {
         .def_readwrite("rng_seed", &RevisedSimplexOptions::rng_seed)
         .def_readwrite("refactor_every", &RevisedSimplexOptions::refactor_every)
         .def_readwrite("pricing_rule", &RevisedSimplexOptions::pricing_rule)
-        .def_readwrite("steepest_edge_reset_freq", &RevisedSimplexOptions::steepest_edge_reset_freq)
         .def_readwrite("max_basis_rebuilds", &RevisedSimplexOptions::max_basis_rebuilds)
         ;
 

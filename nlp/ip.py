@@ -1,5 +1,6 @@
 # sqp_ip.py
 # InteriorPointStepper: stabilized slacks-only barrier IPM w/ bounds
+# Added shifted barrier method support
 from __future__ import annotations
 
 import copy
@@ -18,6 +19,7 @@ from nlp.blocks.linesearch import LineSearcher
 from .blocks.aux import HessianManager, Model, SQPConfig
 from .blocks.filter import Filter, Funnel
 from .blocks.reg import Regularizer, make_psd_advanced
+from .ip_cg import *
 
 
 # ------------------ sparse helpers ------------------
@@ -65,6 +67,7 @@ class IPState:
     zL: np.ndarray  # duals for lower bounds
     zU: np.ndarray  # duals for upper bounds
     mu: float
+    tau_shift: float = 0.0  # NEW: shift parameter for shifted barrier
     initialized: bool = False
 
     @staticmethod
@@ -72,11 +75,15 @@ class IPState:
         mI, mE = model.m_ineq, model.m_eq
         d = model.eval_all(x, components=["cI", "cE"])
         cI = np.zeros(mI) if (mI == 0 or d["cI"] is None) else np.asarray(d["cI"], float)
+        
         # Start safely interior: s ~ max(1, -cI + 1e-3), λ ≈ μ/s
         mu0 = max(getattr(cfg, "ip_mu_init", 1e-2), 1e-12)
+        tau_shift = float(getattr(cfg, "ip_shift_tau", 0.0))  # NEW: get shift parameter
+        
         if mI > 0:
             s0 = np.maximum(1.0, -cI + 1e-3)
-            lam0 = np.maximum(1e-8, mu0 / np.maximum(s0, 1e-12))
+            # For shifted barrier: λ ≈ μ/(s + τ)
+            lam0 = np.maximum(1e-8, mu0 / np.maximum(s0 + tau_shift, 1e-12))
         else:
             s0 = np.zeros(0)
             lam0 = np.zeros(0)
@@ -91,11 +98,15 @@ class IPState:
         hasU = np.isfinite(ub)
         sL = np.where(hasL, np.maximum(1e-12, x - lb), 1.0)
         sU = np.where(hasU, np.maximum(1e-12, ub - x), 1.0)
-        zL0 = np.where(hasL, np.maximum(1e-8, mu0 / sL), 0.0)
-        zU0 = np.where(hasU, np.maximum(1e-8, mu0 / sU), 0.0)
+        
+        # For bounds, we can also apply shift if desired
+        bound_shift = float(getattr(cfg, "ip_shift_bounds", 0.0))  # NEW: separate shift for bounds
+        zL0 = np.where(hasL, np.maximum(1e-8, mu0 / (sL + bound_shift)), 0.0)
+        zU0 = np.where(hasU, np.maximum(1e-8, mu0 / (sU + bound_shift)), 0.0)
 
         return IPState(
-            mI=mI, mE=mE, s=s0, lam=lam0, nu=nu0, zL=zL0, zU=zU0, mu=mu0, initialized=True
+            mI=mI, mE=mE, s=s0, lam=lam0, nu=nu0, zL=zL0, zU=zU0, mu=mu0, 
+            tau_shift=tau_shift, initialized=True
         )
 
 
@@ -280,10 +291,12 @@ class RestorationModel:
 # ------------------ stepper ------------------
 class InteriorPointStepper:
     """
-    Slacks-only barrier IP stepper with bounds:
+    Slacks-only barrier IP stepper with bounds and optional shifted barrier:
 
-        min f(x) - μ Σ log s
-        s.t. c_I(x) + s = 0,  c_E(x) = 0,  s>0,  ℓ ≤ x ≤ u
+    Standard barrier:  min f(x) - μ Σ log s
+    Shifted barrier:   min f(x) - μ Σ log(s + τ)
+    
+    s.t. c_I(x) + s = 0,  c_E(x) = 0,  s>0,  ℓ ≤ x ≤ u
 
     Uses Mehrotra predictor-corrector (σ from affine step) + centrality
     correction, unified fraction-to-boundary, SPD KKT default, inertia
@@ -321,6 +334,12 @@ class InteriorPointStepper:
         add("ip_exact_hessian", True)
         add("ip_hess_reg0", 1e-4)
         add("ip_eq_reg", 1e-4)
+
+        # NEW: shifted barrier parameters
+        add("ip_use_shifted_barrier", True)  # toggle for shifted barrier
+        add("ip_shift_tau", 0.1)              # shift parameter for slacks
+        add("ip_shift_bounds", 1e-3)           # shift parameter for bounds (can be different)
+        add("ip_shift_adaptive", True)       # adaptive shift based on problem conditioning
 
         # barrier & predictor-corrector
         add("ip_mu_init", 1e-2)
@@ -418,23 +437,29 @@ class InteriorPointStepper:
         return float(max(0.0, min(1.0, a)))
 
     def _safe_reinit_slacks_duals(
-        self, cI: np.ndarray, JI, x: np.ndarray, lb, ub, hasL, hasU, mu: float
+        self, cI: np.ndarray, JI, x: np.ndarray, lb, ub, hasL, hasU, mu: float, tau_shift: float = 0.0
     ):
-        """Ensure (s, λ, zL, zU) are strictly interior & complementary."""
+        """Ensure (s, λ, zL, zU) are strictly interior & complementary with optional shift."""
         n = x.size
         mI = int(cI.size)
         if mI > 0:
             s_floor = np.maximum(1e-8, np.minimum(1.0, np.abs(cI)))
             s0 = np.maximum(s_floor, -cI + 1e-3)
-            lam0 = np.maximum(1e-8, mu / np.maximum(s0, 1e-12))
+            # For shifted barrier: λ ≈ μ/(s + τ)
+            lam0 = np.maximum(1e-8, mu / np.maximum(s0 + tau_shift, 1e-12))
         else:
             s0 = np.zeros(0)
             lam0 = np.zeros(0)
+        
         zL0 = np.zeros(n); zU0 = np.zeros(n)
         sL = np.where(hasL, np.maximum(1e-12, x - lb), 1.0)
         sU = np.where(hasU, np.maximum(1e-12, ub - x), 1.0)
-        zL0[hasL] = np.maximum(1e-8, mu / sL[hasL])
-        zU0[hasU] = np.maximum(1e-8, mu / sU[hasU])
+        
+        # Can use different shift for bounds if desired
+        bound_shift = float(getattr(self.cfg, "ip_shift_bounds", 0.0))
+        zL0[hasL] = np.maximum(1e-8, mu / (sL[hasL] + bound_shift))
+        zU0[hasU] = np.maximum(1e-8, mu / (sU[hasU] + bound_shift))
+        
         return s0, lam0, zL0, zU0
 
     # ---------- KKT solver ----------
@@ -448,7 +473,7 @@ class InteriorPointStepper:
         reuse_symbolic: bool = True,
         refine_iters: int = 0,
         *,
-        method: str = "qdldl",  # default SPD
+        method: str = "qdldl",  # "hykkt", "lifted", "qdldl"
         gamma: float = None,
         delta_c_lift: float = None,
         cg_tol: float = 1e-10,
@@ -459,11 +484,23 @@ class InteriorPointStepper:
             [ W   G^T ][dx] = [ rhs_x ]
             [ G    0  ][dy]   [ -rpE   ]
 
-        method:
-        - "hykkt"  : SPD K_gamma = (W + δ_w I) + γ G^T G, CG on Schur
+        SPD paths:
+        - "hykkt"  : CG on Schur with inner solves on K_gamma = W+δ_w I + γ G^T G
         - "lifted" : SPD Schur with finite δ_c (dy = 1/δ_c (G dx - r2))
-        - "qdldl"  : inertia-corrected LDL^T with qdldl
+        Indefinite:
+        - "qdldl"  : inertia-corrected LDL^T (kept as your original fallback)
         """
+        import numpy as np
+        import scipy.sparse as sp
+        import scipy.sparse.linalg as spla
+        from scipy.sparse.linalg import LinearOperator
+
+        # ---------- local helpers ----------
+        def _csr(A, shape=None):
+            if sp.isspmatrix_csr(A): 
+                return A
+            return A.tocsr() if shape is None else sp.csr_matrix(A, shape=shape)
+
         def _upper_csc(K):
             K = K.tocoo()
             mask = K.row <= K.col
@@ -474,6 +511,44 @@ class InteriorPointStepper:
             A = _csr(A)
             return float(np.max(np.abs(A).sum(axis=1))) if A.shape[0] else 1.0
 
+        # Minimal CG for a matrix-free SPD operator (optional left precond M)
+        def _cg_matfree(matvec, b, x0=None, tol=1e-10, maxit=200, M=None):
+            n = b.size
+            x = np.zeros(n) if x0 is None else x0.copy()
+            r = b - matvec(x)
+            z = r if M is None else M(r)
+            p = z.copy()
+            rz_old = float(r @ z)
+            nrm0 = float(np.linalg.norm(r))
+            stop = max(tol * nrm0, 0.0)
+            if nrm0 <= stop:
+                return x, 0
+            for it in range(1, maxit + 1):
+                Ap = matvec(p)
+                pAp = float(p @ Ap)
+                if pAp <= 0.0:  # not SPD / numerical trouble
+                    break
+                alpha = rz_old / pAp
+                x += alpha * p
+                r -= alpha * Ap
+                nr = float(np.linalg.norm(r))
+                if nr <= stop:
+                    return x, it
+                z = r if M is None else M(r)
+                rz_new = float(r @ z)
+                beta = rz_new / rz_old
+                rz_old = rz_new
+                p = z + beta * p
+            return x, it
+
+        # Optional QDLDL (exact inner solve) — one factorization per HYKKT call
+        try:
+            import qdldl as qd  # adjust if your binding name differs
+            _HAS_QDLDL = True
+        except Exception:
+            _HAS_QDLDL = False
+
+        # ---------- unpack inputs ----------
         n = Wmat.shape[0]
         mE = 0 if JE_mat is None else JE_mat.shape[0]
         W = _csr(Wmat, (n, n))
@@ -481,65 +556,145 @@ class InteriorPointStepper:
         r1 = rhs_x
         r2 = -rpE if mE > 0 else None
 
-        # SPD paths if equality present
+        # =========================
+        # SPD paths (HYKKT / LIFTED)
+        # =========================
         if method in ("hykkt", "lifted") and mE > 0:
+            # Use your last accepted Hessian regularization if present
             delta_w_last = float(getattr(self, "_delta_w_last", 0.0) or 0.0)
-            if gamma is None or delta_c_lift is None:
+
+            # Auto gamma if not provided
+            if gamma is None:
                 num = _normest_rowsum_inf(W) + delta_w_last
                 den = max(_normest_rowsum_inf(G), 1.0)
                 gamma_hat = max(1.0, num / (den * den))
+                gamma = gamma_hat
 
             if method == "hykkt":
-                if gamma is None: gamma = gamma_hat
-                Kgam = W + delta_w_last * sp.eye(n, format="csr") + gamma * (G.T @ G)
-                Kgam_csc = Kgam.tocsc()
+                # Build K_gamma = W + δ_w I + γ G^T G
+                Kgam = W + delta_w_last * sp.eye(n, format="csr") + gamma * (G.T @ G).tocsr()
 
-                def solve_Kgam(b):
-                    return spla.spsolve(Kgam_csc, b)
+                # Inner solver: prefer QDLDL (single factorization), else Numba PCG
+                inner_info = {}
+                if _HAS_QDLDL:
+                    # Factorize Kgam once
+                    K_csc_up = _upper_csc(Kgam.tocsc())
+                    # Optional AMD; use your ordering if you have it, else none
+                    perm = None
+                    try:
+                        from .aux.amd import AMDReorderingArray
+                        amd_ = AMDReorderingArray(aggressive_absorption=True)
+                        perm, _ = amd_.compute_fill_reducing_permutation(K_csc_up)
+                    except Exception:
+                        perm = None
 
-                def S_mv(y):
-                    return G @ solve_Kgam(G.T @ y)
+                    fac = qd.factorize(K_csc_up.indptr, K_csc_up.indices, K_csc_up.data, K_csc_up.shape[0], perm=perm)
 
-                S = LinearOperator((mE, mE), matvec=S_mv, rmatvec=S_mv, dtype=float)
+                    def _inner_solve(q):
+                        return qd.solve(fac, q)
+
+                    inner_info["inner"] = "qdldl"
+                else:
+                    # Numba PCG (diagonal precond) on CSR
+                    A = Kgam.tocsr()
+                    indptr, indices, data = A.indptr, A.indices, A.data
+
+                    # extract diagonal safely
+                    diag = np.zeros(n, dtype=float)
+                    for i in range(n):
+                        start, end = indptr[i], indptr[i + 1]
+                        d = 0.0
+                        for k in range(start, end):
+                            if indices[k] == i:
+                                d = data[k]; break
+                        diag[i] = d if d != 0.0 else max(delta_w_last, 1e-12)
+
+                    def _inner_solve(q):
+                        x0 = np.zeros_like(q)
+                        x, _, _ = pcg_csr(indptr, indices, data, q, x0, diag, tol=max(1e-2*cg_tol, 1e-12), maxit=max(10*cg_maxit, 200))
+                        return x
+
+                    inner_info["inner"] = "pcg"
+
+                # Schur: S y = G Kgam^{-1} G^T y
+                def _S_mv(y):
+                    return G @ _inner_solve(G.T @ y)
+
+                # A simple Jacobi preconditioner for S (optional)
+                # M^{-1} ≈ 1 / diag(G diag(Kgam)^{-1} G^T)
+                S_M = None
+                try:
+                    if inner_info["inner"] == "pcg":
+                        # use the same diag as above to build a quick precond
+                        inv_diag_A = np.zeros(n)
+                        # Avoid re-computing; reuse 'diag'
+                        inv_diag_A[:] = 1.0 / diag
+                    else:
+                        # cheap surrogate: diag(Kgam) ≈ diag(W) + δ_w + γ*row_sums(G^2)
+                        diagA = np.array(W.diagonal(), dtype=float) + delta_w_last
+                        diagA += gamma * np.array((G.multiply(G)).T.sum(axis=1)).ravel()  # sum of squares per column
+                        inv_diag_A = 1.0 / np.maximum(diagA, 1e-12)
+
+                    # diag of S: sum_j G[i,j]^2 * inv_diag_A[j]
+                    Sd = (G.multiply(G)) @ inv_diag_A
+                    Sd = np.asarray(Sd).ravel()
+                    Sd = np.maximum(Sd, 1e-12)
+
+                    def _S_precond(v):
+                        return v / Sd
+
+                    S_M = _S_precond
+                except Exception:
+                    S_M = None
+
+                # RHS for Schur: rhs_s = G Kgam^{-1} (r1 + γ G^T r2) - r2
                 svec = r1 + gamma * (G.T @ r2)
-                rhs_schur = (G @ solve_Kgam(svec)) - r2
-                dy, info = cg(S, rhs_schur, rtol=cg_tol, maxiter=cg_maxit)
-                if info != 0:
-                    # Retry with larger gamma; else fallback
-                    gamma *= 5.0
-                    Kgam = W + delta_w_last * sp.eye(n, format="csr") + gamma * (G.T @ G)
-                    Kgam_csc = Kgam.tocsc()
+                rhs_s = (G @ _inner_solve(svec)) - r2
 
-                    def S_mv2(y):
-                        return G @ spla.spsolve(Kgam_csc, G.T @ y)
+                # CG solve for dy
+                dy, it_s = _cg_matfree(_S_mv, rhs_s, x0=None, tol=cg_tol, maxit=cg_maxit, M=S_M)
 
-                    S2 = LinearOperator((mE, mE), matvec=S_mv2, rmatvec=S_mv2, dtype=float)
-                    svec = r1 + gamma * (G.T @ r2)
-                    rhs_schur = (G @ spla.spsolve(Kgam_csc, svec)) - r2
-                    dy, info = cg(S2, rhs_schur, rtol=max(cg_tol, 1e-8), maxiter=cg_maxit)
-                    if info != 0:
-                        method = "qdldl"
+                # Recover dx: dx = Kgam^{-1} (r1 + γ G^T r2 - G^T dy)
+                rhs_dx = svec - (G.T @ dy)
+                dx = _inner_solve(rhs_dx)
 
-                if method == "hykkt" and info == 0:
-                    rhs_dx = r1 + gamma * (G.T @ r2) - (G.T @ dy)
-                    dx = solve_Kgam(rhs_dx)
-                    self._delta_w_last = delta_w_last
-                    return dx, dy
+                self._delta_w_last = delta_w_last
+                # (Optional) you can return inner/outer iteration info if you keep a dict
+                return dx, dy
 
+            # ---- LIFTED variant ----
             if method == "lifted":
-                if delta_c_lift is None: delta_c_lift = 1.0 / gamma_hat
+                if delta_c_lift is None:
+                    num = _normest_rowsum_inf(W) + delta_w_last
+                    den = max(_normest_rowsum_inf(G), 1.0)
+                    gamma_hat = max(1.0, num / (den * den))
+                    delta_c_lift = 1.0 / gamma_hat
+
                 Kspd = W + delta_w_last * sp.eye(n, format="csr") + (1.0 / delta_c_lift) * (G.T @ G)
-                rhs_dx = r1 - (1.0 / delta_c_lift) * r2
-                dx = spla.spsolve(Kspd.tocsc(), rhs_dx)
+                try:
+                    # prefer factorized solve if possible
+                    solveA = spla.factorized(Kspd.tocsc())
+                    dx = solveA(r1 - (1.0 / delta_c_lift) * (G.T @ r2))
+                except Exception:
+                    dx = spla.spsolve(Kspd.tocsc(), r1 - (1.0 / delta_c_lift) * (G.T @ r2))
                 dy = (G @ dx - r2) * (1.0 / delta_c_lift)
                 return dx, dy
 
-        # LDLᵀ fallback with inertia correction
+        # ============================================================
+        # Indefinite LDLᵀ fallback with inertia correction (your code)
+        # ============================================================
         delta_w_last = getattr(self, "_delta_w_last", 0.0)
         delta_w = 0.0
         delta_c = 0.0
         attempts = 0
         max_attempts = 10
+
+        # Local dependency expected from your codebase:
+        try:
+            import qdldl as qd  # your LDL' backend
+        except Exception:
+            qd = None
+
         while attempts < max_attempts:
             if mE > 0:
                 Wcsr = _csr(W + delta_w * sp.eye(n))
@@ -555,25 +710,36 @@ class InteriorPointStepper:
             K_upper = _upper_csc(K)
             nsys = K_upper.shape[0]
 
-            # AMD ordering from your codebase
-            from .aux.amd import AMDReorderingArray
-            amd_ = AMDReorderingArray(aggressive_absorption=True)
-            perm, _ = amd_.compute_fill_reducing_permutation(K_upper)
+            # AMD ordering if you have it
+            try:
+                from .aux.amd import AMDReorderingArray
+                amd_ = AMDReorderingArray(aggressive_absorption=True)
+                perm, _ = amd_.compute_fill_reducing_permutation(K_upper)
+            except Exception:
+                perm = None
 
             try:
+                if qd is None:
+                    raise RuntimeError("qdldl not available")
                 fac = qd.factorize(K_upper.indptr, K_upper.indices, K_upper.data, nsys, perm=perm)
                 D = fac.D
                 num_pos = int(np.sum(D > 0))
                 num_neg = int(np.sum(D < 0))
                 num_zero = int(np.sum(np.abs(D) < 1e-12))
 
-                nvar = n + mE
-                if num_pos == n and num_neg == mE and num_zero == 0:
-                    self._delta_w_last = delta_w
-                    sol = qd.solve_refine(fac, rhs, refine_iters) if refine_iters > 0 else qd.solve(fac, rhs)
-                    return (sol[:n], sol[n:]) if mE > 0 else (sol, np.zeros(0))
+                if mE > 0:
+                    if num_pos == n and num_neg == mE and num_zero == 0:
+                        self._delta_w_last = delta_w
+                        sol = qd.solve_refine(fac, rhs, refine_iters) if refine_iters > 0 else qd.solve(fac, rhs)
+                        return sol[:n], sol[n:]
+                else:
+                    if num_pos == n and num_neg == 0 and num_zero == 0:
+                        self._delta_w_last = delta_w
+                        sol = qd.solve_refine(fac, rhs, refine_iters) if refine_iters > 0 else qd.solve(fac, rhs)
+                        return sol, np.zeros(0)
 
-                if num_zero > 0:
+                # adjust regularization if inertia not as desired
+                if num_zero > 0 or (mE > 0 and num_neg != mE):
                     delta_c = max(delta_c, 1e-8)
 
                 if delta_w_last == 0:
@@ -587,10 +753,14 @@ class InteriorPointStepper:
                 attempts += 1
 
             except Exception:
+                # Ultimate fallback to SciPy solve
                 sol = spla.spsolve(K.tocsc(), rhs)
-                return (sol[:n], sol[n:]) if mE > 0 else (sol, np.zeros(0))
+                if mE > 0:
+                    return sol[:n], sol[n:]
+                return sol, np.zeros(0)
 
         return None, None  # failed
+
 
     # ---------- error ----------
     def _compute_error(self, model: Model, x, lam, nu, zL, zU, mu: float = 0.0) -> float:
@@ -624,6 +794,38 @@ class InteriorPointStepper:
             (np.linalg.norm(r_comp_slacks, np.inf) / s_c) if r_comp_slacks.size > 0 else 0.0,
         )
         return err
+
+    # ---------- shifted barrier utilities ----------
+    def _compute_shifted_complementarity(self, s: np.ndarray, lam: np.ndarray, mu: float, tau_shift: float) -> np.ndarray:
+        """Compute shifted complementarity: (s + τ) * λ - μ"""
+        if s.size == 0:
+            return np.zeros(0)
+        return (s + tau_shift) * lam - mu
+
+    def _compute_shifted_sigma_slacks(self, s: np.ndarray, lam: np.ndarray, tau_shift: float, eps_abs: float = 1e-8, cap_val: float = 1e8) -> np.ndarray:
+        """Compute Σ for shifted barrier: Σ = λ/(s + τ)"""
+        if s.size == 0:
+            return np.zeros(0)
+        return np.clip(lam / np.maximum(s + tau_shift, eps_abs), 0.0, cap_val)
+
+    def _adaptive_shift_update(self, s: np.ndarray, cI: np.ndarray, it: int) -> float:
+        """Adaptive shift parameter based on problem conditioning"""
+        if s.size == 0:
+            return 0.0
+        
+        # Simple heuristic: increase shift when slacks are very small or constraints are badly violated
+        min_slack = np.min(s) if s.size > 0 else 1.0
+        max_viol = np.max(np.abs(cI)) if self.mI > 0 else 0.0
+        
+        # Base shift increases with iterations and problem difficulty
+        base_shift = float(getattr(self.cfg, "ip_shift_tau", 0.1))
+        
+        if min_slack < 1e-6 or max_viol > 1e2:
+            return min(1.0, base_shift * (1.0 + 0.1 * it))
+        elif min_slack > 1e-2 and max_viol < 1e-2:
+            return max(0.0, base_shift * (1.0 - 0.05 * it))
+        else:
+            return base_shift
 
     # ---------- feasibility restoration ----------
     def _feasibility_restoration(self, model: Model, x: np.ndarray, mu: float, flt: Filter):
@@ -714,6 +916,9 @@ class InteriorPointStepper:
 
         d_new = model.eval_all(best_x, components=["cI"])
         cI_new = _as_array_or_zeros(d_new.get("cI", None), model.m_ineq)
+        
+        # Update slacks considering shifted barrier
+        tau_shift = float(getattr(self.cfg, "ip_shift_tau", 0.0)) if self.cfg.ip_use_shifted_barrier else 0.0
         self.s = np.maximum(1e-8, -cI_new) if cI_new.size else np.zeros(0)
 
         print(f"[Restoration] success: θ {theta_R:.3e} → {best_theta:.3e}")
@@ -739,8 +944,15 @@ class InteriorPointStepper:
         zL = st.zL.copy()
         zU = st.zU.copy()
         mu = float(st.mu)
-        tau = max(self.cfg.ip_tau_min, self.cfg.ip_tau)
-
+        
+        # NEW: get shift parameters
+        use_shifted = bool(getattr(self.cfg, "ip_use_shifted_barrier", False))
+        #print(f"Iteration {it}: μ={mu:.2e}, shifted barrier={'on' if use_shifted else 'off'}")
+        tau_shift = float(st.tau_shift) if use_shifted else 0.0
+        #print(f"  Shift parameter τ: {tau_shift:.2e}")
+        bound_shift = float(getattr(self.cfg, "ip_shift_bounds", 0.0)) if use_shifted else 0.0
+        #print(f"  Bound shift parameter τ_bound: {bound_shift:.2e}")
+        
         # evaluate model
         data = model.eval_all(x, components=["f", "g", "cI", "JI", "cE", "JE"])
         f = float(data["f"])
@@ -755,6 +967,13 @@ class InteriorPointStepper:
         self.mE = mE
         self.s = s
 
+        # Adaptive shift update if enabled
+        if use_shifted and getattr(self.cfg, "ip_shift_adaptive", False):
+            tau_shift = self._adaptive_shift_update(s, cI, it)  # Will get cI below
+            st.tau_shift = tau_shift
+        
+        tau = max(self.cfg.ip_tau_min, self.cfg.ip_tau)
+        
         # bounds & slacks
         lb, ub, hasL, hasU = _get_bounds(model, x)
         sL = np.where(hasL, np.maximum(1e-12, x - lb), 1.0)
@@ -766,7 +985,7 @@ class InteriorPointStepper:
             bad |= (not np.all(np.isfinite(s))) or np.any(s <= 0) or (not np.all(np.isfinite(lmb))) or np.any(lmb <= 0)
         bad |= (not np.all(np.isfinite(zL))) or np.any(zL < 0) or (not np.all(np.isfinite(zU))) or np.any(zU < 0)
         if bad:
-            s, lmb, zL, zU = self._safe_reinit_slacks_duals(cI, JI, x, lb, ub, hasL, hasU, mu)
+            s, lmb, zL, zU = self._safe_reinit_slacks_duals(cI, JI, x, lb, ub, hasL, hasU, mu, tau_shift)
             sL = np.where(hasL, np.maximum(1e-12, x - lb), 1.0)
             sU = np.where(hasU, np.maximum(1e-12, ub - x), 1.0)
 
@@ -793,16 +1012,23 @@ class InteriorPointStepper:
             }
             return x, lmb, nuv, info
 
-        # robust Σ
+        # robust Σ - modified for shifted barrier
         eps_abs = float(getattr(self.cfg, "sigma_eps_abs", 1e-8))
         cap_val = float(getattr(self.cfg, "sigma_cap", 1e8))
-        Sigma_L = np.where(hasL, zL / np.maximum(sL, eps_abs), 0.0)
-        Sigma_U = np.where(hasU, zU / np.maximum(sU, eps_abs), 0.0)
+        
+        # Bounds use separate shift parameter
+        Sigma_L = np.where(hasL, zL / np.maximum(sL + bound_shift, eps_abs), 0.0)
+        Sigma_U = np.where(hasU, zU / np.maximum(sU + bound_shift, eps_abs), 0.0)
         Sigma_x_vec = np.clip(Sigma_L + Sigma_U, 0.0, cap_val)
+        
+        # Slacks use main shift parameter
         if mI > 0:
-            s_floor = np.maximum(1e-8, np.minimum(1.0, np.abs(cI)))
-            s_safe = np.maximum(s, s_floor)
-            Sigma_s_vec = np.clip(lmb / np.maximum(s_safe, eps_abs), 0.0, cap_val)
+            if use_shifted:
+                Sigma_s_vec = self._compute_shifted_sigma_slacks(s, lmb, tau_shift, eps_abs, cap_val)
+            else:
+                s_floor = np.maximum(1e-8, np.minimum(1.0, np.abs(cI)))
+                s_safe = np.maximum(s, s_floor)
+                Sigma_s_vec = np.clip(lmb / np.maximum(s_safe, eps_abs), 0.0, cap_val)
         else:
             Sigma_s_vec = np.zeros(0)
 
@@ -815,15 +1041,29 @@ class InteriorPointStepper:
         # predictor: Mehrotra affine
         dx_aff, dnu_aff = self.solve_KKT(
             W, -r_d, JE, r_pE,
-            method=getattr(self.cfg, "ip_kkt_method", "lifted"), cg_tol=1e-8, cg_maxit=200
+            method="hykkt", cg_tol=1e-8, cg_maxit=200
         )
         if dx_aff is None:
             dx_aff, dnu_aff = self.solve_KKT(W, -r_d, JE, r_pE, method="qdldl")
 
         ds_aff = (-r_pI - (JI @ dx_aff if (mI > 0 and JI is not None) else 0)) if mI > 0 else np.zeros(0)
-        dlam_aff = (-(s * lmb) - lmb * ds_aff) / np.maximum(s, 1e-16) if mI > 0 else np.zeros(0)
-        dzL_aff = np.where(hasL, (-sL * zL - zL * dx_aff) / np.maximum(sL, 1e-16), 0.0)
-        dzU_aff = np.where(hasU, (-sU * zU + zU * dx_aff) / np.maximum(sU, 1e-16), 0.0)
+        
+        # Modified for shifted barrier: solve (s + τ) * dlam + lam * ds = -(s + τ) * lam
+        if mI > 0 and use_shifted:
+            s_tau = s + tau_shift
+            dlam_aff = (-(s_tau * lmb) - lmb * ds_aff) / np.maximum(s_tau, 1e-16)
+        else:
+            dlam_aff = (-(s * lmb) - lmb * ds_aff) / np.maximum(s, 1e-16) if mI > 0 else np.zeros(0)
+        
+        # Bounds dual steps (can also use shift)
+        if use_shifted and bound_shift > 0:
+            sL_shift = sL + bound_shift
+            sU_shift = sU + bound_shift
+            dzL_aff = np.where(hasL, (-(sL_shift * zL) - zL * dx_aff) / np.maximum(sL_shift, 1e-16), 0.0)
+            dzU_aff = np.where(hasU, (-(sU_shift * zU) + zU * dx_aff) / np.maximum(sU_shift, 1e-16), 0.0)
+        else:
+            dzL_aff = np.where(hasL, (-sL * zL - zL * dx_aff) / np.maximum(sL, 1e-16), 0.0)
+            dzU_aff = np.where(hasU, (-sU * zU + zU * dx_aff) / np.maximum(sU, 1e-16), 0.0)
 
         # fraction-to-boundary for affine
         def _ftb_pos(z, dz):
@@ -847,15 +1087,28 @@ class InteriorPointStepper:
         if mI > 0:
             s_aff = s + alpha_aff * ds_aff
             lam_aff = lmb + alpha_aff * dlam_aff
-            parts.append(np.dot(s_aff, lam_aff))
+            # Modified complementarity for shifted barrier
+            if use_shifted:
+                parts.append(np.dot(s_aff + tau_shift, lam_aff))
+            else:
+                parts.append(np.dot(s_aff, lam_aff))
+                
         if np.any(hasL):
             sL_aff = sL + alpha_aff * dx_aff
             zL_aff = zL + alpha_aff * dzL_aff
-            parts.append(np.dot(sL_aff[hasL], zL_aff[hasL]))
+            if use_shifted and bound_shift > 0:
+                parts.append(np.dot((sL_aff + bound_shift)[hasL], zL_aff[hasL]))
+            else:
+                parts.append(np.dot(sL_aff[hasL], zL_aff[hasL]))
+                
         if np.any(hasU):
             sU_aff = sU - alpha_aff * dx_aff
             zU_aff = zU + alpha_aff * dzU_aff
-            parts.append(np.dot(sU_aff[hasU], zU_aff[hasU]))
+            if use_shifted and bound_shift > 0:
+                parts.append(np.dot((sU_aff + bound_shift)[hasU], zU_aff[hasU]))
+            else:
+                parts.append(np.dot(sU_aff[hasU], zU_aff[hasU]))
+                
         denom = (mI + int(np.sum(hasL)) + int(np.sum(hasU)))
         mu_aff = max(mu_min, (sum(parts) / max(1, denom)) if parts else mu)
 
@@ -868,44 +1121,81 @@ class InteriorPointStepper:
 
         comp_scale = 0.0
         if mI > 0:
-            comp_scale += float(np.dot(s, lmb)) / max(1, mI)
+            if use_shifted:
+                comp_scale += float(np.dot(s + tau_shift, lmb)) / max(1, mI)
+            else:
+                comp_scale += float(np.dot(s, lmb)) / max(1, mI)
         if np.any(hasL):
-            comp_scale += float(np.sum((x[hasL] - lb[hasL]) * zL[hasL])) / max(1, int(np.sum(hasL)))
+            if use_shifted and bound_shift > 0:
+                comp_scale += float(np.sum((x[hasL] - lb[hasL] + bound_shift) * zL[hasL])) / max(1, int(np.sum(hasL)))
+            else:
+                comp_scale += float(np.sum((x[hasL] - lb[hasL]) * zL[hasL])) / max(1, int(np.sum(hasL)))
         if np.any(hasU):
-            comp_scale += float(np.sum((ub[hasU] - x[hasU]) * zU[hasU])) / max(1, int(np.sum(hasU)))
+            if use_shifted and bound_shift > 0:
+                comp_scale += float(np.sum((ub[hasU] - x[hasU] + bound_shift) * zU[hasU])) / max(1, int(np.sum(hasU)))
+            else:
+                comp_scale += float(np.sum((ub[hasU] - x[hasU]) * zU[hasU])) / max(1, int(np.sum(hasU)))
+                
         if comp_scale > 10.0 * mu:
             mu = min(comp_scale, 10.0)
 
         mu = max(mu_min, sigma * mu_aff)
 
-        # corrector: centrality RHS (lightweight)
+        # corrector: centrality RHS (modified for shifted barrier)
         if mI > 0:
-            rc_s = (mu - s * lmb)
-            rhs_x += (JI.T @ (_diag(Sigma_s_vec) @ (rc_s / np.maximum(lmb, 1e-12))))
+            if use_shifted:
+                rc_s = (mu - (s + tau_shift) * lmb)
+                rhs_x += (JI.T @ (_diag(Sigma_s_vec) @ (rc_s / np.maximum(lmb, 1e-12))))
+            else:
+                rc_s = (mu - s * lmb)
+                rhs_x += (JI.T @ (_diag(Sigma_s_vec) @ (rc_s / np.maximum(lmb, 1e-12))))
+                
         if np.any(hasL):
-            rc_L = (mu - sL * zL)
-            rhs_x += np.where(hasL, rc_L / np.maximum(sL, 1e-12), 0.0)
+            if use_shifted and bound_shift > 0:
+                rc_L = (mu - (sL + bound_shift) * zL)
+                rhs_x += np.where(hasL, rc_L / np.maximum(sL + bound_shift, 1e-12), 0.0)
+            else:
+                rc_L = (mu - sL * zL)
+                rhs_x += np.where(hasL, rc_L / np.maximum(sL, 1e-12), 0.0)
+                
         if np.any(hasU):
-            rc_U = (mu - sU * zU)
-            rhs_x -= np.where(hasU, rc_U / np.maximum(sU, 1e-12), 0.0)
+            if use_shifted and bound_shift > 0:
+                rc_U = (mu - (sU + bound_shift) * zU)
+                rhs_x -= np.where(hasU, rc_U / np.maximum(sU + bound_shift, 1e-12), 0.0)
+            else:
+                rc_U = (mu - sU * zU)
+                rhs_x -= np.where(hasU, rc_U / np.maximum(sU, 1e-12), 0.0)
 
         # corrector solve
         dx, dnu = self.solve_KKT(
             W, rhs_x, JE, r_pE,
-            method=getattr(self.cfg, "ip_kkt_method", "lifted"),
+            method="hykkt",
             cg_tol=1e-8, cg_maxit=200
         )
         if dx is None:
             dx, dnu = self.solve_KKT(W, rhs_x, JE, r_pE, method="qdldl")
             
-        # recover ds, dλ
+        # recover ds, dλ (modified for shifted barrier)
         ds = (-r_pI - (JI @ dx if (mI > 0 and JI is not None) else 0)) if mI > 0 else np.zeros(0)
-        dlam = ((-(lmb - mu / np.maximum(s, 1e-16)) - _safe_pos_div(mu, s**2, eps=eps_abs) * ds)
-                if mI > 0 else np.zeros(0))
+        
+        if mI > 0:
+            if use_shifted:
+                s_tau = s + tau_shift
+                dlam = (mu - s_tau * lmb - lmb * ds) / np.maximum(s_tau, 1e-16)
+            else:
+                dlam = (mu - s * lmb - lmb * ds) / np.maximum(s, 1e-16)
+        else:
+            dlam = np.zeros(0)
 
-        # bound duals steps via complementarity linearization
-        dzL = np.where(hasL, _safe_pos_div(mu - sL * zL - zL * dx, sL, eps=eps_abs), 0.0)
-        dzU = np.where(hasU, _safe_pos_div(mu - sU * zU + zU * dx, sU, eps=eps_abs), 0.0)
+        # bound duals steps via complementarity linearization (modified for shifted barrier)
+        if use_shifted and bound_shift > 0:
+            sL_shift = sL + bound_shift
+            sU_shift = sU + bound_shift
+            dzL = np.where(hasL, _safe_pos_div(mu - sL_shift * zL - zL * dx, sL_shift, eps=eps_abs), 0.0)
+            dzU = np.where(hasU, _safe_pos_div(mu - sU_shift * zU + zU * dx, sU_shift, eps=eps_abs), 0.0)
+        else:
+            dzL = np.where(hasL, _safe_pos_div(mu - sL * zL - zL * dx, sL, eps=eps_abs), 0.0)
+            dzU = np.where(hasU, _safe_pos_div(mu - sU * zU + zU * dx, sU, eps=eps_abs), 0.0)
 
         # ----- Optional higher-order (2nd-order) correction -----
         if getattr(self.cfg, "ip_enable_higher_order", False) and dx.size:
@@ -941,18 +1231,27 @@ class InteriorPointStepper:
                 if mI > 0:
                     ds2   = -(JI @ dx2) if JI is not None else np.zeros(mI)
                     ds   += tau2 * ds2
-                    dlam += tau2 * ( - _safe_pos_div(mu, np.maximum(s,1e-16)**2, eps=eps_abs) * ds2 )
+                    if use_shifted:
+                        s_tau = s + tau_shift
+                        dlam += tau2 * ( (mu - s_tau * lmb - lmb * ds2) / np.maximum(s_tau, 1e-16) )
+                    else:
+                        dlam += tau2 * ( (mu - s * lmb - lmb * ds2) / np.maximum(s, 1e-16) )
 
-                # Bound dual corrections (linearized)
+                # Bound dual corrections (linearized, modified for shifted barrier)
                 if np.any(hasL):
-                    dzL += tau2 * _safe_pos_div(- zL * dx2, sL, eps=eps_abs)
+                    if use_shifted and bound_shift > 0:
+                        dzL += tau2 * _safe_pos_div(- zL * dx2, sL + bound_shift, eps=eps_abs)
+                    else:
+                        dzL += tau2 * _safe_pos_div(- zL * dx2, sL, eps=eps_abs)
                 if np.any(hasU):
-                    dzU += tau2 * _safe_pos_div(  zU * dx2, sU, eps=eps_abs)
+                    if use_shifted and bound_shift > 0:
+                        dzU += tau2 * _safe_pos_div(  zU * dx2, sU + bound_shift, eps=eps_abs)
+                    else:
+                        dzU += tau2 * _safe_pos_div(  zU * dx2, sU, eps=eps_abs)
 
             except Exception:
                 # If anything goes weird, just skip the HO step
                 pass
-
 
         # tiny x trust-region cap
         dx_norm = float(np.linalg.norm(dx))
@@ -1000,7 +1299,7 @@ class InteriorPointStepper:
                 return x_new, lmb_new, nu_new, info
             except ValueError:
                 # recenter at current x: reset pairs and take tiny safe step along -g
-                s, lmb, zL, zU = self._safe_reinit_slacks_duals(cI, JI, x, lb, ub, hasL, hasU, mu=max(mu, 1e-2))
+                s, lmb, zL, zU = self._safe_reinit_slacks_duals(cI, JI, x, lb, ub, hasL, hasU, mu=max(mu, 1e-2), tau_shift=tau_shift)
                 dxf = -g / max(1.0, np.linalg.norm(g))
                 alpha = min(alpha_max, 1e-2)
                 x_new = x + alpha * dxf
@@ -1015,7 +1314,7 @@ class InteriorPointStepper:
                 st.s, st.lam, st.nu, st.zL, st.zU = s, lmb, nuv, zL, zU
                 return x_new, lmb, nuv, info
 
-        # accept step (cap bound duals with σ-neighborhood)
+        # accept step (cap bound duals with σ-neighborhood, modified for shifted barrier)
         alpha_bz = alpha  # we already limited by fraction-to-boundary for z via dz formulas
         x_new  = x + alpha * dx
         s_new  = s + alpha * ds if mI > 0 else s
@@ -1027,12 +1326,24 @@ class InteriorPointStepper:
         ksig = 1e10  # big box to avoid collapse but keep positivity
         sL_new = np.where(hasL, x_new - lb, 1.0)
         sU_new = np.where(hasU, ub - x_new, 1.0)
+        
         if np.any(hasL):
-            sL_clip = np.maximum(sL_new, 1e-16)
-            zL_new = np.maximum(mu / (ksig * sL_clip), np.minimum(zL_new, ksig * mu / sL_clip))
+            if use_shifted and bound_shift > 0:
+                sL_shift_new = sL_new + bound_shift
+                sL_clip = np.maximum(sL_shift_new, 1e-16)
+                zL_new = np.maximum(mu / (ksig * sL_clip), np.minimum(zL_new, ksig * mu / sL_clip))
+            else:
+                sL_clip = np.maximum(sL_new, 1e-16)
+                zL_new = np.maximum(mu / (ksig * sL_clip), np.minimum(zL_new, ksig * mu / sL_clip))
+                
         if np.any(hasU):
-            sU_clip = np.maximum(sU_new, 1e-16)
-            zU_new = np.maximum(mu / (ksig * sU_clip), np.minimum(zU_new, ksig * mu / sU_clip))
+            if use_shifted and bound_shift > 0:
+                sU_shift_new = sU_new + bound_shift
+                sU_clip = np.maximum(sU_shift_new, 1e-16)
+                zU_new = np.maximum(mu / (ksig * sU_clip), np.minimum(zU_new, ksig * mu / sU_clip))
+            else:
+                sU_clip = np.maximum(sU_new, 1e-16)
+                zU_new = np.maximum(mu / (ksig * sU_clip), np.minimum(zU_new, ksig * mu / sU_clip))
 
         # recompute at x_new (for report)
         data_new = model.eval_all(x_new, ["f", "g", "cI", "JI", "cE", "JE"])
@@ -1049,9 +1360,15 @@ class InteriorPointStepper:
             + (JE_new.T @ nu_new  if (mE > 0 and JE_new is not None) else 0) \
             - zL_new + zU_new
 
-        r_comp_L_new = np.where(hasL, (x_new - lb) * zL_new - mu, 0.0) if np.any(hasL) else 0.0
-        r_comp_U_new = np.where(hasU, (ub - x_new) * zU_new - mu, 0.0) if np.any(hasU) else 0.0
-        r_comp_s_new = (s_new * lmb_new - mu) if mI > 0 else np.zeros(0)
+        # Modified complementarity residuals for shifted barrier
+        if use_shifted:
+            r_comp_L_new = np.where(hasL, (x_new - lb + bound_shift) * zL_new - mu, 0.0) if np.any(hasL) else 0.0
+            r_comp_U_new = np.where(hasU, (ub - x_new + bound_shift) * zU_new - mu, 0.0) if np.any(hasU) else 0.0
+            r_comp_s_new = ((s_new + tau_shift) * lmb_new - mu) if mI > 0 else np.zeros(0)
+        else:
+            r_comp_L_new = np.where(hasL, (x_new - lb) * zL_new - mu, 0.0) if np.any(hasL) else 0.0
+            r_comp_U_new = np.where(hasU, (ub - x_new) * zU_new - mu, 0.0) if np.any(hasU) else 0.0
+            r_comp_s_new = (s_new * lmb_new - mu) if mI > 0 else np.zeros(0)
 
         kkt_new = {
             "stat": np.linalg.norm(r_d_new, np.inf),
@@ -1084,8 +1401,11 @@ class InteriorPointStepper:
             "rho": 0.0,
             "tr_radius": (self.tr.radius if self.tr else 0.0),
             "mu": mu,
+            "shifted_barrier": use_shifted,  # NEW: report if shifted barrier was used
+            "tau_shift": tau_shift,          # NEW: report shift parameter
         }
 
         # persist state
         st.s, st.lam, st.nu, st.zL, st.zU, st.mu = (s_new, lmb_new, nu_new, zL_new, zU_new, mu)
+        st.tau_shift = tau_shift  # NEW: persist shift parameter
         return x_new, lmb_new, nu_new, info

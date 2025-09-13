@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <numeric> // <-- required for std::iota
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -37,7 +37,6 @@ struct LP {
 // Helpers for infinities
 inline double inf() { return std::numeric_limits<double>::infinity(); }
 inline double ninf() { return -std::numeric_limits<double>::infinity(); }
-
 inline bool is_finite(double v) { return std::isfinite(v); }
 
 // ------------------------------
@@ -119,7 +118,7 @@ struct PresolveResult {
     std::vector<int> orig_row_index; // reduced->original row map
     double obj_shift = 0.0;
     bool proven_infeasible = false;
-    bool proven_unbounded = false; // NEW: track unboundedness
+    bool proven_unbounded = false; // track unboundedness
 };
 
 // ------------------------------
@@ -136,7 +135,7 @@ inline ActivityBounds row_activity_bounds(const Eigen::RowVectorXd &a,
     ActivityBounds ab{0.0, 0.0};
     const int n = (int)a.size();
     for (int j = 0; j < n; ++j) {
-        double coeff = a(j);
+        const double coeff = a(j);
         if (coeff >= 0.0) {
             ab.min_act +=
                 coeff *
@@ -161,22 +160,24 @@ enum class RowReduceMethod { RRQR, SVD, Auto };
 class Presolver {
 public:
     struct Options {
-        double svd_tol;          // 1e-9
+        double svd_tol;          // 1e-8
         double zero_tol;         // 1e-12
         double infeas_tol;       // 1e-9
         int max_passes;          // 10
         bool enable_rowreduce;   // true
-        bool enable_scaling;     // true
-        bool classic_row_reduce; // use the old SVD row-reduction
-        double rr_infeas_mult;   // multiplier for residual test (= 1e3)
-        bool conservative_mode;  // NEW: be more conservative with degenerate
-                                 // problems
+        bool enable_scaling;     // true (rows)
+        bool classic_row_reduce; // legacy switch
+        double rr_infeas_mult;   // (= 1e3)
+        bool conservative_mode;  // be more conservative
 
-        double rrqr_pivot_tol = 1e-8; // minimum diag(R) magnitude to consider
-        int max_ruiz_iters = 3; // internal balancing iterations for rank test
+        double rrqr_pivot_tol = 1e-8; // minimum diag(R) magnitude
+        int max_ruiz_iters = 3;       // iterations for rank-test balancing
         RowReduceMethod row_reduce_method = RowReduceMethod::Auto;
-        bool use_iter_refine = true; // refine Ur^T b if badly conditioned
+        bool use_iter_refine = true; // refine Ur^T b
         double cond_max = 1e10;
+
+        // NEW: optional column scaling (balanced 1/∞ norms)
+        bool enable_col_scaling = true;
 
         Options()
             : svd_tol(1e-8), zero_tol(1e-12), infeas_tol(1e-9), max_passes(10),
@@ -187,6 +188,9 @@ public:
 
     Presolver() : opt_() {}
     explicit Presolver(const Options &opt) : opt_(opt) {}
+
+    // Compatibility alias for callers expecting Presolver::Result
+    using Result = PresolveResult;
 
     PresolveResult run(const LP &in) {
         res_.stack.clear();
@@ -203,23 +207,36 @@ public:
         std::iota(res_.orig_row_index.begin(), res_.orig_row_index.end(), 0);
         std::iota(res_.orig_col_index.begin(), res_.orig_col_index.end(), 0);
 
-        // Basic sanity
+        // Sanity
         if ((int)P.sense.size() != (int)P.b.size())
-            throw std::invalid_argument("sense size mismatch with b");
+            throw std::invalid_argument("presolve: sense size mismatch with b");
+        if ((int)P.l.size() != n0 || (int)P.u.size() != n0 ||
+            (int)P.c.size() != n0)
+            throw std::invalid_argument("presolve: vector sizes must equal n");
 
-        // NEW: Early unboundedness detection
+        // Early bound contradictions
+        if (!check_and_fix_bounds(P)) {
+            res_.reduced = std::move(P);
+            res_.proven_infeasible = true;
+            return res_;
+        }
+
+        // Early unboundedness detection (safe/conservative)
         if (detect_unboundedness(P)) {
             res_.reduced = std::move(P);
             res_.proven_unbounded = true;
             return res_;
         }
 
-        // 0) Simple scaling (optional): normalize row infinity norm to ~1
+        // 0) Row scaling (optional): normalize row infinity norm to ~1
         if (opt_.enable_scaling)
             scale_rows_unit_inf(P);
 
-        // 1) RowReduce (SVD) to drop obvious linear dependencies / detect
-        // inconsistency
+        // 0b) Column scaling (optional): normalize col infinity norm to ~1
+        if (opt_.enable_col_scaling)
+            scale_cols_unit_inf(P);
+
+        // 1) RowReduce to drop dependencies / detect inconsistency
         if (opt_.enable_rowreduce) {
             if (!row_reduce(P)) {
                 res_.reduced = std::move(P);
@@ -228,13 +245,12 @@ public:
             }
         }
 
-        // Outer rule passes
+        // Outer passes
         int pass = 0;
         bool changed = true;
         while (changed && pass < opt_.max_passes) {
             changed = false;
 
-            // Check for unboundedness after each major change
             if (detect_unboundedness(P)) {
                 res_.reduced = std::move(P);
                 res_.proven_unbounded = true;
@@ -244,16 +260,20 @@ public:
             changed |= remove_free_zero_rows(P);
             if (res_.proven_infeasible)
                 break;
+
             changed |= fixed_variable_detection(P);
             changed |= singleton_row_elimination(P);
             if (res_.proven_infeasible)
                 break;
+
             changed |= singleton_column_elimination(P);
             changed |= tighten_bounds_by_rows(P);
             if (res_.proven_infeasible)
                 break;
+
             changed |= redundancy_duplicate_rows(P);
             changed |= safe_dual_cost_fixing(P);
+
             ++pass;
         }
 
@@ -274,7 +294,6 @@ public:
     // Lift a reduced-space solution back to original space
     std::pair<Eigen::VectorXd, double>
     postsolve(const Eigen::VectorXd &x_red) const {
-        // Start with reduced x placed into original index slots
         const int n_full_guess = (int)res_.orig_col_index.size();
         Eigen::VectorXd x_full = Eigen::VectorXd::Constant(
             n_full_guess, std::numeric_limits<double>::quiet_NaN());
@@ -299,11 +318,10 @@ public:
         return {x_full, obj_correction};
     }
 
-    const PresolveResult &result() const { return res_; }
+    const PresolveResult &result() const noexcept { return res_; }
 
 private:
     static double cond2_estimate_upper(const Eigen::MatrixXd &R11) {
-        // Robust and small: exact SVD on r x r (r is the tentative rank)
         if (R11.size() == 0)
             return 0.0;
         Eigen::JacobiSVD<Eigen::MatrixXd> svd(R11, Eigen::ComputeThinU |
@@ -316,7 +334,6 @@ private:
     }
 
     // In-place tiny Ruiz equilibration (for *rank decision only*).
-    // Returns pair of diagonal scalings (Dr, Dc) such that A_bal = Dr * A * Dc.
     static std::pair<Eigen::VectorXd, Eigen::VectorXd>
     ruiz_balance(Eigen::MatrixXd &A, int iters, double floor = 1e-12) {
         const int m = (int)A.rows();
@@ -344,60 +361,51 @@ private:
         return {Dr, Dc};
     }
 
-    // NEW: Detect unboundedness in the problem
-    bool detect_unboundedness(const LP &P) {
+    // Detect unboundedness (conservative): a single variable can move
+    // indefinitely improving the objective without violating any row.
+    bool detect_unboundedness(const LP &P) const {
         const int n = (int)P.A.cols();
         const int m = (int)P.A.rows();
-
         if (n == 0)
-            return false; // No variables
+            return false;
 
         for (int j = 0; j < n; ++j) {
-            // Check if variable j can be made arbitrarily large/small
-            bool can_increase = !is_finite(P.u(j));
-            bool can_decrease = !is_finite(P.l(j));
-
+            const bool can_increase = !is_finite(P.u(j));
+            const bool can_decrease = !is_finite(P.l(j));
             if (!can_increase && !can_decrease)
                 continue;
 
-            // Check if increasing/decreasing x_j violates any constraint
-            bool blocked_above = false, blocked_below = false;
-
+            bool blocks_plus = false, blocks_minus = false;
             for (int i = 0; i < m; ++i) {
-                double aij = P.A(i, j);
+                const double aij = P.A(i, j);
                 if (nearly_zero(aij, opt_.zero_tol))
                     continue;
 
-                // For x_j -> +inf
-                if (can_increase) {
-                    if ((P.sense[i] == RowSense::LE && aij > opt_.zero_tol) ||
-                        (P.sense[i] == RowSense::GE && aij < -opt_.zero_tol) ||
-                        (P.sense[i] == RowSense::EQ)) {
-                        blocked_above = true;
-                    }
+                if (P.sense[i] == RowSense::EQ) {
+                    blocks_plus =
+                        true; // equalities always block single-var drift
+                    blocks_minus = true;
+                    break;
                 }
-
-                // For x_j -> -inf
-                if (can_decrease) {
-                    if ((P.sense[i] == RowSense::LE && aij < -opt_.zero_tol) ||
-                        (P.sense[i] == RowSense::GE && aij > opt_.zero_tol) ||
-                        (P.sense[i] == RowSense::EQ)) {
-                        blocked_below = true;
-                    }
+                if (P.sense[i] == RowSense::LE) {
+                    if (aij > opt_.zero_tol)
+                        blocks_plus = true;
+                    if (aij < -opt_.zero_tol)
+                        blocks_minus = true;
+                } else if (P.sense[i] == RowSense::GE) {
+                    if (aij < -opt_.zero_tol)
+                        blocks_plus = true;
+                    if (aij > opt_.zero_tol)
+                        blocks_minus = true;
                 }
             }
 
-            // If objective coefficient suggests unboundedness
-            if (P.c(j) < -opt_.zero_tol && can_increase && !blocked_above) {
-                return true; // Can increase x_j indefinitely with improving
-                             // objective
-            }
-            if (P.c(j) > opt_.zero_tol && can_decrease && !blocked_below) {
-                return true; // Can decrease x_j indefinitely with improving
-                             // objective
-            }
+            // Objective direction must align with available drift
+            if (P.c(j) < -opt_.zero_tol && can_increase && !blocks_plus)
+                return true;
+            if (P.c(j) > opt_.zero_tol && can_decrease && !blocks_minus)
+                return true;
         }
-
         return false;
     }
 
@@ -405,7 +413,7 @@ private:
     void scale_rows_unit_inf(LP &P) {
         const int m = (int)P.A.rows();
         for (int i = 0; i < m; ++i) {
-            double s = P.A.row(i).cwiseAbs().maxCoeff();
+            const double s = P.A.row(i).cwiseAbs().maxCoeff();
             if (s > 0 && !nearly_zero(s, opt_.zero_tol) && std::isfinite(s)) {
                 P.A.row(i) /= s;
                 P.b(i) /= s;
@@ -414,7 +422,26 @@ private:
         }
     }
 
+    void scale_cols_unit_inf(LP &P) {
+        const int n = (int)P.A.cols();
+        for (int j = 0; j < n; ++j) {
+            const double s = P.A.col(j).cwiseAbs().maxCoeff();
+            if (s > 0 && !nearly_zero(s, opt_.zero_tol) && std::isfinite(s)) {
+                P.A.col(j) /= s;
+                // Update objective and bounds consistently: c^T x = (c*s)^T
+                // (x/s)
+                P.c(j) /= s;
+                if (is_finite(P.l(j)))
+                    P.l(j) *= s;
+                if (is_finite(P.u(j)))
+                    P.u(j) *= s;
+                res_.stack.emplace_back(ActScaleCol{j, s});
+            }
+        }
+    }
+
 private:
+    // --- Row reduce (SVD path) ---
     bool row_reduce_svd(LP &P) {
         using SVD = Eigen::BDCSVD<Eigen::MatrixXd>;
         const int m = (int)P.A.rows();
@@ -486,6 +513,7 @@ private:
         return true;
     }
 
+    // --- Dispatcher ---
     bool row_reduce(LP &P) {
         if (!opt_.enable_rowreduce)
             return true;
@@ -496,35 +524,31 @@ private:
             return row_reduce_svd(P);
         case RowReduceMethod::Auto:
         default:
-            // Try RRQR first; if it returns infeasible or fails feasibility
-            // tightening, row_reduce_rrqr() already falls back to SVD itself in
-            // tough cases.
-            return row_reduce_rrqr(P);
+            return row_reduce_rrqr(P); // falls back to SVD inside if needed
         }
     }
-    // === REPLACE row_reduce_rrqr(...) with this version ===
-private:
+
+    // --- RRQR-based row reduction (with fallback to SVD) ---
     bool row_reduce_rrqr(LP &P) {
         const int m = (int)P.A.rows();
         const int n = (int)P.A.cols();
         if (m == 0)
             return true;
 
-        // --- 1) Balance copies for stable rank decision (local; not recorded
-        // as actions)
+        // 1) Balance copies for stable rank decision (local)
         Eigen::MatrixXd A = P.A;
         Eigen::VectorXd b = P.b;
         if (opt_.max_ruiz_iters > 0) {
             auto [Dr, Dc] = ruiz_balance(A, opt_.max_ruiz_iters);
             for (int i = 0; i < m; ++i)
                 b(i) /= Dr(i);
-            (void)Dc; // not needed further in this routine
+            (void)Dc;
         }
 
-        // --- 2) Column-pivoted QR on A (m x n): A = Q * R * P^T
+        // 2) CPQR
         Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qrA(A);
         if (qrA.info() != Eigen::Success)
-            return true; // conservative: keep as-is
+            return true;
 
         const int kmax = std::min(m, n);
         Eigen::MatrixXd R = qrA.matrixR()
@@ -532,7 +556,7 @@ private:
                                 .template triangularView<Eigen::Upper>();
         Eigen::VectorXd diagR = R.diagonal().cwiseAbs();
 
-        // --- 3) SVD-like relative thresholding aligned with your SVD path
+        // 3) Thresholding
         const double eps = std::numeric_limits<double>::epsilon();
         const double dmax = (diagR.size() ? diagR.maxCoeff() : 0.0);
         const double rel_floor = 100.0 * eps * dmax;
@@ -540,16 +564,14 @@ private:
             std::max({opt_.rrqr_pivot_tol, opt_.svd_tol * dmax, rel_floor});
 
         int r = 0;
-        for (; r < diagR.size(); ++r) {
+        for (; r < diagR.size(); ++r)
             if (diagR(r) < rthr)
                 break;
-        }
 
         if (r == 0) {
-            // Guard against collapsing a "not tiny" matrix to m==0
             const double ainfn = P.A.cwiseAbs().rowwise().sum().maxCoeff();
             if (ainfn > 1e3 * eps)
-                return true; // keep as-is (conservative)
+                return true; // conservative
             if (P.b.lpNorm<Eigen::Infinity>() <= opt_.infeas_tol) {
                 res_.stack.emplace_back(ActRowReduce{
                     Eigen::MatrixXd::Zero(m, 0), Eigen::VectorXi(), m});
@@ -564,16 +586,14 @@ private:
             }
         }
 
-        // --- 4) Condition guard on R11; adjust r if too ill-conditioned
+        // 4) Condition guard
         auto cond_ok = [&](int rr) -> bool {
             if (rr <= 0)
                 return false;
             Eigen::MatrixXd R11 = R.topLeftCorner(rr, rr);
-            double kappa =
-                cond2_estimate_upper(R11); // uses tiny SVD on rr x rr
+            const double kappa = cond2_estimate_upper(R11);
             return (kappa <= opt_.cond_max || !std::isfinite(kappa));
         };
-
         int r_try = r;
         while (r_try <= (int)diagR.size()) {
             if (!cond_ok(r_try))
@@ -582,52 +602,44 @@ private:
         }
         r = std::max(1, std::min(r_try - 1, (int)diagR.size()));
 
-        // --- 5) Build Ur (m x r): first r columns of Q from HouseholderQR on
-        // ORIGINAL P.A (HouseholderQR has no .info(); constructing Q*r safely
-        // like this)
+        // 5) Build Ur from HouseholderQR on original P.A
         Eigen::HouseholderQR<Eigen::MatrixXd> qra_full(P.A);
         Eigen::MatrixXd Ur = Eigen::MatrixXd::Identity(m, r);
-        Ur = qra_full.householderQ() * Ur; // m x r orthonormal basis
+        Ur = qra_full.householderQ() * Ur;
 
-        // --- 6) Feasibility check: || (I - Ur Ur^T) b ||_∞ on ORIGINAL b
+        // 6) Feasibility check on ORIGINAL b
         Eigen::VectorXd resid = P.b - Ur * (Ur.transpose() * P.b);
         const double res_inf = resid.lpNorm<Eigen::Infinity>();
         const double allowed = opt_.rr_infeas_mult * opt_.infeas_tol *
                                std::max(1.0, P.b.lpNorm<Eigen::Infinity>());
 
         if (res_inf > allowed) {
-            // Try bumping rank once if possible; else fallback to SVD
             if (r < m && r + 1 <= (int)diagR.size() && cond_ok(r + 1)) {
                 ++r;
                 Ur = Eigen::MatrixXd::Identity(m, r);
                 Ur = qra_full.householderQ() * Ur;
                 resid = P.b - Ur * (Ur.transpose() * P.b);
             }
-            if (resid.lpNorm<Eigen::Infinity>() > allowed) {
+            if (resid.lpNorm<Eigen::Infinity>() > allowed)
                 return row_reduce_svd(P); // robust fallback
-            }
         }
 
-        // --- 7) Form reduced system: Ur^T A x = Ur^T b  (all equality)
+        // 7) Reduced system
         Eigen::MatrixXd Atil = Ur.transpose() * P.A; // r x n
         Eigen::VectorXd btil = Ur.transpose() * P.b; // r
-
-        // Optional single refinement of btil
         if (opt_.use_iter_refine) {
             Eigen::VectorXd corr = Ur.transpose() * (P.b - Ur * btil);
             btil += corr;
         }
 
-        // --- 8) Record reversible action and update model
+        // 8) Record & update
         Eigen::VectorXi keep(r);
         for (int i = 0; i < r; ++i)
             keep(i) = i;
         res_.stack.emplace_back(ActRowReduce{Ur, keep, m});
-
         P.A = std::move(Atil);
         P.b = std::move(btil);
         P.sense.assign(r, RowSense::EQ);
-
         res_.orig_row_index.resize(r);
         std::iota(res_.orig_row_index.begin(), res_.orig_row_index.end(), 0);
         return true;
@@ -635,10 +647,8 @@ private:
 
     // ---------- Remove zero/free rows; detect contradiction ----------
     bool remove_free_zero_rows(LP &P) {
-        const int m = (int)P.A.rows();
-        const int n = (int)P.A.cols();
         bool changed = false;
-        for (int i = 0; i < m; /*increment below*/) {
+        for (int i = 0; i < (int)P.A.rows(); /*increment below*/) {
             if (i >= (int)P.A.rows())
                 break;
             const auto row = P.A.row(i);
@@ -699,8 +709,7 @@ private:
                 const double rhs = P.b(i);
 
                 if (P.sense[i] == RowSense::EQ) {
-                    double xfix = rhs / aij;
-                    // IMPROVED: More careful bound checking
+                    const double xfix = rhs / aij;
                     if ((is_finite(P.l(nzj)) &&
                          xfix < P.l(nzj) - opt_.infeas_tol) ||
                         (is_finite(P.u(nzj)) &&
@@ -708,17 +717,11 @@ private:
                         res_.proven_infeasible = true;
                         return true;
                     }
-
-                    // CONSERVATIVE: In conservative mode, be more careful about
-                    // singleton elimination
                     if (opt_.conservative_mode && !is_finite(P.l(nzj)) &&
                         !is_finite(P.u(nzj))) {
-                        // Don't eliminate unbounded variables in conservative
-                        // mode
                         ++i;
                         continue;
                     }
-
                     const auto col = P.A.col(nzj);
                     P.b.noalias() -= col * xfix;
                     res_.obj_shift += P.c(nzj) * xfix;
@@ -732,7 +735,7 @@ private:
                     continue;
                 }
 
-                // For inequalities: derive bound tightening
+                // inequalities -> derive bound tightening
                 double newL = P.l(nzj), newU = P.u(nzj);
                 if (P.sense[i] == RowSense::LE) {
                     if (aij > 0)
@@ -782,17 +785,15 @@ private:
             if (j >= (int)P.A.cols())
                 break;
             if (nnz[j] == 1 && row_of[j] >= 0 && row_of[j] < (int)P.A.rows()) {
-                int i = row_of[j];
-                double aij = P.A(i, j);
+                const int i = row_of[j];
+                const double aij = P.A(i, j);
                 if (P.sense[i] == RowSense::EQ) {
-                    // CONSERVATIVE: Check bounds before elimination
                     if (opt_.conservative_mode &&
                         (!is_finite(P.l(j)) || !is_finite(P.u(j)))) {
                         ++j;
                         continue;
                     }
-
-                    double xfix = P.b(i) / aij;
+                    const double xfix = P.b(i) / aij;
                     if ((is_finite(P.l(j)) &&
                          xfix < P.l(j) - opt_.infeas_tol) ||
                         (is_finite(P.u(j)) &&
@@ -845,27 +846,34 @@ private:
 
             const int n = (int)P.A.cols();
             for (int j = 0; j < n; ++j) {
-                double aij = P.A(i, j);
+                const double aij = P.A(i, j);
                 if (nearly_zero(aij, opt_.zero_tol))
                     continue;
-                double other_min =
-                    ab.min_act - contrib(aij, P.l(j), P.u(j), true);
-                double other_max =
-                    ab.max_act - contrib(aij, P.l(j), P.u(j), false);
+
+                auto contrib = [&](bool take_min) {
+                    if (aij >= 0)
+                        return (take_min
+                                    ? aij * (is_finite(P.l(j)) ? P.l(j) : 0.0)
+                                    : aij * (is_finite(P.u(j)) ? P.u(j) : 0.0));
+                    else
+                        return (take_min
+                                    ? aij * (is_finite(P.u(j)) ? P.u(j) : 0.0)
+                                    : aij * (is_finite(P.l(j)) ? P.l(j) : 0.0));
+                };
+                const double other_min = ab.min_act - contrib(true);
+                const double other_max = ab.max_act - contrib(false);
 
                 double L = P.l(j), U = P.u(j);
                 if (P.sense[i] == RowSense::LE) {
-                    if (aij > 0 && is_finite(U)) {
+                    if (aij > 0 && is_finite(U))
                         U = std::min(U, (rhs - other_min) / aij);
-                    } else if (aij < 0 && is_finite(L)) {
+                    else if (aij < 0 && is_finite(L))
                         L = std::max(L, (rhs - other_min) / aij);
-                    }
                 } else if (P.sense[i] == RowSense::GE) {
-                    if (aij > 0 && is_finite(L)) {
+                    if (aij > 0 && is_finite(L))
                         L = std::max(L, (rhs - other_max) / aij);
-                    } else if (aij < 0 && is_finite(U)) {
+                    else if (aij < 0 && is_finite(U))
                         U = std::min(U, (rhs - other_max) / aij);
-                    }
                 } else { // EQ
                     if (aij > 0) {
                         if (is_finite(U))
@@ -897,8 +905,7 @@ private:
     // ---------- Redundancy: remove duplicate/zero rows ----------
     bool redundancy_duplicate_rows(LP &P) {
         bool changed = false;
-        const int m = (int)P.A.rows();
-        for (int i = 0; i < m; /*inc inside*/) {
+        for (int i = 0; i < (int)P.A.rows(); /*inc inside*/) {
             if (i >= (int)P.A.rows())
                 break;
             bool removed = false;
@@ -932,7 +939,6 @@ private:
                 break;
             const double cj = P.c(j);
 
-            // IMPROVED: More careful analysis for dual fixing
             if (opt_.conservative_mode && (std::abs(cj) < opt_.zero_tol)) {
                 ++j;
                 continue;
@@ -941,7 +947,7 @@ private:
             bool mono_increasing = true;
             bool mono_decreasing = true;
             for (int i = 0; i < m; ++i) {
-                double aij = P.A(i, j);
+                const double aij = P.A(i, j);
                 if (P.sense[i] == RowSense::LE) {
                     if (aij < -opt_.zero_tol)
                         mono_increasing = false;
@@ -952,18 +958,16 @@ private:
                         mono_increasing = false;
                     if (aij < -opt_.zero_tol)
                         mono_decreasing = false;
-                } else { // equality: breaks monotonic argument
-                    mono_increasing = false;
-                    mono_decreasing = false;
+                } else { // equality
+                    mono_increasing = mono_decreasing = false;
                     break;
                 }
             }
 
-            // IMPROVED: Only fix if we have finite bounds
             if ((cj >= opt_.zero_tol && mono_increasing && is_finite(P.l(j))) ||
                 (cj <= -opt_.zero_tol && mono_decreasing &&
                  is_finite(P.u(j)))) {
-                double xfix = (cj >= opt_.zero_tol) ? P.l(j) : P.u(j);
+                const double xfix = (cj >= opt_.zero_tol) ? P.l(j) : P.u(j);
                 const auto col = P.A.col(j);
                 P.b.noalias() -= col * xfix;
                 res_.obj_shift += P.c(j) * xfix;
@@ -990,8 +994,7 @@ private:
         P.A.conservativeResize(m - 1, n);
         P.b.conservativeResize(m - 1);
         P.sense.pop_back();
-        if (!res_.orig_row_index.empty() &&
-            (int)res_.orig_row_index.size() > m - 1) {
+        if ((int)res_.orig_row_index.size() == m) {
             res_.orig_row_index.erase(res_.orig_row_index.begin() + i);
         }
     }
@@ -1010,19 +1013,9 @@ private:
         P.l.conservativeResize(n - 1);
         P.u.conservativeResize(n - 1);
 
-        if (!res_.orig_col_index.empty() &&
-            (int)res_.orig_col_index.size() > n - 1) {
+        if ((int)res_.orig_col_index.size() == n) {
             res_.orig_col_index.erase(res_.orig_col_index.begin() + j);
         }
-    }
-
-    static double contrib(double aij, double lj, double uj, bool take_min) {
-        if (aij >= 0)
-            return (take_min ? aij * (is_finite(lj) ? lj : 0.0)
-                             : aij * (is_finite(uj) ? uj : 0.0));
-        else
-            return (take_min ? aij * (is_finite(uj) ? uj : 0.0)
-                             : aij * (is_finite(lj) ? lj : 0.0));
     }
 
     void prune_zero_rows(LP &P) {
@@ -1036,9 +1029,25 @@ private:
         }
     }
 
+    // ---------- Bounds sanity ----------
+    bool check_and_fix_bounds(LP &P) const {
+        const int n = (int)P.A.cols();
+        for (int j = 0; j < n; ++j) {
+            if (is_finite(P.l(j)) && is_finite(P.u(j)) &&
+                P.l(j) > P.u(j) + opt_.infeas_tol)
+                return false;
+            // Normalize tiny inversions
+            if (is_finite(P.l(j)) && is_finite(P.u(j)) && P.l(j) > P.u(j)) {
+                const double mid = 0.5 * (P.l(j) + P.u(j));
+                P.l(j) = P.u(j) = mid;
+            }
+        }
+        return true;
+    }
+
     // ---------- Undo actions (postsolve) ----------
-    static void undo_action(const ActScaleRow &a, Eigen::VectorXd &, double &) {
-        (void)a; // no effect on x or obj
+    static void undo_action(const ActScaleRow &, Eigen::VectorXd &, double &) {
+        // no effect on x or obj
     }
 
     static void undo_action(const ActScaleCol &a, Eigen::VectorXd &x,
@@ -1047,19 +1056,15 @@ private:
             x(a.j) /= a.scale;
     }
 
-    static void undo_action(const ActRemoveRow &a, Eigen::VectorXd &,
-                            double &) {
-        (void)a;
+    static void undo_action(const ActRemoveRow &, Eigen::VectorXd &, double &) {
     }
 
-    static void undo_action(const ActRowReduce &a, Eigen::VectorXd &,
-                            double &) {
-        (void)a; // row reduction didn't change x (only constraints)
+    static void undo_action(const ActRowReduce &, Eigen::VectorXd &, double &) {
+        // row reduction doesn't change x (only constraints)
     }
 
     static void undo_action(const ActFixVar &a, Eigen::VectorXd &x,
                             double &obj) {
-        // Reinsert x_j = x_fix
         if (a.j >= (int)x.size()) {
             Eigen::VectorXd xnew(a.j + 1);
             xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
@@ -1070,63 +1075,42 @@ private:
         obj += a.c_j * a.x_fix;
     }
 
-    static void undo_action(const ActTightenBound &a, Eigen::VectorXd &,
-                            double &) {
-        (void)a;
-    }
+    static void undo_action(const ActTightenBound &, Eigen::VectorXd &,
+                            double &) {}
 
     static void undo_action(const ActSingletonRowElim &a, Eigen::VectorXd &x,
-                            double &obj) {
-        // IMPROVED: Better reconstruction for singleton row elimination
+                            double &) {
         if (a.j >= (int)x.size()) {
             Eigen::VectorXd xnew(a.j + 1);
             xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
             xnew.head(x.size()) = x;
             x.swap(xnew);
         }
-
-        // For equality singleton rows, we can reconstruct exactly
         if (a.sense == RowSense::EQ && std::abs(a.aij) > 1e-12) {
-            // Calculate what other variables contribute to this row
-            double other_contrib = 0.0;
+            double other = 0.0;
             for (int k = 0; k < (int)a.row.size(); ++k) {
-                if (k != a.j && k < (int)x.size() && std::isfinite(x(k))) {
-                    other_contrib += a.row(k) * x(k);
-                }
+                if (k != a.j && k < (int)x.size() && std::isfinite(x(k)))
+                    other += a.row(k) * x(k);
             }
-            x(a.j) = (a.rhs - other_contrib) / a.aij;
-        } else if (!std::isfinite(x(a.j))) {
-            x(a.j) = 0.0; // fallback
-        }
-        (void)obj;
-    }
-
-    static void undo_action(const ActSingletonColElim &a, Eigen::VectorXd &x,
-                            double &obj) {
-        // IMPROVED: Better reconstruction for singleton column elimination
-        if (a.j >= (int)x.size()) {
-            Eigen::VectorXd xnew(a.j + 1);
-            xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
-            xnew.head(x.size()) = x;
-            x.swap(xnew);
-        }
-
-        // For singleton columns in equality rows, reconstruct from the
-        // constraint
-        if (a.i >= 0 && std::abs(a.aij) > 1e-12) {
-            // This was eliminated from an equality constraint
-            // We need the RHS value to reconstruct properly
-            // For now, use a safe fallback
-            if (!std::isfinite(x(a.j)))
-                x(a.j) = 0.0;
+            x(a.j) = (a.rhs - other) / a.aij;
         } else if (!std::isfinite(x(a.j))) {
             x(a.j) = 0.0;
         }
-        (void)obj;
     }
 
-    static void undo_action(const ActDualFix &a, Eigen::VectorXd &x,
-                            double &obj) {
+    static void undo_action(const ActSingletonColElim &a, Eigen::VectorXd &x,
+                            double &) {
+        if (a.j >= (int)x.size()) {
+            Eigen::VectorXd xnew(a.j + 1);
+            xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
+            xnew.head(x.size()) = x;
+            x.swap(xnew);
+        }
+        if (!std::isfinite(x(a.j)))
+            x(a.j) = 0.0; // safe fallback
+    }
+
+    static void undo_action(const ActDualFix &a, Eigen::VectorXd &x, double &) {
         if (a.j >= (int)x.size()) {
             Eigen::VectorXd xnew(a.j + 1);
             xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
@@ -1135,12 +1119,12 @@ private:
         }
         if (!std::isfinite(x(a.j)))
             x(a.j) = a.x_fix;
-        (void)obj;
     }
 
+    // Add alongside the other undo_action overloads:
     static void undo_action(const ActRemoveCol &a, Eigen::VectorXd &x,
                             double &obj) {
-        // IMPROVED: Better handling of removed columns
+        // Ensure x is large enough
         if (a.j >= (int)x.size()) {
             Eigen::VectorXd xnew(a.j + 1);
             xnew.setConstant(std::numeric_limits<double>::quiet_NaN());
@@ -1148,18 +1132,20 @@ private:
             x.swap(xnew);
         }
 
-        // For removed columns, try to set to a reasonable bound
+        // If x_j wasn't set by other undos, give it a reasonable value
         if (!std::isfinite(x(a.j))) {
             if (is_finite(a.l_j) && is_finite(a.u_j)) {
-                x(a.j) = (a.l_j + a.u_j) / 2.0; // midpoint
+                x(a.j) = 0.5 * (a.l_j + a.u_j); // midpoint of bounds
             } else if (is_finite(a.l_j)) {
                 x(a.j) = a.l_j;
             } else if (is_finite(a.u_j)) {
                 x(a.j) = a.u_j;
             } else {
-                x(a.j) = 0.0; // fallback for unbounded variables
+                x(a.j) = 0.0; // fully free var fallback
             }
         }
+
+        // Do not touch obj here. The caller computes c^T x + obj_shift.
         (void)obj;
     }
 

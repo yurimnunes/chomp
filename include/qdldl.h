@@ -307,96 +307,6 @@ permute_symmetric_upper(const SparseMatrix<FT, IT> &A,
     return make_csc<FT, IT>(n, std::move(Cp), std::move(Ci), std::move(Cx));
 }
 
-// ===================== Symmetric AMD ordering (header-only)
-// =====================
-template <FloatingPoint FT = double, SignedInteger IT = int64_t>
-inline Ordering<IT>
-simple_minimum_degree_ordering(const SparseMatrix<FT, IT> &A) {
-    const IT n = A.size();
-    const auto Ap = A.col_ptr();
-    const auto Ai = A.row_idx();
-
-    if (n <= 0)
-        return make_ordering<IT>({});
-    if (n == 1)
-        return make_ordering<IT>({IT{0}});
-
-    try {
-        // Compute initial degrees (count off-diagonal entries)
-        std::vector<IT> degree(static_cast<std::size_t>(n), IT{0});
-
-        for (IT j = 0; j < n; ++j) {
-            const IT p0 = Ap[static_cast<std::size_t>(j)];
-            const IT p1 = Ap[static_cast<std::size_t>(j + 1)];
-            for (IT p = p0; p < p1; ++p) {
-                const IT i = Ai[static_cast<std::size_t>(p)];
-                if (i != j && i >= 0 && i < n) {
-                    degree[static_cast<std::size_t>(j)]++;
-                    degree[static_cast<std::size_t>(i)]++; // symmetric
-                }
-            }
-        }
-
-        std::vector<bool> eliminated(static_cast<std::size_t>(n), false);
-        std::vector<IT> elimination_order;
-        elimination_order.reserve(static_cast<std::size_t>(n));
-
-        // Simple greedy minimum degree
-        for (IT step = 0; step < n; ++step) {
-            IT min_degree = n + 1;
-            IT pivot = -1;
-
-            // Find uneliminated vertex with minimum degree
-            for (IT v = 0; v < n; ++v) {
-                if (!eliminated[static_cast<std::size_t>(v)] &&
-                    degree[static_cast<std::size_t>(v)] < min_degree) {
-                    min_degree = degree[static_cast<std::size_t>(v)];
-                    pivot = v;
-                }
-            }
-
-            if (pivot == -1)
-                break;
-
-            elimination_order.push_back(pivot);
-            eliminated[static_cast<std::size_t>(pivot)] = true;
-
-            // Update degrees of neighbors (simple approximation)
-            for (IT j = 0; j < n; ++j) {
-                if (eliminated[static_cast<std::size_t>(j)])
-                    continue;
-
-                const IT p0 = Ap[static_cast<std::size_t>(j)];
-                const IT p1 = Ap[static_cast<std::size_t>(j + 1)];
-                for (IT p = p0; p < p1; ++p) {
-                    const IT i = Ai[static_cast<std::size_t>(p)];
-                    if (i == pivot) {
-                        degree[static_cast<std::size_t>(j)]--;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Convert to permutation
-        std::vector<IT> perm(static_cast<std::size_t>(n));
-        for (IT i = 0; i < static_cast<IT>(elimination_order.size()); ++i) {
-            if (i < n && elimination_order[static_cast<std::size_t>(i)] < n) {
-                perm[static_cast<std::size_t>(
-                    elimination_order[static_cast<std::size_t>(i)])] = i;
-            }
-        }
-
-        return make_ordering<IT>(std::move(perm));
-
-    } catch (...) {
-        // Fallback to identity
-        std::vector<IT> identity(static_cast<std::size_t>(n));
-        std::iota(identity.begin(), identity.end(), IT{0});
-        return make_ordering<IT>(std::move(identity));
-    }
-}
-
 // ===================== Reverse Cuthill-McKee Ordering =====================
 template <FloatingPoint FT = double, SignedInteger IT = int64_t>
 inline Ordering<IT> rcm_ordering(const SparseMatrix<FT, IT> &A) {
@@ -504,7 +414,7 @@ inline Ordering<IT> rcm_ordering(const SparseMatrix<FT, IT> &A) {
     }
 }
 
-template<SignedInteger IT=int64_t>
+template <SignedInteger IT = int64_t>
 inline Ordering<IT> natural_ordering(IT n) {
     std::vector<IT> identity(static_cast<std::size_t>(n));
     std::iota(identity.begin(), identity.end(), IT{0});
@@ -589,8 +499,9 @@ public:
         return analyze(Aperm);
     }
 
-    // ---------- Numeric factorization using precomputed symbolic ----------
-    [[nodiscard]] static LDLFactorization<FloatType, IntType>
+    // NOTE: place this definition inside QDLDLSolver<FloatType, IntType>
+    // (no extra template<> header here).
+    static LDLFactorization<FloatType, IntType>
     refactorize(const SparseMatrix<FloatType, IntType> &A,
                 const Symbolic<FloatType, IntType> &S) {
         const IntType n = S.n;
@@ -618,19 +529,35 @@ public:
         FloatType *__restrict D = R.D.data();
         FloatType *__restrict Dinv = R.D_inv.data();
 
+        // initialize per-column write heads
         for (IntType i = 0; i < n; ++i)
             Lnext[static_cast<std::size_t>(i)] =
                 Lp[static_cast<std::size_t>(i)];
+
+        R.positive_eigenvalues = 0;
+
+        // --- simple, built-in regularization knobs (no external options
+        // needed) ---
+        const bool kRegEnable = true;
+        const FloatType kRegEps = static_cast<FloatType>(1e-12);
+        const FloatType kRegDelta = static_cast<FloatType>(1e-7);
+        const FloatType kDesiredSign =
+            static_cast<FloatType>(+1); // change to -1 if you need
 
         for (IntType k = 0; k < n; ++k) {
             W.next_column();
             IntType nnz_y = 0;
             bool diag_seen = false;
 
+            // scatter A(:,k) into y and take diagonal into D[k]
             const IntType pend = Ap[static_cast<std::size_t>(k + 1)];
             for (IntType ip = Ap[static_cast<std::size_t>(k)]; ip < pend;
                  ++ip) {
                 const IntType b_idx = Ai[static_cast<std::size_t>(ip)];
+                if (QDLL_UNLIKELY(b_idx > k)) {
+                    throw InvalidMatrixError(
+                        "Lower-triangular entry encountered in refactorize()");
+                }
                 if (b_idx == k) {
                     D[static_cast<std::size_t>(k)] =
                         Ax[static_cast<std::size_t>(ip)];
@@ -640,14 +567,12 @@ public:
                 yVals[static_cast<std::size_t>(b_idx)] =
                     Ax[static_cast<std::size_t>(ip)];
 
+                // climb etree marking path, push reversed into Yidx
                 IntType next = S.etree[static_cast<std::size_t>(b_idx)];
-                // Add starting node
                 if (!W.is_marked(b_idx)) {
                     W.mark(b_idx);
                     Ebuf[0] = b_idx;
                     IntType nnzE = 1;
-
-                    // climb etree
                     while (next != UNKNOWN<IntType> && next < k) {
                         if (W.is_marked(next))
                             break;
@@ -667,6 +592,7 @@ public:
                                          std::to_string(k));
             }
 
+            // eliminate along L columns listed in Yidx (reverse order)
             while (nnz_y > 0) {
                 const IntType c = Yidx[static_cast<std::size_t>(--nnz_y)];
                 const IntType j0 = Lp[static_cast<std::size_t>(c)];
@@ -688,15 +614,33 @@ public:
                 yVals[static_cast<std::size_t>(c)] = FloatType{0};
             }
 
-            if (QDLL_UNLIKELY(D[static_cast<std::size_t>(k)] == FloatType{0})) {
-                throw FactorizationError("Zero pivot at column " +
-                                         std::to_string(k));
+            // ------------------ PATCH START: signed regularization
+            // ------------------
+            if (kRegEnable) {
+                // If D[k] is too small in the desired sign direction, push it
+                // away from zero.
+                if (D[static_cast<std::size_t>(k)] * kDesiredSign < kRegEps) {
+                    D[static_cast<std::size_t>(k)] = kRegDelta * kDesiredSign;
+                }
             }
-            if (D[static_cast<std::size_t>(k)] > FloatType{0})
+            // Robust zero/underflow check (avoid exact-0 comparisons)
+            const FloatType piv = D[static_cast<std::size_t>(k)];
+            const FloatType piv_abs = (piv >= FloatType{0}) ? piv : -piv;
+            const FloatType tol0 = std::numeric_limits<FloatType>::epsilon();
+            if (QDLL_UNLIKELY(piv_abs <= tol0)) {
+                throw FactorizationError(
+                    "Zero (or underflow) pivot at column " + std::to_string(k));
+            }
+            // ------------------ PATCH END
+            // ------------------------------------------
+
+            if (D[static_cast<std::size_t>(k)] > FloatType{0}) {
                 ++R.positive_eigenvalues;
+            }
             Dinv[static_cast<std::size_t>(k)] =
                 FloatType{1} / D[static_cast<std::size_t>(k)];
         }
+
         return R;
     }
 
