@@ -401,17 +401,99 @@ class NLPSolver:
         )
 
     def _print_iteration(self, k: int, info: Dict):
-        status = "A" if info["accepted"] else "R"
-        if info["converged"]:
-            status += "*"
-        mode = info.get("mode", self.mode)
-        mu_s = f" μ={info['mu']:.2e}" if "mu" in info else ""
-        sw = f" ->{info['switched_to']}" if "switched_to" in info else ""
-        print(
-            f"[{k:3d}] {status} [{mode}]{sw} step={info['step_norm']:.2e} "
-            f"f={info['f']:.6e} θ={info['theta']:.2e} α={info['alpha']:.2e} "
-            f"Δ={info['tr_radius']:.2e}{mu_s}"
+        import math
+        import sys
+        import time
+
+        # --- singleton state (kept inside) ---
+        if not hasattr(self, "_iprinter"):
+            self._iprinter = {
+                "t0": time.perf_counter(),
+                "last_header": -1,
+                "best_f": math.inf,
+                "best_theta": math.inf,
+                "use_color": sys.stdout.isatty(),
+            }
+        S = self._iprinter
+
+        # ANSI (applied after width formatting so alignment holds)
+        if S["use_color"]:
+            C = dict(
+                bold="\033[1m", dim="\033[2m",
+                green="\033[32m", red="\033[31m", yellow="\033[33m",
+                reset="\033[0m",
+            )
+        else:
+            C = {k: "" for k in ["bold","dim","green","red","yellow","reset"]}
+
+        # --- fields ---
+        mode = info.get("mode", getattr(self, "mode", "sqp"))
+        mode_cell = f"[{mode[:3]}]"              # fixed 5 chars with brackets
+        sw_target = info.get("switched_to")
+        sw_cell = f"→{str(sw_target)[:3]}" if sw_target else ""
+
+        fval = float(info["f"])
+        theta = float(info["theta"])
+        alpha = float(info["alpha"])
+        step_norm = float(info["step_norm"])
+        Delta = float(info["tr_radius"])
+        mu = info.get("mu", None)
+
+        # best-so-far
+        if fval < S["best_f"]: S["best_f"] = fval
+        if theta < S["best_theta"]: S["best_theta"] = theta
+        t = time.perf_counter() - S["t0"]
+
+        # status (plain first, color after formatting)
+        st_plain = "A" if info["accepted"] else "R"
+        if info.get("converged"):
+            st_star = "*"
+        else:
+            st_star = ""
+
+        # --- one canonical format for header and rows ---
+        # widths chosen to fit scientific formats tightly
+        HDR = (
+            f"{'k':>3}  {'st':>2} {'mode':>5} {'sw':<7} "
+            f"{'step':>10} {'f':>13} {'θ':>9} {'α':>8} {'Δ':>9} "
+            f"{'best_f':>13} {'best_θ':>9} {'time':>8} {'μ':>10}"
         )
+        ROW = (
+            f"{k:>3}  "                       # k
+            f"{{ST:>2}} "                     # status (filled later to keep width)
+            f"{mode_cell:>5} "                # mode [xxx]
+            f"{sw_cell:<7} "                  # sw (→xxx)
+            f"{step_norm:>10.2e} "            # step
+            f"{fval:>13.6e} "                 # f
+            f"{theta:>9.2e} "                 # θ
+            f"{alpha:>8.2e} "                 # α
+            f"{Delta:>9.2e} "                 # Δ
+            f"{S['best_f']:>13.2e} "          # best_f
+            f"{S['best_theta']:>9.2e} "       # best_θ
+            f"{t:>7.1f}s "                    # time
+            f"{(f'{mu:.2e}' if mu is not None else ''):>10}"  # μ
+        )
+
+        # periodic header
+        if k == 0 or (k - S["last_header"]) >= 20:
+            S["last_header"] = k
+            print(f"{C['bold']}{HDR}{C['reset']}")
+
+        # format status cell with width first, then colorize without changing spacing
+        st_cell_plain = f"{st_plain:>2}"
+        st_cell_col = st_cell_plain
+        # apply color to the single visible char; keep spaces intact
+        if st_plain == "A":
+            st_colored = f"{C['green']}{st_plain}{C['reset']}"
+        else:
+            st_colored = f"{C['red']}{st_plain}{C['reset']}"
+        st_cell_col = st_cell_plain.replace(st_plain, st_colored, 1)
+
+        # add converged star (yellow) right after status, without disturbing widths
+        star = f"{C['yellow']}*{C['reset']}" if st_star else ""
+        line = ROW.replace("{ST:>2}", st_cell_col) + star
+
+        print(line)
 
     def _watchdog_update(self, x_cand: Optional[np.ndarray] = None) -> None:
         x_eval = self.x if x_cand is None else np.asarray(x_cand, float)

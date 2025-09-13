@@ -6,6 +6,7 @@
 
 * **SQP (Sequential Quadratic Programming)** — Newton-type steps with globalization (line search, trust region, filter/funnel acceptance).
 * **IP (Interior Point)** — log-barrier primal-dual method with slack variables, inspired by **IPOPT**, for smooth handling of inequalities.
+* **DFO-L1 (Derivative-Free L1 Exact Penalty)** — trust-region method for problems where gradients are unavailable, using exact penalty formulation with specialized handling of non-smooth constraints.
 * **AUTO** — automatic mode selection depending on problem structure.
 
 CHOMP combines **automatic differentiation**, **sparse linear algebra**, and **advanced regularization** to solve nonlinear constrained optimization problems reliably and efficiently.
@@ -18,17 +19,27 @@ CHOMP combines **automatic differentiation**, **sparse linear algebra**, and **a
 
   * `sqp`: Sequential Quadratic Programming with advanced globalization.
   * `ip`: Interior Point method with slack + log-barrier.
+  * `dfo`: Derivative-Free Optimization using L1 exact penalty trust-region method.
   * `auto`: Automatic mode selection.
 
 * **Constraint handling**
 
   * Equalities and inequalities.
   * Automatic slack transformation for inequalities in IP mode.
+  * Black-box constraints via exact penalty (DFO mode).
+  * Infeasible iterate acceptance for penalty-based methods.
 
 * **Linear algebra backends**
 
   * Sparse LDLᵀ factorizations via **QDLDL**.
   * Dense/sparse fallbacks using **SciPy**.
+
+* **Derivative-free capabilities**
+
+  * Model-based optimization when gradients are unavailable.
+  * Polynomial interpolation with adaptive geometry management.
+  * Black-box objective and constraint function support.
+  * Trust-region globalization with exact penalty handling.
 
 * **Robust regularization**
 
@@ -77,6 +88,28 @@ x0 = np.array([3.0, 2.0])
 
 solver = NLPSolver(rosenbrock, c_ineq=c_ineq, x0=x0, config=SQPConfig())
 x_opt, lam, info = solver.solve(mode="sqp")
+```
+
+### Derivative-free optimization (black-box functions)
+
+```python
+import numpy as np
+from chomp import NLPSolver, DFOConfig
+
+# Black-box objective (e.g., simulation result)
+def expensive_simulation(x):
+    # Imagine this calls an external simulator
+    return (x[0] - 1)**2 + (x[1] - 2)**2 + 0.1 * np.sin(10 * x[0])
+
+# Black-box constraint
+def constraint_simulation(x):
+    return x[0]**2 + x[1]**2 - 4  # Circle constraint
+
+x0 = np.array([0.5, 0.5])
+
+solver = NLPSolver(expensive_simulation, c_ineq=[constraint_simulation], 
+                  x0=x0, config=DFOConfig())
+x_opt, lam, info = solver.solve(mode="dfo")
 ```
 
 ---
@@ -152,11 +185,47 @@ This makes CHOMP both a **solver backend** and a **modeling tool**, all in one l
 
 ---
 
+## 🧠 Derivative-Free L1 Exact Penalty Method
+
+CHOMP implements a **derivative-free trust-region method** using **L1 exact penalty** formulation, specifically designed for optimization problems where:
+
+* **Gradients are unavailable** (black-box simulations, physical experiments)
+* **Constraints may be black-box** functions  
+* **Infeasible iterates** are acceptable during optimization
+* **Direct convergence** to constrained optimum is desired (no sequence of penalty subproblems)
+
+### Key Features
+
+* **Exact penalty formulation**: `p(x) = f(x) + μ Σ max(0, c_i(x))` allows direct convergence under suitable conditions
+* **Non-smooth handling**: Specialized treatment of nearly-active constraints to avoid zig-zagging near feasible boundaries  
+* **Model-based approach**: Polynomial interpolation models for both objective and constraints with adaptive geometry
+* **Trust-region globalization**: Robust convergence with automatic radius management
+* **Criticality measures**: Sophisticated stopping criteria adapted for exact penalty functions
+
+### When to Use DFO Mode
+
+* Objective/constraints from expensive simulations (CFD, FEM, etc.)
+* Physical experiments or lab measurements
+* Legacy code without derivative information
+* Functions with noise or discontinuities in derivatives
+* Modest problem sizes (n ≤ 50 recommended for efficiency)
+
+### Performance Characteristics
+
+Based on numerical experiments from [Giuliani et al. (2022)](https://doi.org/10.1007/s40314-021-01748-4):
+* **Competitive** with NOMAD and DEFT-Funnel on CUTEst problems
+* **Fewer function evaluations** for simulation-based oil field optimization
+* **Automatic penalty parameter** adjustment for challenging constraint structures
+
+---
+
 ## 🔬 Examples
 
 * **Unconstrained**: Rosenbrock minimization
-* **Inequality-constrained**: Branin function + circular constraint
+* **Inequality-constrained**: Branin function + circular constraint  
 * **Equality-constrained**: Quadratic programming with linear equalities
+* **Derivative-free**: Black-box simulation optimization with exact penalty
+* **Mixed problems**: Combining analytical and simulation-based constraints
 
 See [`examples/`](./examples) for runnable demos.
 
@@ -167,6 +236,7 @@ See [`examples/`](./examples) for runnable demos.
 * Nocedal & Wright (2006), *Numerical Optimization*
 * Wächter & Biegler (2006), *Primal-Dual Interior Point Filter Line Search Algorithm* (IPOPT)
 * Gill, Murray & Wright (1981), *Practical Optimization*
+* Giuliani, Camponogara & Conn (2022), *A derivative-free exact penalty algorithm: basic ideas, convergence theory and computational studies*, Computational and Applied Mathematics
 
 ---
 
@@ -179,5 +249,6 @@ See [`examples/`](./examples) for runnable demos.
   * `Regularizer`: Hessian conditioning and inertia correction.
   * `SQPStepper`: globalization via trust region, line search, filter, funnel.
   * `InteriorPointStepper`: slack/barrier-based primal-dual IPM.
+  * `DFOStepper`: derivative-free trust-region with L1 exact penalty.
   * `KKT`: sparse KKT system assembly and factorization.
 * **Wrapper**: lightweight symbolic layer for building problems declaratively.
