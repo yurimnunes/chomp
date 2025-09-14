@@ -85,14 +85,14 @@
 
     .step-number {
       background: #3b82f6;
-      color: white;
+      color: #fff;
       border-radius: 50%;
       width: 28px;
       height: 28px;
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      font-weight: bold;
+      font-weight: 700;
       font-size: 14px
     }
 
@@ -108,54 +108,140 @@
       padding: .125rem .375rem;
       font-size: .75rem
     }
+
+    /* Landing grid backdrop */
+    .bg-grid {
+      background-image:
+        linear-gradient(to right, rgba(15, 23, 42, .06) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(15, 23, 42, .06) 1px, transparent 1px);
+      background-size: 24px 24px;
+      mask-image: radial-gradient(ellipse at 50% 20%, rgba(0, 0, 0, .9), rgba(0, 0, 0, .15) 60%, transparent 75%);
+    }
+
+    /* Soft gradient glow */
+    .glow {
+      position: absolute;
+      inset: -20% -10% auto -10%;
+      height: 55vh;
+      background: radial-gradient(60% 60% at 50% 40%, rgba(79, 70, 229, .25), rgba(34, 197, 94, .18) 40%, rgba(14, 165, 233, .12) 70%, transparent 75%);
+      filter: blur(40px);
+      pointer-events: none;
+    }
+
+    /* Fade-in and up */
+    .fade-up {
+      opacity: 0;
+      transform: translateY(12px);
+      animation: fadeUp .7s ease forwards .1s;
+    }
+
+    @keyframes fadeUp {
+      to {
+        opacity: 1;
+        transform: none;
+      }
+    }
+
+    /* Nav active state */
+    .nav-link {
+      position: relative;
+    }
+
+    .nav-link.active {
+      color: rgb(15 23 42);
+      font-weight: 700;
+    }
+
+    .nav-link.active::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: -8px;
+      height: 2px;
+      background: rgb(15 23 42);
+      border-radius: 9999px;
+    }
   </style>
+  <style>
+    :root {
+      --nav-h: 72px;
+    }
+
+    /* tweak if your nav is taller/shorter */
+    .alt-section {
+      scroll-margin-top: calc(var(--nav-h) + 12px);
+    }
+  </style>
+
 </head>
 
 <body class="min-h-screen text-slate-800 bg-gradient-to-br from-slate-50 to-indigo-50">
 
-  <!-- ======= Header / Hero ======= -->
-  <header class="bg-gradient-to-tr from-indigo-50 via-emerald-50 to-cyan-50 border-b border-slate-200">
-    <div class="max-w-7xl mx-auto px-6 py-10 lg:py-14">
-      <div class="flex flex-col lg:flex-row items-start gap-8">
-        <div class="flex-1">
-          <div class="flex items-center gap-4">
-            <img src="logo.png" alt="CHOMP logo" class="w-40 h-40 object-contain" />
+  <!-- ======= Sticky Nav ======= -->
+  <nav id="topnav" class="fixed top-0 inset-x-0 z-50 transition-colors">
+    <div class="mx-auto max-w-7xl px-6 py-4 flex items-center justify-between">
+      <a href="#" class="flex items-center gap-2">
+        <img src="logo.png" alt="CHOMP logo" class="w-8 h-8 object-contain">
+        <span class="font-extrabold tracking-tight text-slate-900">CHOMP</span>
+      </a>
+      <div class="hidden md:flex items-center gap-5 text-sm">
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#get">Get</a>
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#algorithms">Algorithms</a>
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#l1">DFO-L1</a>
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#usage">Usage</a>
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#api">API</a>
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#examples">Examples</a>
+        <a target="_blank" rel="noopener" href="https://github.com/lseman/chomp"
+          class="px-3 py-1.5 rounded-lg bg-slate-900 text-white hover:bg-black">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ======= Full-Viewport Hero ======= -->
+  <header class="relative h-[100svh] flex items-center">
+    <div aria-hidden="true" class="absolute inset-0 bg-grid"></div>
+    <div aria-hidden="true" class="glow"></div>
+
+    <div class="relative mx-auto max-w-7xl px-6 w-full">
+      <img src="logo.png" alt="CHOMP logo"
+        class="block mx-auto mb-8 w-40 sm:w-56 md:w-64 lg:w-72 xl:w-80 h-auto object-contain" />
+                  <div class="flex items-center gap-3 mb-6">
             <div>
-              <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight text-slate-900">CHOMP —
-                <span class="text-indigo-600">A Modern NLP Solver</span>
+              <h1 class="text-5xl md:text-6xl font-extrabold tracking-tight text-slate-900 leading-[1.05]">
+                CHOMP — <span class="text-indigo-600">A Modern NLP Solver</span>
               </h1>
-              <p class="mt-1 text-sm tracking-wide text-slate-500"><b>C</b>HOMP <b>H</b>andles <b>O</b>ptimization of
+              <p class="mt-1 text-xs tracking-wide text-slate-500"><b>C</b>HOMP <b>H</b>andles <b>O</b>ptimization of
                 <b>M</b>any <b>P</b>roblems</p>
             </div>
           </div>
-          <p class="mt-4 text-lg md:text-xl text-slate-700 max-w-3xl">
+      <div class="grid lg:grid-cols-[1.2fr_.8fr] gap-10 items-center">
+        <!-- Hero copy -->
+        <div class="fade-up">
+
+
+
+          <p class="mt-5 text-lg md:text-xl text-slate-700 max-w-2xl">
             A modular nonlinear programming solver that chomps through tough constrained problems using
             <b>SQP</b>, <b>Interior-Point</b>, and <b>DFO-L1 Exact Penalty</b>, plus an <b>Auto</b> strategy selector —
-            powered by automatic differentiation,
-            sparse linear algebra, and robust regularization.
+            powered by automatic differentiation, sparse linear algebra, and robust regularization.
           </p>
 
-          <div class="mt-6 flex flex-wrap gap-3">
+          <div class="mt-8 flex flex-wrap gap-3">
             <a href="#get"
-              class="px-4 py-2 rounded-xl bg-indigo-600 text-white font-semibold shadow hover:bg-indigo-700">Get
+              class="px-5 py-3 rounded-xl bg-indigo-600 text-white font-semibold shadow hover:bg-indigo-700">Get
               CHOMP</a>
-            <a href="#l1"
-              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">DFO-L1
-              Method</a>
-            <a href="#build"
-              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Build</a>
             <a href="#algorithms"
-              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Algorithms</a>
-            <a href="#usage"
-              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Usage</a>
-            <a href="#api"
-              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">API</a>
+              class="px-5 py-3 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Explore
+              Algorithms</a>
             <a href="#examples"
-              class="px-4 py-2 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">Examples</a>
+              class="px-5 py-3 rounded-xl bg-white ring-1 ring-slate-200 shadow-sm font-semibold hover:bg-slate-50">See
+              Examples</a>
           </div>
         </div>
 
-        <aside class="w-full lg:w-80">
+        <!-- Hero side card -->
+        <aside class="fade-up w-full lg:w-auto">
           <div class="bg-white/70 border border-slate-200 rounded-2xl p-5 shadow card">
             <h3 class="text-lg font-semibold mb-2">Project Links</h3>
             <div class="space-y-2">
@@ -165,8 +251,8 @@
                 <span class="kbd">↗</span>
               </a>
               <a href="#get"
-                class="block px-3 py-2 rounded-lg bg-indigo-600 text-white text-center hover:bg-indigo-700">Install &
-                Build</a>
+                class="block px-3 py-2 rounded-lg bg-indigo-600 text-white text-center hover:bg-indigo-700">Install
+                &amp; Build</a>
             </div>
             <p class="text-xs text-slate-500 mt-3">
               Open-source research code. SQP • Interior-Point • DFO-L1 • Sparse KKT • AD
@@ -175,16 +261,26 @@
         </aside>
       </div>
     </div>
+
+    <!-- Scroll cue -->
+    <a href="#get"
+      class="absolute bottom-6 left-1/2 -translate-x-1/2 inline-flex flex-col items-center gap-1 text-slate-500 hover:text-slate-700"
+      aria-label="Scroll to Get section">
+      <span class="text-xs tracking-wide">Scroll</span>
+      <svg class="w-5 h-5 animate-bounce" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+      </svg>
+    </a>
   </header>
 
-  <!-- ======= Section: Get / Install ======= -->
-  <section id="get" class="py-12">
+  <!-- ======= Sections (no fixed bg here; alternator will handle) ======= -->
+  <section id="get" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Get CHOMP</h2>
 
-      <div class="grid lg:grid-cols-2 gap-6">
+      <div class="grid lg:grid-cols-1 gap-6">
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-xl font-semibold mb-3">📦 Quick Install (Python)</h3>
+          <h3 class="text-xl font-semibold mb-3">Quick Install (Python)</h3>
           <p class="text-slate-700 mb-3">Editable install for development:</p>
           <div class="relative">
             <button
@@ -194,12 +290,12 @@
 cd chomp
 pip install -e .</code></pre>
           </div>
-          <p class="text-sm text-slate-600 mt-3"><b>Requires:</b> Python ≥ 3.9, NumPy, SciPy. Native extensions are
-            built automatically if your toolchain is available.</p>
+          <p class="text-sm text-slate-600 mt-3"><b>Requires:</b> Python ≥ 3.9, NumPy, SciPy. Native extensions build
+            automatically if your toolchain is available.</p>
         </article>
 
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card" id="build">
-          <h3 class="text-xl font-semibold mb-3">🔨 Build from Source (CMake + pybind11)</h3>
+          <h3 class="text-xl font-semibold mb-3">Build from Source (CMake + pybind11)</h3>
           <p class="text-slate-700 mb-3">Compile C++ kernels and Python bindings:</p>
           <div class="relative">
             <button
@@ -242,67 +338,67 @@ cmake --build . -j</code></pre>
       </div>
     </div>
   </section>
-
-
-  <!-- ======= Section: Algorithms (SQP/IP/AUTO) ======= -->
-  <section id="algorithms" class="py-12">
+  <section id="algorithms" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Core Algorithms</h2>
 
-      <div class="step">
-        <div class="flex items-center gap-3 mb-3">
-          <span class="step-number">1</span>
-          <h3 class="text-xl font-semibold">SQP (Sequential Quadratic Programming)</h3>
-        </div>
-        <p class="text-slate-700">At iterate $x_k$, solve a QP in $p$ with $H_k$ ≈ $\nabla^2 \mathcal L$ and linearized
-          constraints:</p>
-        <div class="math-nowrap mt-2">$$\begin{aligned}
-          \min_p\; & \tfrac12 p^\top H_k p + \nabla f(x_k)^\top p \\
-          \text{s.t.}\; & c_E(x_k) + J_E(x_k)p = 0,\quad
-          c_I(x_k) + J_I(x_k)p \le 0.
-          \end{aligned}$$</div>
-        <p class="text-slate-700 mt-2">Globalization via trust-region, line search, and filter/funnel acceptance.</p>
+      <!-- 2-column: SQP + IP -->
+      <div class="grid md:grid-cols-2 gap-6 mb-6">
+        <article class="step h-full">
+          <div class="flex items-center gap-3 mb-3">
+            <span class="step-number">1</span>
+            <h3 class="text-xl font-semibold">SQP (Sequential Quadratic Programming)</h3>
+          </div>
+          <p class="text-slate-700">
+            At iterate $x_k$, solve a QP in $p$ with $H_k$ ≈ $\nabla^2 \mathcal L$ and linearized constraints:
+          </p>
+          <div class="math-nowrap mt-2">$$\begin{aligned}
+            \min_p\; & \tfrac12 p^\top H_k p + \nabla f(x_k)^\top p \\
+            \text{s.t.}\; & c_E(x_k) + J_E(x_k)p = 0,\quad
+            c_I(x_k) + J_I(x_k)p \le 0.
+            \end{aligned}$$</div>
+          <p class="text-slate-700 mt-2">Globalization via trust-region, line search, and filter/funnel acceptance.</p>
+        </article>
+
+        <article class="step h-full">
+          <div class="flex items-center gap-3 mb-3">
+            <span class="step-number">2</span>
+            <h3 class="text-xl font-semibold">Interior-Point (Slack + Log-Barrier)</h3>
+          </div>
+          <p class="text-slate-700">Introduce slacks $s&gt;0$ with barrier parameter $\mu$:</p>
+          <div class="math-nowrap">$$
+            \min_{x,s}\; f(x) - \mu \sum_j \log s_j\quad\text{s.t.}\; c_E(x)=0,\; c_I(x)+s=0.
+            $$</div>
+          <p class="text-slate-700 mt-2">Mehrotra predictor–corrector, fraction-to-boundary, and filter line search.</p>
+        </article>
       </div>
 
-      <div class="step">
-        <div class="flex items-center gap-3 mb-3">
-          <span class="step-number">2</span>
-          <h3 class="text-xl font-semibold">Interior-Point (Slack + Log-Barrier)</h3>
-        </div>
-        <p class="text-slate-700">Introduce slacks $s&gt;0$ with barrier parameter $\mu$:</p>
-        <div class="math-nowrap">$$\min_{x,s}\; f(x) - \mu \sum_j \log s_j\quad\text{s.t.}\; c_E(x)=0,\; c_I(x)+s=0.$$
-        </div>
-        <p class="text-slate-700 mt-2">Mehrotra predictor–corrector, fraction-to-boundary, and filter line search.</p>
-      </div>
-
-      <div class="step">
+      <!-- Single-column: AUTO -->
+      <article class="step">
         <div class="flex items-center gap-3 mb-3">
           <span class="step-number">3</span>
           <h3 class="text-xl font-semibold">AUTO Mode</h3>
         </div>
-        <p class="text-slate-700">Chooses SQP vs IP vs DFO based on structure (active inequalities, conditioning,
-          progress). Warm-starts duals/slacks.</p>
-      </div>
+        <p class="text-slate-700">
+          Chooses SQP vs IP vs DFO based on structure (active inequalities, conditioning, progress).
+          Warm-starts duals/slacks.
+        </p>
+      </article>
     </div>
   </section>
 
-  <!-- ======= Section: DFO-L1 Exact Penalty ======= -->
-  <section id="l1" class="py-12 bg-slate-50">
+  <section id="l1" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Derivative-Free L1 Exact Penalty (Trust-Region)</h2>
 
       <div class="grid lg:grid-cols-3 gap-6">
         <article class="lg:col-span-2 bg-white border border-slate-200 rounded-2xl p-6 shadow card">
-          <h3 class="text-xl font-semibold mb-3">Problem & Idea</h3>
-          <p class="text-slate-700">
-            We solve constrained problems without derivatives:
-          </p>
+          <h3 class="text-xl font-semibold mb-3">Problem &amp; Idea</h3>
+          <p class="text-slate-700">We solve constrained problems without derivatives:</p>
           <div class="math-nowrap my-3">$$
             \min_{x\in\mathbb{R}^n} f(x) \quad \text{s.t.}\quad c_i(x)\le 0,\; i=1,\dots,m.
             $$</div>
-          <p class="text-slate-700">
-            Use an <b>exact penalty</b> with parameter $\mu\!>\!0$:
-          </p>
+          <p class="text-slate-700">Use an <b>exact penalty</b> with parameter $\mu\!>\!0$:</p>
           <div class="math-nowrap my-3">$$
             p(x) \;=\; f(x) \;+\; \mu \sum_{i=1}^m \max\{0,\,c_i(x)\}.
             $$</div>
@@ -328,7 +424,7 @@ cmake --build . -j</code></pre>
               (breakpoints where constraints switch).</li>
             <li><b>Project Nearly-Active to Zero:</b> Compute a small correction that drives nearly-active constraints
               closer to $0$ (least-squares).</li>
-            <li><b>Trust-Region & Acceptance:</b> Compare predicted vs. actual reduction; adjust radius, and improve
+            <li><b>Trust-Region &amp; Acceptance:</b> Compare predicted vs. actual reduction; adjust radius, and improve
               models if agreement is poor.</li>
           </ol>
 
@@ -344,7 +440,7 @@ cmake --build . -j</code></pre>
             <li>Exact penalty avoids sequences of subproblems.</li>
             <li>Trust-region globalization with adaptive radius.</li>
             <li>Descent directions that avoid boundary zig-zag.</li>
-            <li>Criticality measure & model accuracy checks.</li>
+            <li>Criticality measure &amp; model accuracy checks.</li>
           </ul>
           <div class="theorem text-sm mt-4">
             <b>Convergence (outline):</b> With fully-linear models, bounded Hessians, and standard TR acceptance rules,
@@ -358,14 +454,11 @@ cmake --build . -j</code></pre>
     </div>
   </section>
 
-
-  <!-- ======= Section: Usage ======= -->
-  <section id="usage" class="py-12 bg-slate-50">
+  <section id="usage" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Quick Start</h2>
 
-      <div class="grid md:grid-cols-2 gap-8">
-        <!-- Classic API -->
+      <div class="grid md:grid-cols-1 gap-8">
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-xl font-semibold mb-3">Classic API</h3>
           <div class="relative">
@@ -386,7 +479,6 @@ print(x_opt, info.status)</code></pre>
           </div>
         </article>
 
-        <!-- Wrapper API (NEW) -->
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-xl font-semibold mb-3">Wrapper API (Symbolic)</h3>
           <p class="text-sm text-slate-600 -mt-1 mb-2">Build with operator-overloaded expressions; AD-aware trigs and
@@ -442,8 +534,7 @@ print("x* =", x_star, info.status)</code></pre>
     </div>
   </section>
 
-  <!-- ======= Section: API ======= -->
-  <section id="api" class="py-12">
+  <section id="api" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">API Cheatsheet</h2>
       <div class="grid md:grid-cols-2 gap-6">
@@ -475,11 +566,10 @@ print("x* =", x_star, info.status)</code></pre>
     </div>
   </section>
 
-  <!-- ======= Section: Examples ======= -->
-  <section id="examples" class="py-12 bg-slate-50">
+  <section id="examples" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Worked Examples</h2>
-      <div class="grid lg:grid-cols-2 gap-8">
+      <div class="grid lg:grid-cols-1 gap-8">
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-lg font-semibold mb-2">Quadratic with Linear Constraints (SQP)</h3>
           <p class="text-slate-700">Filter globalization + trust region with active-set changes.</p>
@@ -537,15 +627,16 @@ print(x, info.status)</code></pre>
         <div class="text-xs text-slate-400">SQP • Interior-Point • DFO-L1 • Auto • Sparse KKT • AD</div>
       </div>
       <div class="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-400">
-        Trust-region & filter globalization • Slack/barrier IPM • Schur/LDL<sup>T</sup> • Ruiz equilibration
+        Trust-region &amp; filter globalization • Slack/barrier IPM • Schur/LDL<sup>T</sup> • Ruiz equilibration
       </div>
       <div class="mt-6 text-center text-xs text-slate-400">
-        References: Giuliani, Camponogara & Conn (2022); Nocedal & Wright; Wächter & Biegler; Gill, Murray & Wright.
+        References: Giuliani, Camponogara &amp; Conn (2022); Nocedal &amp; Wright; Wächter &amp; Biegler; Gill, Murray
+        &amp; Wright.
       </div>
     </div>
   </footer>
 
-  <!-- Copy-to-clipboard for code blocks + Prism init -->
+  <!-- Copy buttons, year, smooth anchors, sticky nav & section alternator & nav highlight -->
   <script>
     document.addEventListener("DOMContentLoaded", () => {
       // Copy buttons
@@ -562,14 +653,14 @@ print(x, info.status)</code></pre>
         });
       });
 
-      // Ensure line numbers on all <pre> with code blocks
+      // Ensure line numbers
       document.querySelectorAll('pre').forEach(pre => pre.classList.add('line-numbers'));
 
       // Update year
       const y = document.getElementById('year');
       if (y) y.textContent = new Date().getFullYear();
 
-      // Smooth scroll for anchor links
+      // Smooth anchor scroll (ensure block start)
       document.querySelectorAll('a[href^="#"]').forEach(a => {
         a.addEventListener('click', (e) => {
           const href = a.getAttribute('href');
@@ -580,6 +671,164 @@ print(x, info.status)</code></pre>
       });
     });
   </script>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const nav = document.getElementById('topnav');
+      const hero = document.querySelector('header');
+
+      const solid = () => nav && nav.classList.add('backdrop-blur', 'bg-white/80', 'border-b', 'border-slate-200');
+      const clear = () => nav && nav.classList.remove('backdrop-blur', 'bg-white/80', 'border-b', 'border-slate-200');
+
+      // Start solid to avoid flash; observer will clear if hero is fully visible
+      solid();
+
+      let navH = nav ? nav.getBoundingClientRect().height : 72;
+
+      // --- Active nav highlight based on section visibility ---
+      const links = Array.from(document.querySelectorAll('.nav-link'));
+      const linkById = new Map(
+        links.filter(a => a.hash).map(a => [a.hash.slice(1), a])
+      );
+      const sections = Array.from(document.querySelectorAll('.alt-section'));
+
+      const setActive = (id) => {
+        links.forEach(a => a.classList.remove('active'));
+        const el = linkById.get(id);
+        if (el) el.classList.add('active');
+      };
+
+      // Mark immediately on click to avoid IO lag
+      links.forEach(a => {
+        a.addEventListener('click', () => {
+          const id = a.hash && a.hash.slice(1);
+          if (id) setActive(id);
+        });
+      });
+
+      // Track visibility ratios
+      const vis = new Map(); // id -> ratio
+
+      const chooseAndSetActive = () => {
+        // Pick the section with the highest ratio; break ties with nearest to header
+        let bestId = null, bestRatio = 0, bestDist = Infinity;
+        const headerY = navH + 8;
+        sections.forEach(sec => {
+          const id = sec.id;
+          const ratio = vis.get(id) || 0;
+          if (ratio > 0) {
+            const rect = sec.getBoundingClientRect();
+            const dist = Math.abs(rect.top - headerY);
+            if (ratio > bestRatio || (ratio === bestRatio && dist < bestDist)) {
+              bestRatio = ratio; bestDist = dist; bestId = id;
+            }
+          }
+        });
+        if (!bestId) {
+          // Fallback: nearest section to header line
+          let nearestId = null, nearestDist = Infinity;
+          sections.forEach(sec => {
+            const rect = sec.getBoundingClientRect();
+            const dist = Math.abs(rect.top - headerY);
+            if (dist < nearestDist) { nearestDist = dist; nearestId = sec.id; }
+          });
+          bestId = nearestId;
+        }
+        if (bestId) setActive(bestId);
+      };
+
+      const thresholds = Array.from({ length: 11 }, (_, i) => i / 10);
+
+      let sectionObserver = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+          const id = entry.target.id;
+          vis.set(id, entry.intersectionRatio);
+        });
+        chooseAndSetActive();
+      }, {
+        // Make the top boundary just below the sticky nav; bottom boundary a bit above footer
+        rootMargin: `-${navH + 8}px 0px -55% 0px`,
+        threshold: thresholds
+      });
+
+      sections.forEach(s => sectionObserver.observe(s));
+
+      // --- Navbar transparency only when hero is fully visible at top ---
+      let heroObserver = null;
+      const makeHeroObserver = () => {
+        if (!hero) return;
+        if (heroObserver) heroObserver.disconnect();
+        heroObserver = new IntersectionObserver((entries) => {
+          entries.forEach(entry => {
+            if (entry.isIntersecting && entry.intersectionRatio === 1) {
+              // Hero fully visible -> transparent
+              clear();
+            } else {
+              // Otherwise -> solid
+              solid();
+            }
+          });
+        }, { threshold: [0, 1], rootMargin: "0px 0px 0px 0px" });
+        heroObserver.observe(hero);
+      };
+      makeHeroObserver();
+
+      // Handle initial hash (deep link) or initial state with no hash
+      const init = () => {
+        if (location.hash) {
+          const id = location.hash.slice(1);
+          setActive(id);
+          const target = document.getElementById(id);
+          if (target) target.scrollIntoView({ behavior: 'instant', block: 'start' });
+        } else {
+          chooseAndSetActive();
+        }
+      };
+      requestAnimationFrame(init);
+
+      // --- Alternating section backgrounds (white / slate-50) ---
+      const applyAlternating = () => {
+        const secs = Array.from(document.querySelectorAll('.alt-section'));
+        secs.forEach((sec, idx) => {
+          sec.classList.remove('bg-white', 'bg-slate-50');
+          sec.classList.add(idx % 2 === 0 ? 'bg-white' : 'bg-slate-50');
+        });
+      };
+
+      // initial apply after layout settles
+      requestAnimationFrame(applyAlternating);
+
+      // keep it fresh on resize (in case layout reorders or sections show/hide)
+      window.addEventListener('resize', applyAlternating);
+
+      // if sections are dynamically inserted/removed, re-apply
+      const mo = new MutationObserver(() => applyAlternating());
+      mo.observe(document.body, { childList: true, subtree: true });
+
+
+      // Recompute on resize: update nav height, re-create observers with new margins
+      window.addEventListener('resize', () => {
+        const newNavH = nav ? nav.getBoundingClientRect().height : 72;
+        if (newNavH !== navH) {
+          navH = newNavH;
+
+          // Recreate section observer with updated rootMargin
+          sectionObserver.disconnect();
+          sections.forEach(s => vis.set(s.id, 0));
+          sectionObserver = new IntersectionObserver((entries) => {
+            entries.forEach(entry => vis.set(entry.target.id, entry.intersectionRatio));
+            chooseAndSetActive();
+          }, { rootMargin: `-${navH + 8}px 0px -55% 0px`, threshold: thresholds });
+          sections.forEach(s => sectionObserver.observe(s));
+
+          // Recreate hero observer (rootMargin doesn't depend on navH, but keep consistent)
+          makeHeroObserver();
+        }
+        chooseAndSetActive();
+      });
+    });
+  </script>
+
+
 </body>
 
 </html>
