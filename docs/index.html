@@ -206,15 +206,16 @@
     <div class="relative mx-auto max-w-7xl px-6 w-full">
       <img src="logo.png" alt="CHOMP logo"
         class="block mx-auto mb-8 w-40 sm:w-56 md:w-64 lg:w-72 xl:w-80 h-auto object-contain" />
-                  <div class="flex items-center gap-3 mb-6">
-            <div>
-              <h1 class="text-5xl md:text-6xl font-extrabold tracking-tight text-slate-900 leading-[1.05]">
-                CHOMP — <span class="text-indigo-600">A Modern NLP Solver</span>
-              </h1>
-              <p class="mt-1 text-xs tracking-wide text-slate-500"><b>C</b>HOMP <b>H</b>andles <b>O</b>ptimization of
-                <b>M</b>any <b>P</b>roblems</p>
-            </div>
-          </div>
+      <div class="flex items-center gap-3 mb-6">
+        <div>
+          <h1 class="text-5xl md:text-6xl font-extrabold tracking-tight text-slate-900 leading-[1.05]">
+            CHOMP — <span class="text-indigo-600">A Modern NLP Solver</span>
+          </h1>
+          <p class="mt-1 text-xs tracking-wide text-slate-500"><b>C</b>HOMP <b>H</b>andles <b>O</b>ptimization of
+            <b>M</b>any <b>P</b>roblems
+          </p>
+        </div>
+      </div>
       <div class="grid lg:grid-cols-[1.2fr_.8fr] gap-10 items-center">
         <!-- Hero copy -->
         <div class="fade-up">
@@ -316,7 +317,8 @@ cmake --build . -j</code></pre>
               <ul class="list-disc ml-5 mt-1 space-y-1">
                 <li><code>AD_ENABLE_OPENMP</code> (default OFF)</li>
                 <li><code>AD_ENABLE_QDLDL</code>, <code>AD_ENABLE_OSQP</code>, <code>AD_ENABLE_PIQP</code>,
-                  <code>AD_ENABLE_AMDQG</code>, <code>AD_ENABLE_L1CORE</code> (default ON)</li>
+                  <code>AD_ENABLE_AMDQG</code>, <code>AD_ENABLE_L1CORE</code> (default ON)
+                </li>
               </ul>
             </div>
             <div class="bg-slate-50 border border-slate-200 rounded-lg p-3">
@@ -347,30 +349,171 @@ cmake --build . -j</code></pre>
         <article class="step h-full">
           <div class="flex items-center gap-3 mb-3">
             <span class="step-number">1</span>
-            <h3 class="text-xl font-semibold">SQP (Sequential Quadratic Programming)</h3>
+            <h3 class="text-xl font-semibold">SQP with Trust Region (Byrd–Omojokun)</h3>
           </div>
+
           <p class="text-slate-700">
-            At iterate $x_k$, solve a QP in $p$ with $H_k$ ≈ $\nabla^2 \mathcal L$ and linearized constraints:
+            At iterate \(x_k\) we solve a quadratic model with linearized constraints and a trust-region:
           </p>
-          <div class="math-nowrap mt-2">$$\begin{aligned}
-            \min_p\; & \tfrac12 p^\top H_k p + \nabla f(x_k)^\top p \\
-            \text{s.t.}\; & c_E(x_k) + J_E(x_k)p = 0,\quad
-            c_I(x_k) + J_I(x_k)p \le 0.
-            \end{aligned}$$</div>
-          <p class="text-slate-700 mt-2">Globalization via trust-region, line search, and filter/funnel acceptance.</p>
+
+          <div class="math-nowrap mt-2">$$
+            \begin{aligned}
+            \min_{p}\;& \tfrac12\,p^\top H_k\,p + \nabla f(x_k)^\top p \\
+            \text{s.t. }& c_E(x_k) + J_E(x_k)\,p = 0,\quad
+            c_I(x_k) + J_I(x_k)\,p \le 0, \\
+            & \|p\|_{\mathrm{TR}} \le \Delta_k,\quad \ell \le x_k + p \le u.
+            \end{aligned}
+            $$</div>
+
+          <p class="text-slate-700 mt-3">
+            We use a Byrd–Omojokun composite step \(p = p_n + p_t\): a <em>normal</em> step reduces
+            feasibility in the equality space, then a <em>tangential</em> step optimizes the Lagrangian in the
+            nullspace, both
+            within the trust region (Euclidean or ellipsoidal).
+          </p>
+
+          <h4 class="font-semibold mt-4">Trust-Region Geometry</h4>
+          <ul class="list-disc pl-5 text-slate-700 space-y-1">
+            <li><span class="font-medium">Ellipsoidal norm (optional):</span> \(\|p\|_{\mathrm{TR}}=\|L^\top p\|_2\)
+              with \(M=L L^\top \approx \operatorname{sym}(H_k)+\tau I\); adapts the ball to curvature.</li>
+            <li><span class="font-medium">PCG (Steihaug–Toint):</span> preconditioned CG on the TR subproblem; fast
+              Numba path for dense/CSR with Jacobi.</li>
+            <li><span class="font-medium">Active-set inequalities:</span> iterative augmentation of equalities when
+              \(J_I p + c_I(x_k)\) violates feasibility.</li>
+            <li><span class="font-medium">Box-safe scaling:</span> fraction-to-boundary cap \(\alpha_{\max}\) keeps
+              \(x_k+\alpha p \in [\ell,u]\).</li>
+          </ul>
+
+          <h4 class="font-semibold mt-4">Stabilization & Feasibility</hight4>
+            <ul class="list-disc pl-5 text-slate-700 space-y-1">
+              <li><span class="font-medium">dOPT stabilization:</span> small residual shifts on \(c_E,c_I\)
+                (Gill–Saunders style) near active sets to tame ill-conditioning.</li>
+              <li><span class="font-medium">Criticality safeguard:</span> when \(\|P_T\nabla f\|\) is small, shrink
+                \(\Delta_k\) to regain model accuracy.</li>
+              <li><span class="font-medium">Adaptive split:</span> normal radius \(\Delta_n=\zeta\Delta_k\) with
+                \(\zeta\) adapted from feasibility history.</li>
+              <li><span class="font-medium">SOC correction (optional):</span> a short second-order correction \(q\)
+                after line search; clipped so \(\|p+q\|_{\mathrm{TR}}\le\Delta_k\).</li>
+              <li><span class="font-medium">Restoration:</span> targeted feasibility step if line search/TR acceptance
+                fails.</li>
+            </ul>
+
+            <h4 class="font-semibold mt-4">Acceptance & Updates</h4>
+            <ul class="list-disc pl-5 text-slate-700 space-y-1">
+              <li><span class="font-medium">Predicted vs. actual reduction:</span> \(m(0)-m(p)\) vs.
+                \(f(x_k)-f(x_k+p)\); ratio \(\rho_k=\dfrac{\text{ared}}{\text{pred}}\).</li>
+              <li><span class="font-medium">Feasibility-aware \(\rho\):</span> down-weights \(\rho_k\) when constraint
+                violation is large; integrates with filter/funnel.</li>
+              <li><span class="font-medium">Curvature-aware radius:</span> expand \(\Delta_k\) when curvature along
+                \(p\) is healthy and the step nearly hits the boundary; shrink on poor \(\rho_k\).</li>
+              <li><span class="font-medium">Line search bridge:</span> optional merit/filter line search on \(p\) before
+                SOC; always clipped by \(\alpha_{\max}\).</li>
+              <li><span class="font-medium">Multipliers:</span> recover \((\lambda,\nu)\) from a safeguarded
+                least-squares system using an estimated TR multiplier \(\sigma\).</li>
+            </ul>
+
+            <details class="mt-4">
+              <summary class="cursor-pointer text-slate-800 font-semibold">What’s inside the subproblem solve?</summary>
+              <div class="mt-2 text-slate-700 space-y-2">
+                <p><span class="font-medium">Normal step:</span> solve \(J_E p_n \approx -c_E(x_k)\), clipped to
+                  \(\Delta_n\) (and box). </p>
+                <p><span class="font-medium">Tangential step:</span> minimize the reduced quadratic in the nullspace \(
+                  \mathcal N(J_E)\) with Steihaug–Toint PCG; ellipsoidal metric handled by change of variables.</p>
+                <p><span class="font-medium">Active-set loop:</span> add the most violated \(J_I\) rows as temporary
+                  equalities until feasible within tolerance.</p>
+              </div>
+            </details>
         </article>
+
 
         <article class="step h-full">
           <div class="flex items-center gap-3 mb-3">
             <span class="step-number">2</span>
-            <h3 class="text-xl font-semibold">Interior-Point (Slack + Log-Barrier)</h3>
+            <h3 class="text-xl font-semibold">Interior-Point (Slack + Shifted Log-Barrier)</h3>
           </div>
-          <p class="text-slate-700">Introduce slacks $s&gt;0$ with barrier parameter $\mu$:</p>
-          <div class="math-nowrap">$$
-            \min_{x,s}\; f(x) - \mu \sum_j \log s_j\quad\text{s.t.}\; c_E(x)=0,\; c_I(x)+s=0.
+
+          <p class="text-slate-700">
+            We solve a slack-augmented, <em>optionally shifted</em> barrier problem with variable bounds:
+          </p>
+
+          <div class="math-nowrap mt-2">$$
+            \begin{aligned}
+            \min_{x,s}&\;\; f(x)\;-\;\mu\!\sum_{j}\log\big(s_j+\tau\big) \\
+            \text{s.t. }&\; c_E(x)=0,\;\; c_I(x)+s=0, \\
+            &\; \ell \le x \le u \quad (\text{optional}).
+            \end{aligned}
             $$</div>
-          <p class="text-slate-700 mt-2">Mehrotra predictor–corrector, fraction-to-boundary, and filter line search.</p>
+
+          <p class="text-slate-700 mt-3">
+            Bounds use shifted slacks \(s_L=x-\ell,\; s_U=u-x\) with duals \(z_L,z_U\) (and optional bound shift
+            \(\beta\)).
+            The perturbed complementarity conditions are:
+          </p>
+
+          <div class="math-nowrap mt-2">$$
+            (s+\tau)\odot\lambda=\mu,\qquad
+            (s_L+\beta)\odot z_L=\mu,\qquad
+            (s_U+\beta)\odot z_U=\mu.
+            $$</div>
+
+          <p class="text-slate-700 mt-3">
+            We form a regularized augmented system (HYKKT by default; LDLᵀ fallback) with diagonal
+            barriers \(\Sigma_x,\Sigma_s\) and solve predictor/corrector steps efficiently.
+          </p>
+
+          <div class="math-nowrap mt-2">$$
+            W \;\;=\;\; \nabla_{xx}^2 \mathcal{L}(x,\lambda,\nu)\;+\;\underbrace{\Sigma_x}_{z_L,z_U}\;+\;
+            J_I^\top \underbrace{\Sigma_s}_{\lambda,s}\, J_I,
+            $$</div>
+
+          <div class="math-nowrap">$$
+            \text{solve } \begin{bmatrix} W & J_E^\top \\ J_E & 0 \end{bmatrix}
+            \begin{bmatrix} \Delta x \\ \Delta \nu \end{bmatrix}
+            \;=\;
+            \begin{bmatrix} -r_d \\ -r_{p,E} \end{bmatrix},
+            \quad
+            \Delta s = -\big(c_I + J_I\,\Delta x\big),
+            \quad
+            \Delta\lambda,\Delta z_L,\Delta z_U \text{ from complementarity}.
+            $$</div>
+
+          <h4 class="font-semibold mt-4">Algorithmic Highlights</h4>
+          <ul class="list-disc pl-5 text-slate-700 space-y-1">
+            <li><span class="font-medium">Mehrotra Predictor–Corrector:</span> affine-scaling predictor, adaptive
+              centering \(\sigma = ((1-\alpha_{\mathrm{aff}})^2) ( \mu_{\mathrm{aff}}/\mu )^{p}\) with \(p\approx3\),
+              corrector with centrality & bounds terms.</li>
+            <li><span class="font-medium">Fraction-to-Boundary:</span> separate \(\tau_{\text{pri}},
+              \tau_{\text{dual}}\) caps for \(\alpha\) to keep \(s,\lambda,z_L,z_U>0\) and stay inside the shifted cone.
+            </li>
+            <li><span class="font-medium">Shifted Barrier (robustness):</span> automatic \(\tau\) (inequalities) and
+              \(\beta\) (bounds) adaptation to avoid tiny slacks and help with large residuals.</li>
+            <li><span class="font-medium">Gondzio Multi-Corrector (optional):</span> extra right-hand-side sweeps when
+              the affine step is short or complementarity is dispersed.</li>
+            <li><span class="font-medium">Higher-Order Correction (optional):</span> a capped second correction
+              \(\Delta^2 x\) based on the quadratic term \(J_I^\top(\Sigma_s J_I \Delta x)\) to reduce nonlinearity
+              error.</li>
+            <li><span class="font-medium">Tiny Trust Region on \(\Delta x\):</span> norm cap to prevent overly
+              aggressive steps when Hessian conditioning is marginal.</li>
+            <li><span class="font-medium">Filter/Armijo Line Search:</span> feasibility-aware merit bridge; if needed, a
+              <em>restoration</em> phase seeks a cheaper feasible point to resume progress.
+            </li>
+            <li><span class="font-medium">KKT Solves:</span> HYKKT with reuse & CG refinement; LDLᵀ fallback. Hessian is
+              regularized to be numerically PSD.</li>
+          </ul>
+
+          <details class="mt-4">
+            <summary class="cursor-pointer text-slate-800 font-semibold">Stopping &amp; μ-update</summary>
+            <div class="mt-2 text-slate-700 space-y-2">
+              <p>We stop when
+                \(\|r_d\|_\infty,\;\|c_E\|_\infty,\;\|c_I\|_\infty,\;\max\{\|(s+\tau)\odot\lambda-\mu\|_\infty,\|(s_L+\beta)\odot
+                z_L-\mu\|_\infty,\|(s_U+\beta)\odot z_U-\mu\|_\infty\}\)
+                are below tolerance and \(\mu\) is small.</p>
+              <p>\(\mu\) is decreased using a safeguarded schedule based on predictor quality, feasibility,
+                complementarity, and Hessian conditioning.</p>
+            </div>
+          </details>
         </article>
+
       </div>
 
       <!-- Single-column: AUTO -->
@@ -517,7 +660,8 @@ print("x* =", x_star, info.status)</code></pre>
           <div class="text-slate-500 text-xs font-semibold">STEP 1</div>
           <h4 class="font-semibold">Choose mode</h4>
           <p class="text-sm text-slate-700"><code>mode="sqp"</code>, <code>"ip"</code>, <code>"dfo"</code>, or
-            <code>"auto"</code>.</p>
+            <code>"auto"</code>.
+          </p>
         </div>
         <div class="border border-slate-200 rounded-xl p-4 bg-white">
           <div class="text-slate-500 text-xs font-semibold">STEP 2</div>
