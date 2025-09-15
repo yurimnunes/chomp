@@ -995,100 +995,83 @@ public:
     // A is n×n CSR (pattern-only). Return B = A[p, :][:, p].
     // If you don't need canonicalization, set sort_cols=false and dedup=false
     // for O(nnz).
-    static CSR permute_(const CSR &A, const std::vector<i32> &p,
-                        bool sort_cols = true, bool dedup = false) {
-        const i32 n = A.n;
-        if (n == 0)
-            return CSR(0);
-        const auto &AI = A.indptr;
-        const auto &AJ = A.indices;
+  // A is n×n CSR (pattern-only). Return B = A[p, :][:, p].
+// EXPECTS: p is NEW -> OLD (i.e., p[new] = old). This is what AMD returns here.
+static CSR permute_(const CSR &A, const std::vector<i32> &p,
+                    bool sort_cols = true, bool dedup = false) {
+    const i32 n = A.n;
+    if (n == 0) return CSR(0);
 
-        // ip: new row -> old row
-        std::vector<i32> ip = inverse_permutation(p);
+    const auto &AI = A.indptr;
+    const auto &AJ = A.indices;
 
-        CSR B(n);
-        B.indptr.assign(n + 1, 0);
+    // ip: OLD -> NEW
+    std::vector<i32> ip = inverse_permutation(p);
 
-        // 1) Row lengths (before optional dedup)
-        for (i32 i = 0; i < n; ++i) {
-            const i32 oi = ip[i];
-            B.indptr[i + 1] = B.indptr[i] + (AI[oi + 1] - AI[oi]);
-        }
-        B.indices.resize(B.indptr.back());
+    CSR B(n);
+    B.indptr.assign(n + 1, 0);
 
-// 2) Column remap fill
-#pragma omp parallel for if ((i64)B.indices.size() > (1 << 15))
-        for (i32 i = 0; i < n; ++i) {
-            const i32 oi = ip[i];
-            const i32 begA = AI[oi];
-            const i32 endA = AI[oi + 1];
-            i32 out = B.indptr[i];
-            for (i32 k = begA; k < endA; ++k) {
-                const i32 j_old = AJ[k];
-                B.indices[out++] = p[j_old];
-            }
-            if (sort_cols) {
-                auto beg = B.indices.begin() + B.indptr[i];
-                auto end = B.indices.begin() + out;
-                std::sort(beg, end);
-                if (dedup) {
-                    // compact this *row only* using a temp buffer to avoid UB
-                    // (Alternatively: unique in-place then rewrite row.)
-                    auto new_end = std::unique(beg, end);
-                    const i32 new_len = (i32)std::distance(beg, new_end);
-                    const i32 old_len = out - B.indptr[i];
-                    if (new_len < old_len) {
-                        // rewrite row compactly
-                        std::copy(beg, new_end, beg);
-                        // we can't shrink the whole indices array per-row
-                        // without shifting tails, so we leave extra slots
-                        // "garbage" for now and fix in a second pass. Mark the
-                        // effective length via a side array.
-                    }
-                }
-            }
-        }
-
-        if (dedup) {
-            // Second pass: rebuild a compact indices array using the
-            // sorted+uniqued rows.
-            std::vector<i32> new_indptr(n + 1, 0);
-            // compute exact lengths by re-uniqueing cheaply (rows are sorted
-            // already)
-            for (i32 i = 0; i < n; ++i) {
-                const i32 rb = B.indptr[i];
-                const i32 re = B.indptr[i + 1];
-                if (re <= rb) {
-                    new_indptr[i + 1] = new_indptr[i];
-                    continue;
-                }
-                i32 len = 1;
-                for (i32 k = rb + 1; k < re; ++k) {
-                    if (B.indices[k] != B.indices[k - 1])
-                        ++len;
-                }
-                new_indptr[i + 1] = new_indptr[i] + len;
-            }
-            std::vector<i32> new_indices(new_indptr.back());
-            // fill compacted rows
-            for (i32 i = 0; i < n; ++i) {
-                const i32 rb = B.indptr[i];
-                const i32 re = B.indptr[i + 1];
-                i32 out = new_indptr[i];
-                if (re > rb) {
-                    new_indices[out++] = B.indices[rb];
-                    for (i32 k = rb + 1; k < re; ++k) {
-                        if (B.indices[k] != B.indices[k - 1])
-                            new_indices[out++] = B.indices[k];
-                    }
-                }
-            }
-            B.indptr.swap(new_indptr);
-            B.indices.swap(new_indices);
-        }
-
-        return B;
+    // 1) Row lengths: new row i corresponds to old row oi = p[i]
+    for (i32 i = 0; i < n; ++i) {
+        const i32 oi = p[i];                 // old row index
+        B.indptr[i + 1] = B.indptr[i] + (AI[oi + 1] - AI[oi]);
     }
+    B.indices.resize(B.indptr.back());
+
+    // 2) Columns: old col j_old maps to new col ip[j_old]
+    #pragma omp parallel for if ((i64)B.indices.size() > (1 << 15))
+    for (i32 i = 0; i < n; ++i) {
+        const i32 oi = p[i];                 // old row for new row i
+        const i32 begA = AI[oi];
+        const i32 endA = AI[oi + 1];
+        i32 out = B.indptr[i];
+        for (i32 k = begA; k < endA; ++k) {
+            const i32 j_old = AJ[k];
+            B.indices[out++] = ip[j_old];    // new column index
+        }
+        if (sort_cols) {
+            auto beg = B.indices.begin() + B.indptr[i];
+            auto end = B.indices.begin() + out;
+            std::sort(beg, end);
+            if (dedup) {
+                auto new_end = std::unique(beg, end);
+                // We'll compact fully in a second pass below if dedup=true.
+            }
+        }
+    }
+
+    if (dedup) {
+        // Rebuild compact indices + indptr after per-row unique
+        std::vector<i32> new_indptr(n + 1, 0);
+        for (i32 i = 0; i < n; ++i) {
+            const i32 rb = B.indptr[i];
+            const i32 re = B.indptr[i + 1];
+            if (re <= rb) { new_indptr[i + 1] = new_indptr[i]; continue; }
+            // rows already sorted; count unique
+            i32 len = 1;
+            for (i32 k = rb + 1; k < re; ++k)
+                if (B.indices[k] != B.indices[k - 1]) ++len;
+            new_indptr[i + 1] = new_indptr[i] + len;
+        }
+        std::vector<i32> new_indices(new_indptr.back());
+        for (i32 i = 0; i < n; ++i) {
+            const i32 rb = B.indptr[i];
+            const i32 re = B.indptr[i + 1];
+            i32 out = new_indptr[i];
+            if (re > rb) {
+                new_indices[out++] = B.indices[rb];
+                for (i32 k = rb + 1; k < re; ++k)
+                    if (B.indices[k] != B.indices[k - 1])
+                        new_indices[out++] = B.indices[k];
+            }
+        }
+        B.indptr.swap(new_indptr);
+        B.indices.swap(new_indices);
+    }
+
+    return B;
+}
+
 
     static i32 bandwidth_(const CSR &A) {
         if (A.nnz() == 0)
@@ -1121,32 +1104,44 @@ struct SupernodeInfo {
 // Build strictly lower-triangular symmetric pattern of A[p,p] ∪ A[p,p]^T
 static CSR make_lower_sym(const CSR &A, const std::vector<i32> &p) {
     const i32 n = A.n;
-    CSR P =
-        AMDReorderingArray::permute_(A, p, /*sort_cols=*/true, /*dedup=*/true);
-    // symmetrize (pattern only) and keep strict lower
-    std::vector<std::vector<i32>> rows(n);
+    CSR P = AMDReorderingArray::permute_(A, p, true, true);
+
+    // Count degrees for LOWER triangle (i > j, stored at row i)
+    std::vector<i32> deg(n, 0);
     for (i32 i = 0; i < n; ++i) {
-        for (i32 k = P.indptr[i]; k < P.indptr[i + 1]; ++k) {
-            i32 j = P.indices[k];
-            if (j == i)
-                continue;
-            i32 r = std::max(i, j), c = std::min(i, j);
-            rows[r].push_back(c);
+        const i32 rb = P.indptr[i], re = P.indptr[i + 1];
+        for (i32 k = rb; k < re; ++k) {
+            const i32 j = P.indices[k];
+            if (i > j)
+                ++deg[i]; // Store (i,j) in row i of lower triangle
         }
     }
+
     CSR L(n);
-    L.indptr[0] = 0;
-    for (i32 i = 0; i < n; ++i) {
-        auto &r = rows[i];
-        std::sort(r.begin(), r.end());
-        r.erase(std::unique(r.begin(), r.end()), r.end());
-        L.indptr[i + 1] = L.indptr[i] + (i32)r.size();
-    }
+    L.indptr.assign(n + 1, 0);
+    for (i32 r = 0; r < n; ++r)
+        L.indptr[r + 1] = L.indptr[r] + deg[r];
     L.indices.resize(L.indptr.back());
-    for (i32 i = 0, w = 0; i < n; ++i) {
-        for (i32 v : rows[i])
-            L.indices[w++] = v;
+
+    std::vector<i32> wr = L.indptr;
+
+    // Fill: (i,j) with i > j goes to row i
+    for (i32 i = 0; i < n; ++i) {
+        const i32 rb = P.indptr[i], re = P.indptr[i + 1];
+        for (i32 k = rb; k < re; ++k) {
+            const i32 j = P.indices[k];
+            if (i > j)
+                L.indices[wr[i]++] = j; // Column j in row i
+        }
     }
+
+    // Sort each row
+    for (i32 r = 0; r < n; ++r) {
+        auto beg = L.indices.begin() + L.indptr[r];
+        auto end = L.indices.begin() + L.indptr[r + 1];
+        std::sort(beg, end);
+    }
+
     return L;
 }
 
@@ -1154,25 +1149,40 @@ static CSR make_lower_sym(const CSR &A, const std::vector<i32> &p) {
 // cols < i)
 static std::vector<i32> etree_from_lower(const CSR &L) {
     const i32 n = L.n;
+
+    // Build column-wise access: col_lists[j] = {rows i where L(i,j) != 0}
+    std::vector<std::vector<i32>> col_lists(n);
+    for (i32 i = 0; i < n; ++i) {
+        for (i32 p = L.indptr[i]; p < L.indptr[i + 1]; ++p) {
+            i32 j = L.indices[p]; // j < i
+            col_lists[j].push_back(i);
+        }
+    }
+
+    // Sort each column's row list
+    for (auto &col : col_lists) {
+        std::sort(col.begin(), col.end());
+    }
+
+    // Process in column order - Liu's algorithm
     std::vector<i32> parent(n, -1), ancestor(n, -1);
     for (i32 j = 0; j < n; ++j) {
-        for (i32 p = L.indptr[j]; p < L.indptr[j + 1]; ++p) {
-            i32 i = L.indices[p]; // i < j in lower
-            // find with path compression
-            while (i != -1 && i < j) {
-                i32 next = ancestor[i];
-                ancestor[i] = j;
+        for (i32 i : col_lists[j]) { // i > j
+            // Find path from j up the current tree
+            i32 r = j;
+            while (r != -1 && r < i) { // Changed condition: r < i
+                i32 next = ancestor[r];
+                ancestor[r] = i; // Path compression to i
                 if (next == -1) {
-                    parent[i] = j;
+                    parent[r] = i; // Changed: parent[r] = i (not j)
                     break;
                 }
-                i = next;
+                r = next;
             }
         }
     }
     return parent;
 }
-
 // Postorder of a rooted forest (etree) — iterative DFS
 static std::vector<i32> postorder_etree(const std::vector<i32> &parent) {
     const i32 n = (i32)parent.size();
@@ -1220,24 +1230,29 @@ static std::vector<i32> postorder_etree(const std::vector<i32> &parent) {
 // thresholds:
 //   - up to "relax" absolute extra/missing entries, AND
 //   - Jaccard >= tau (0..1).
+#include <algorithm> // std::upper_bound, std::equal, std::sort, std::unique
+
+// Compare two sorted index lists A (rows > cutA) and B (rows > cutB) with
+// relaxed amalgamation. Returns true if equal OR within thresholds:
+//   - up to `relax` total extra/missing entries, AND
+//   - Jaccard >= tau (0..1).
 static bool structural_match_relaxed(const i32 *A, i32 lenA, i32 cutA,
                                      const i32 *B, i32 lenB, i32 cutB,
                                      int relax, double tau) {
-    // advance to strictly-greater-than-cut
-    while (lenA > 0 && *A <= cutA) {
-        ++A;
-        --lenA;
-    }
-    while (lenB > 0 && *B <= cutB) {
-        ++B;
-        --lenB;
-    }
+    // Advance past cuts
+    const i32 *Aend = A + lenA;
+    const i32 *Bend = B + lenB;
+    A = std::upper_bound(A, Aend, cutA);
+    B = std::upper_bound(B, Bend, cutB);
+    lenA = static_cast<i32>(Aend - A);
+    lenB = static_cast<i32>(Bend - B);
 
-    // exact early-out
+    // Exact match early-out
     if (relax <= 0 && lenA == lenB && std::equal(A, A + lenA, B))
         return true;
 
-    int i = 0, j = 0, inter = 0;
+    // Count intersection
+    i32 i = 0, j = 0, inter = 0;
     while (i < lenA && j < lenB) {
         if (A[i] == B[j]) {
             ++inter;
@@ -1249,14 +1264,17 @@ static bool structural_match_relaxed(const i32 *A, i32 lenA, i32 cutA,
             ++j;
         }
     }
-    int uni = lenA + lenB - inter;
-    int diff = uni - inter; // total mismatched count
-    if (diff > relax)
+
+    // Correct symmetric difference and Jaccard
+    const i32 uni = lenA + lenB - inter;          // union size
+    const i32 sym_diff = lenA + lenB - 2 * inter; // symmetric difference
+
+    if (sym_diff > relax)
         return false;
-    double jac = (uni == 0) ? 1.0 : double(inter) / double(uni);
+
+    const double jac = (uni == 0) ? 1.0 : double(inter) / double(uni);
     return jac >= tau;
 }
-
 // Identify supernodes on permuted pattern. Returns ranges in PERMUTED indices.
 static SupernodeInfo identify_supernodes(
     const CSR &A, const std::vector<i32> &p,

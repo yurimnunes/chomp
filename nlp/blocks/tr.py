@@ -66,6 +66,15 @@ class TRConfig:
     theta_crit: float = 0.5  # radius shrink factor on criticality
     max_crit_shrinks: int = 1  # at most this many back-to-back shrinks
 
+    # -------- NEW: TR geometry --------
+    norm_type: str = "ellip"       # {"2", "ellip"}
+    metric_shift: float = 1e-8 # small ridge to make M ≻ 0 when built from H
+    tau_ftb: float = 0.995  # fraction-to-boundary safety factor for box feasibility
+    history_length: int = 10  # for adaptive strategies
+    non_monotone: bool = False  # use non-monotone TR radius update
+    non_monotone_window: int = 5  # window size for non-monotone updates
+    max_iter: int = 100  # max TR iterations (for safety)
+
 
 class TRStatus(Enum):
     SUCCESS = "success"
@@ -151,12 +160,11 @@ def nullspace_basis(A: np.ndarray, rcond: float = 1e-12) -> np.ndarray:
     except la.LinAlgError:
         Q, R, P = la.qr(A.T, mode="economic", pivoting=True)
         rank = np.sum(np.abs(np.diag(R)) > rcond * np.abs(R[0, 0].max() if R.size else 1.0))
-        # For QR with pivoting, reconstruct nullspace using permutation
         null_dim = A.shape[1] - rank
         if null_dim <= 0:
             return np.zeros((A.shape[1], 0))
-        # Basic fallback: use SVD instead on error
-        return nullspace_basis(A, rcond * 10)  # Increase rcond to avoid recursion depth
+        return nullspace_basis(A, rcond * 10)  # fallback
+
 
 def dogleg_step(
     g: Vec, Hg: Vec, gnorm: float, Delta: float, reg: float = 1e-10
@@ -256,6 +264,16 @@ class Preconditioner:
             return np.asarray(z, dtype=np.float64)
         z = self.func(r)
         return np.asarray(z, dtype=np.float64)
+
+class MetricPreconditioner(Preconditioner):
+    """z = (L L^T)^{-1} r via two triangular solves."""
+    def __init__(self, L: np.ndarray):
+        self.L = np.asarray(L, dtype=np.float64)
+    def apply(self, r: np.ndarray) -> np.ndarray:
+        # Solve L y = r; then L^T z = y
+        y = la.solve_triangular(self.L, r, lower=True, check_finite=False)
+        z = la.solve_triangular(self.L.T, y, lower=False, check_finite=False)
+        return z
 
 
 def make_jacobi_from_H(H: MatLike) -> Optional[np.ndarray]:
@@ -581,135 +599,267 @@ def _boundary_intersection(p: Vec, d: Vec, Delta: float) -> float:
     return (-pTd + np.sqrt(disc)) / dTd
 
 
+def low_rank_cholesky_update(L: np.ndarray, U: np.ndarray) -> np.ndarray:
+    """
+    Perform a low-rank update of the Cholesky factor L of M = L L^T:
+    M_new = M + U U^T  =>  find L_new with M_new = L_new L_new^T
+    """
+    k = U.shape[1]
+    L_new = L.copy()
+    for i in range(k):
+        u = U[:, i]
+        for j in range(L_new.shape[0]):
+            r = np.sqrt(L_new[j, j]**2 + u[j]**2)
+            c = r / L_new[j, j]
+            s = u[j] / L_new[j, j]
+            L_new[j, j] = r
+            if j + 1 < L_new.shape[0]:
+                L_new[j + 1 :, j] = (L_new[j + 1 :, j] + s * u[j + 1 :]) / c
+                u[j + 1 :] = c * u[j + 1 :] - s * L_new[j + 1 :, j]
+    return L_new
 # ---------------------------- Main TR Manager ---------------------------- #
+# ---------------------------- Main TR Manager (clean) ---------------------------- #
 class TrustRegionManager:
     """
-    Modern Trust Region manager with Byrd-Omojokun decomposition for SQP.
-    Key features:
-    - Normal/tangential step decomposition for equality constraints
-    - Active-set strategy for inequality constraints
-    - Adaptive zeta and curvature-aware radius updates
-    - Robust numerical handling with iterative solver support
-    - Multiplier recovery for SQP iterations
-    - Criticality step & safeguard
+    Modern Trust Region manager with Byrd–Omojokun decomposition for SQP.
+    Supports Euclidean ("2") and Ellipsoidal ("ellip") trust-region norms.
     """
 
     def __init__(self, config: Optional[TRConfig] = None):
         self.cfg = TRConfig()
         self.delta = self.cfg.delta0
         self.rejection_count = 0
+
         # Adaptive state
-        self._rho_history = []
-        self._feasibility_history = []
-        self._curvature_estimate = None
+        self._rho_history: list[float] = []
+        self._feasibility_history: list[float] = []
+        self._curvature_estimate: Optional[float] = None
+        self._f_history: list[float] = []
+        self._last_was_criticality = False
+
         # Nullspace cache
         self._nullspace_cache: Dict[int, np.ndarray] = {}
         self._last_A_eq_hash: Optional[int] = None
-        self._last_was_criticality = False
 
-    def solve(
-        self,
-        H: MatLike,
-        g: Vec,
-        A_ineq: Optional[np.ndarray] = None,
-        b_ineq: Optional[Vec] = None,
-        A_eq: Optional[np.ndarray] = None,
-        b_eq: Optional[Vec] = None,
-    ) -> Tuple[Vec, Dict[str, Any], Vec, Vec]:
-        """
-        Solve trust region subproblem with mixed constraints.
-        min g^T p + 0.5 p^T H p
-        s.t. A_eq p + b_eq = 0
-             A_ineq p + b_ineq <= 0
-             ||p|| <= delta
-        Returns: step, info dict, inequality multipliers, equality multipliers
-        """
-        # Input validation
-        n = g.size
-        if g.ndim != 1:
-            raise ValueError("g must be a 1D array")
-        if H.shape != (n, n):
-            raise ValueError(f"H must have shape ({n}, {n})")
-        if A_eq is not None:
-            A_eq = np.asarray(A_eq)
-            if A_eq.shape[1] != n:
-                raise ValueError(f"A_eq must have {n} columns")
-            if b_eq is None or b_eq.size != A_eq.shape[0]:
-                raise ValueError("b_eq must match A_eq rows")
-            b_eq = np.asarray(b_eq).ravel()
-        if A_ineq is not None:
-            A_ineq = np.asarray(A_ineq)
-            if A_ineq.shape[1] != n:
-                raise ValueError(f"A_ineq must have {n} columns")
-            if b_ineq is None or b_ineq.size != A_ineq.shape[0]:
-                raise ValueError("b_ineq must match A_ineq rows")
-            b_ineq = np.asarray(b_ineq).ravel()
+        # Metric
+        self.norm_type: str = self.cfg.norm_type
+        self.M: Optional[np.ndarray] = None     # SPD metric
+        self._L: Optional[np.ndarray] = None    # M = L L^T
 
-        if A_eq is not None and A_eq.size > 0:
-            p, info, lam, nu = self._solve_with_equality_constraints(
-                H, g, A_eq, b_eq, A_ineq, b_ineq
-            )
-        elif A_ineq is not None and A_ineq.size > 0:
-            p, info, lam, nu = self._solve_with_inequality_constraints(
-                H, g, A_ineq, b_ineq
-            )
-        else:
-            p, info = self._solve_unconstrained(H, g)
-            lam, nu = np.array([]), np.array([])
-        return p, info, lam, nu
+        # Box context (set by solve())
+        self._box_ctx: Optional[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]] = None
 
-    # ---------- Criticality utilities ----------
+    # ------------------------- Generic small helpers ------------------------- #
+    def _alpha_max_box(self, x: np.ndarray, s: np.ndarray,
+                       lb: Optional[np.ndarray], ub: Optional[np.ndarray],
+                       tau: Optional[float] = None) -> float:
+        """Largest alpha in (0,1] so x + alpha*s respects [lb, ub]."""
+        if (lb is None and ub is None) or s.size == 0:
+            return 1.0
+        tau = self.cfg.tau_ftb if tau is None else float(tau)
+        amax = 1.0
+        if lb is not None:
+            neg = s < 0
+            if np.any(neg):
+                amax = min(amax, np.min((lb[neg] - x[neg]) / s[neg]))
+        if ub is not None:
+            pos = s > 0
+            if np.any(pos):
+                amax = min(amax, np.min((ub[pos] - x[pos]) / s[pos]))
+        return float(np.clip(tau * max(0.0, amax), 0.0, 1.0))
+
+    def _enforce_box_on_step(self, x: np.ndarray, p: np.ndarray,
+                             lb: Optional[np.ndarray], ub: Optional[np.ndarray],
+                             tau: Optional[float] = None) -> np.ndarray:
+        if p.size == 0 or (lb is None and ub is None):
+            return p
+        a = self._alpha_max_box(x, p, lb, ub, tau)
+        return a * p
+
+    def _maybe_enforce_box(self, p: np.ndarray) -> np.ndarray:
+        if self._box_ctx is None:
+            return p
+        x0, lb0, ub0 = self._box_ctx
+        return self._enforce_box_on_step(x0, p, lb0, ub0)
+
+    def _metric_factor(self) -> Optional[np.ndarray]:
+        """Return L such that M = L L^T, or None if Euclidean."""
+        return self._L if (self.norm_type == "ellip" and self._L is not None) else None
+
+    def _tr_norm(self, p: Vec) -> float:
+        L = self._metric_factor()
+        if L is None:
+            return safe_norm(p)
+        # ‖p‖_M = ‖Lᵀ p‖₂
+        y = L.T @ p
+        return float(np.linalg.norm(y))
+
+    def _clip_to_radius(self, p: Vec, Delta: float) -> Vec:
+        nrm = self._tr_norm(p)
+        return p if (nrm <= Delta or nrm <= 1e-16) else (Delta / nrm) * p
+
+    def _clip_and_box(self, p: np.ndarray) -> np.ndarray:
+        p = self._clip_to_radius(p, self.delta)
+        return self._maybe_enforce_box(p)
+
+    # ------------------------- Metric controls (unchanged behavior) ------------------------- #
+    def update_metric(self, M_new: np.ndarray) -> None:
+        if self.M is not None and self._L is not None:
+            # Low-rank-ish try; fallback to full set_metric
+            U = M_new - self.M
+            try:
+                self._L = low_rank_cholesky_update(self._L, U)
+                self.M = 0.5 * (M_new + M_new.T)
+                return
+            except la.LinAlgError:
+                pass
+        self.set_metric(M_new)
+
+    def set_metric(self, M: np.ndarray) -> None:
+        if self.norm_type != "ellip":
+            self.M, self._L = None, None
+            return
+        S = 0.5 * (M + M.T)
+        try:
+            L = la.cholesky(S, lower=True, check_finite=True)
+            self.M, self._L = S, L
+        except la.LinAlgError:
+            w, V = la.eigh(S)
+            shift = max(self.cfg.metric_shift, 1e-12 - float(np.min(w)))
+            w_pos = np.maximum(w + shift, self.cfg.metric_shift)
+            S_pos = (V * w_pos) @ V.T
+            L = la.cholesky(S_pos, lower=True)
+            self.M, self._L = S_pos, L
+
+    def set_metric_from_H(self, H: MatLike) -> None:
+        if self.norm_type != "ellip":
+            self.M, self._L = None, None
+            return
+        Hd = H if isinstance(H, np.ndarray) else (H.toarray() if sp.issparse(H) else np.asarray(H))
+        S = 0.5 * (Hd + Hd.T)
+        try:
+            w = np.linalg.eigvalsh(S)
+            lam_min = float(np.min(w)) if w.size else 1.0
+        except Exception:
+            lam_min = 0.0
+        tau = max(self.cfg.metric_shift, -lam_min + self.cfg.metric_shift)
+        self.set_metric(S + tau * np.eye(S.shape[0]))
+
+    # ------------------------- Projectors / criticality ------------------------- #
     def _projected_grad_norm(self, g: Vec, A_eq: Optional[np.ndarray]) -> float:
-        """
-        ||P_T g|| where T is the tangent space of {A_eq p + b_eq = 0}.
-        Uses the projector P = I - A^T (A A^T)^† A, implemented via a
-        robust normal-equations solve with light Tikhonov.
-        """
         if A_eq is None or A_eq.size == 0:
-            return safe_norm(g)
+            return self._tr_norm(g) if self._metric_factor() is not None else safe_norm(g)
         A = np.asarray(A_eq, dtype=float)
         reg = max(self.cfg.reg_floor, 1e-12)
         Ag = A @ g
         try:
             yy = la.solve(A @ A.T + reg * np.eye(A.shape[0]), Ag, assume_a="pos")
         except la.LinAlgError:
-            yy = la.lstsq(A @ A.T + reg * np.eye(A.shape[0]), Ag, cond=self.cfg.rcond)[
-                0
-            ]
+            yy = la.lstsq(A @ A.T + reg * np.eye(A.shape[0]), Ag, cond=self.cfg.rcond)[0]
         g_tan = g - A.T @ yy
-        return safe_norm(g_tan)
+        return self._tr_norm(g_tan) if self._metric_factor() is not None else safe_norm(g_tan)
 
-    # ---------- Unconstrained subproblem ----------
-    def _solve_unconstrained(self, H: MatLike, g: Vec) -> Tuple[Vec, Dict[str, Any]]:
+    def _project_to_tangent(self, v: Vec, A_eq: Optional[np.ndarray]) -> Vec:
+        if A_eq is None or A_eq.size == 0:
+            return v
+        A = np.asarray(A_eq, dtype=float)
+        reg = max(self.cfg.reg_floor, 1e-12)
+        try:
+            y = la.solve(A @ A.T + reg * np.eye(A.shape[0]), A @ v, assume_a="pos")
+        except la.LinAlgError:
+            y = la.lstsq(A @ A.T + reg * np.eye(A.shape[0]), A @ v, cond=self.cfg.rcond)[0]
+        return v - A.T @ y
+
+    # ------------------------- Common numerics ------------------------- #
+    def _cg_tol(self, gnorm: float) -> float:
+        return min(self.cfg.cg_tol, self.cfg.cg_tol_rel * max(gnorm, 1e-16))
+
+    def _model_reduction(self, H: MatLike, g: Vec, p: Vec) -> float:
+        H_op = make_operator(H, p.size)
+        return -(float(np.dot(g, p)) + 0.5 * float(np.dot(p, H_op @ p)))
+
+    def model_reduction_alpha(self, H: MatLike, g: Vec, p: Vec, alpha: float) -> float:
+        if p.size == 0 or alpha == 0.0:
+            return 0.0
+        H_op = make_operator(H, p.size)
+        Hp = H_op @ p
+        gTp = float(np.dot(g, p))
+        pTHp = float(np.dot(p, Hp))
+        return alpha * (-gTp) - 0.5 * (alpha * alpha) * pTHp
+
+    def _estimate_sigma(self, H_op: spla.LinearOperator, g: Vec, p: Vec) -> float:
+        if p.size == 0:
+            return 0.0
+        Hp = H_op @ p
+        num = float(np.dot(p, Hp + g))
+        den = (self._tr_norm(p) ** 2)
+        if den <= 1e-14:
+            return 0.0
+        sigma = -num / den
+        return max(0.0, sigma)
+
+    def _compute_ratio(self, pred_red: float, act_red: float) -> float:
+        if abs(pred_red) < 1e-14:
+            return 1.0 if abs(act_red) < 1e-14 else (10.0 if act_red > 0 else -10.0)
+        return float(np.clip(act_red / pred_red, -100.0, 100.0))
+
+    def _curvature_along(self, H: MatLike, p: Vec) -> Optional[float]:
+        try:
+            H_op = make_operator(H, p.size)
+            Hp = H_op @ p
+            pTp = float(np.dot(p, p)) if self._metric_factor() is None else (self._tr_norm(p) ** 2)
+            curv = float(np.dot(p, Hp) / max(pTp, 1e-16))
+            if isinstance(H, np.ndarray):
+                eigvals = np.linalg.eigvalsh(H)
+                if eigvals.size:
+                    cond = max(abs(eigvals)) / max(1e-16, min(abs(eigvals)))
+                    curv *= min(1.0, 1e3 / cond)  # light damping if ill-conditioned
+            return curv
+        except Exception:
+            return None
+
+    # ------------------------- Unified CG runner (Euclidean or metric) ------------------------- #
+    def _run_cg(self, H, g, Delta, tol, prec=None):
         n = g.size
         H_op = make_operator(H, n)
-        g_norm = safe_norm(g)
-        tol = min(self.cfg.cg_tol, self.cfg.cg_tol_rel * g_norm)
+        L = self._metric_factor()
+        if L is None:
+            return steihaug_cg_fast(H_op, g, Delta, tol, self.cfg.cg_maxiter,
+                                    self.cfg.neg_curv_tol, prec=prec)
+        # Metric preconditioning directly in p-space:
+        Mprec = MetricPreconditioner(L)
+        return steihaug_cg_fast(H_op, g, Delta, tol, self.cfg.cg_maxiter,
+                                self.cfg.neg_curv_tol, prec=Mprec.apply)
 
-        # Criticality safeguard (unconstrained: ||P_T g|| == ||g||)
+    # ------------------------- Unconstrained subproblem ------------------------- #
+    def _solve_unconstrained(self, H: MatLike, g: Vec) -> Tuple[Vec, Dict[str, Any]]:
+        g_norm = self._tr_norm(g) if self._metric_factor() is not None else safe_norm(g)
+        tol = self._cg_tol(g_norm)
+
+        # Criticality safeguard
         crit_used = False
         crit_shrinks = 0
         if self.cfg.criticality_enabled:
             for _ in range(self.cfg.max_crit_shrinks):
-                if safe_norm(g) <= self.cfg.kappa_g * self.delta:
+                if self._projected_grad_norm(g, None) <= self.cfg.kappa_g * self.delta:
                     self.delta = max(self.cfg.delta_min, self.cfg.theta_crit * self.delta)
-                    crit_used = True
-                    crit_shrinks += 1
+                    crit_used, crit_shrinks = True, crit_shrinks + 1
                 else:
                     break
 
-        # Preconditioner (optional)
+        # Preconditioner (Euclidean only)
         prec = None
-        if self.cfg.use_prec and self.cfg.prec_kind == "auto_jacobi":
+        if self.cfg.use_prec and self.cfg.prec_kind == "auto_jacobi" and self._metric_factor() is None:
             prec = make_jacobi_from_H(H)
 
-        p, status, iters = steihaug_cg_fast(
-            H, g, self.delta, tol, self.cfg.cg_maxiter, self.cfg.neg_curv_tol, prec=prec
-        )
+        p, status, iters = self._run_cg(H, g, self.delta, tol, prec=prec)
+        p = self._clip_and_box(p)
+
+        H_op = make_operator(H, g.size)
         info = {
-            "status": status.value,
-            "iterations": iters,
-            "step_norm": safe_norm(p),
+            "status": status.value if isinstance(status, TRStatus) else str(status),
+            "iterations": int(iters),
+            "step_norm": self._tr_norm(p),
             "model_reduction": self._model_reduction(H_op, g, p),
             "criticality": crit_used,
             "criticality_shrinks": crit_shrinks,
@@ -718,75 +868,41 @@ class TrustRegionManager:
         self._last_was_criticality = bool(crit_used)
         return p, info
 
-    # ---------- Equality-constrained subproblem ----------
+    # ------------------------- Equality-constrained subproblem ------------------------- #
     def _solve_with_equality_constraints(
         self,
-        H: MatLike,
-        g: Vec,
-        A_eq: np.ndarray,
-        b_eq: Vec,
-        A_ineq: Optional[np.ndarray] = None,
-        b_ineq: Optional[Vec] = None,
+        H: MatLike, g: Vec, A_eq: np.ndarray, b_eq: Vec,
+        A_ineq: Optional[np.ndarray] = None, b_ineq: Optional[Vec] = None,
     ) -> Tuple[Vec, Dict[str, Any], Vec, Vec]:
-        """
-        Equality-constrained trust-region subproblem via Byrd–Omojokun split.
-
-        Solves
-            min_p   g^T p + 0.5 p^T H p
-            s.t.    A_eq p + b_eq = 0
-                    A_ineq p + b_ineq <= 0   (handled by active-set augmentation)
-                    ||p|| <= delta
-
-        Returns
-        -------
-        p : np.ndarray
-            Step (normal + tangential).
-        info : dict
-            Diagnostics for this subproblem solve.
-        lam : np.ndarray
-            Inequality multipliers (aligned with A_ineq rows; zero on inactive).
-        nu : np.ndarray
-            Equality multipliers.
-        """
         n = g.size
         H_op = make_operator(H, n)
 
-        # --- Criticality safeguard in the tangent space ---
+        # Criticality safeguard in tangent space
         crit_used = False
         crit_shrinks = 0
         if self.cfg.criticality_enabled:
             for _ in range(self.cfg.max_crit_shrinks):
-                pg = self._projected_grad_norm(g, A_eq)
-                if pg <= self.cfg.kappa_g * self.delta:
+                if self._projected_grad_norm(g, A_eq) <= self.cfg.kappa_g * self.delta:
                     self.delta = max(self.cfg.delta_min, self.cfg.theta_crit * self.delta)
-                    crit_used = True
-                    crit_shrinks += 1
+                    crit_used, crit_shrinks = True, crit_shrinks + 1
                 else:
                     break
 
-        # --- Adaptive zeta based on current equality residual ---
+        # Adaptive ζ
         viol_norm = safe_norm(b_eq)
-        zeta = (
-            self._adaptive_zeta(viol_norm, len(self._feasibility_history))
-            if self.cfg.adaptive_zeta
-            else self.cfg.zeta
-        )
+        zeta = self._adaptive_zeta(viol_norm, len(self._feasibility_history)) if self.cfg.adaptive_zeta else self.cfg.zeta
 
-        # =======================
-        # Step 1: normal (feasibility) step
-        # =======================
+        # Step 1: normal step
         delta_n = zeta * self.delta
         try:
-            # Use true residual here: b_eq = c_E(x) at the OUTER level.
             p_n = la.lstsq(A_eq, -b_eq, cond=self.cfg.rcond)[0]
-            if safe_norm(p_n) > delta_n:
-                p_n = (delta_n / safe_norm(p_n)) * p_n
+            if self._tr_norm(p_n) > delta_n:
+                p_n = self._clip_to_radius(p_n, delta_n)
+                p_n = self._maybe_enforce_box(p_n)
         except la.LinAlgError:
             p_n = np.zeros(n)
 
-        # =======================
-        # Step 2: tangential step in nullspace of A_eq
-        # =======================
+        # Step 2: tangential in nullspace
         A_eq_hash = hash(A_eq.tobytes()) if self.cfg.cache_nullspace else None
         if self.cfg.cache_nullspace and self._last_A_eq_hash == A_eq_hash:
             Z = self._nullspace_cache[A_eq_hash]
@@ -797,18 +913,18 @@ class TrustRegionManager:
                 self._last_A_eq_hash = A_eq_hash
 
         if Z.shape[1] == 0:
-            # No tangent space available (constraints full rank covering R^n)
-            p = p_n
+            # No tangent space
+            p = self._clip_and_box(p_n)
             sigma = self._estimate_sigma(H_op, g, p)
             lam, nu = self._recover_multipliers(H_op, g, p, sigma, A_eq, A_ineq, None)
             info = {
                 "status": "constrained_minimum",
-                "normal_step_norm": safe_norm(p_n),
+                "normal_step_norm": self._tr_norm(p_n),
                 "tangential_step_norm": 0.0,
-                "step_norm": safe_norm(p),
+                "step_norm": self._tr_norm(p),
                 "constraint_violation": safe_norm(A_eq @ p + b_eq),
                 "nullspace_dim": 0,
-                "model_reduction": self._model_reduction(H_op, g, p),
+                "model_reduction": self._model_reduction(H, g, p),
                 "zeta_used": zeta,
                 "criticality": crit_used,
                 "criticality_shrinks": crit_shrinks,
@@ -817,136 +933,132 @@ class TrustRegionManager:
             }
             return p, info, lam, nu
 
-        # Reduced TR on tangent space
-        HZ = H_op @ Z
-        H_reduced = Z.T @ HZ
-        g_reduced = Z.T @ (H_op @ p_n + g)
-        remaining_radius = np.sqrt(max(0.0, self.delta**2 - safe_norm(p_n) ** 2))
+        g_tilde = g + H_op @ p_n
 
-        tol_red = min(self.cfg.cg_tol, self.cfg.cg_tol_rel * safe_norm(g_reduced))
-        prec_red = (
-            make_jacobi_from_H(H_reduced)
-            if self.cfg.use_prec and self.cfg.prec_kind == "auto_jacobi"
-            else None
-        )
+        # Reduced TR radius
+        remaining = max(0.0, self.delta**2 - self._tr_norm(p_n)**2)
+        remaining_radius = np.sqrt(remaining)
 
-        p_t_red, status, iters = steihaug_cg_fast(
-            H_reduced,
-            g_reduced,
-            remaining_radius,
-            tol_red,
-            self.cfg.cg_maxiter,
-            self.cfg.neg_curv_tol,
-            prec=prec_red,
-        )
-        p_t = Z @ p_t_red
+        # Reduced solve (metric-aware)
+        L = self._metric_factor()
+        if L is not None:
+            Mr = Z.T @ (self.M @ Z)
+            try:
+                Lr = la.cholesky(Mr, lower=True)
+            except la.LinAlgError:
+                wr, Vr = la.eigh(Mr)
+                wr = np.maximum(wr, self.cfg.metric_shift)
+                Mr = (Vr * wr) @ Vr.T
+                Lr = la.cholesky(Mr, lower=True)
 
-        # -------- Tangent Cauchy fallback (guarantees progress if projected grad ≠ 0) --------
-        if safe_norm(p_t) <= 1e-14:
-            g_tan = self._project_to_tangent(g + H_op @ p_n, A_eq)
-            if safe_norm(g_tan) > 1e-10:
-                p_t = self._constrained_cauchy_in_tangent(
-                    H_op, g + H_op @ p_n, A_eq, remaining_radius
-                )
+            HZ = H_op @ Z  # store once
+            H_red = Z.T @ HZ
+            Linvr = la.solve_triangular(Lr, np.eye(Lr.shape[0]), lower=True, check_finite=False)
+            LinvrT = Linvr.T
 
-        p = p_n + p_t
+            def Hrbar_mv(y):
+                u = LinvrT @ y        # y -> u
+                v = Z @ u             # u -> p_t basis
+                Hv = H_op @ v
+                Hr_u = Z.T @ Hv       # back to reduced
+                return Linvr @ Hr_u
 
-        # Final trust-region clipping
-        sn = safe_norm(p)
-        if sn > self.delta and sn > 0:
-            p *= self.delta / sn
-
-        # --- Last resort: direct KKT step if still zero and no inequalities to honor ---
-        if safe_norm(p) <= 1e-14 and (A_ineq is None or A_ineq.size == 0):
-            p_kkt, _ = self._kkt_equality_step(H, g, A_eq, b_eq)
-            sk = safe_norm(p_kkt)
-            if sk > 0:
-                p = p_kkt if sk <= self.delta else (self.delta / sk) * p_kkt
-
-        # =======================
-        # Inequality handling (active-set augmentation), if provided
-        # =======================
-        active_idx: list[int] = []
-        info: Dict[str, Any]
-        if A_ineq is not None and A_ineq.size > 0:
-            p, active_idx, active_info = self._active_set_loop(
-                H, g, A_eq, b_eq, A_ineq, b_ineq if b_ineq is not None else np.zeros(A_ineq.shape[0]), p
+            g_bar = Linvr @ (Z.T @ g_tilde)
+            Hrbar = spla.LinearOperator((Z.shape[1], Z.shape[1]), matvec=Hrbar_mv, dtype=float)
+            tol_red = self._cg_tol(safe_norm(g_bar))
+            p_t_bar, status, iters = steihaug_cg_fast(
+                Hrbar, g_bar, remaining_radius, tol_red, self.cfg.cg_maxiter, self.cfg.neg_curv_tol, prec=None
             )
+            u = LinvrT @ p_t_bar
+            p_t = Z @ u
+        else:
+            HZ = H_op @ Z
+            H_reduced = Z.T @ HZ
+            g_reduced = Z.T @ g_tilde
+            tol_red = self._cg_tol(safe_norm(g_reduced))
+            prec_red = make_jacobi_from_H(H_reduced) if (self.cfg.use_prec and self.cfg.prec_kind == "auto_jacobi") else None
+            p_t_red, status, iters = steihaug_cg_fast(
+                H_reduced, g_reduced, remaining_radius, tol_red, self.cfg.cg_maxiter, self.cfg.neg_curv_tol, prec=prec_red
+            )
+            p_t = Z @ p_t_red
+            # Tangent Cauchy fallback
+            if self._tr_norm(p_t) <= 1e-14:
+                g_tan = self._project_to_tangent(g_tilde, A_eq)
+                if self._tr_norm(g_tan) > 1e-10:
+                    p_t = self._constrained_cauchy_in_tangent(H, g_tilde, A_eq, remaining_radius)
+
+        p = self._clip_and_box(p_n + p_t)
+
+        # Last resort if zero and no inequalities
+        if self._tr_norm(p) <= 1e-14 and (A_ineq is None or A_ineq.size == 0):
+            p_kkt, _ = self._kkt_equality_step(H, g, A_eq, b_eq)
+            p = self._clip_and_box(p_kkt)
+
+        # Inequalities (active-set)
+        active_idx: list[int] = []
+        if A_ineq is not None and A_ineq.size > 0:
+            p, active_idx, active_info = self._active_set_loop(H, g, A_eq, b_eq, A_ineq, b_ineq if b_ineq is not None else np.zeros(A_ineq.shape[0]), p)
             info = active_info
-            # Keep some core diagnostics consistent
-            info.setdefault("normal_step_norm", safe_norm(p_n))
-            info.setdefault("tangential_step_norm", safe_norm(p - p_n))
+            info.setdefault("normal_step_norm", self._tr_norm(p_n))
+            info.setdefault("tangential_step_norm", self._tr_norm(p - p_n))
             info.setdefault("nullspace_dim", Z.shape[1])
             info.setdefault("zeta_used", zeta)
             info.setdefault("criticality", crit_used)
             info.setdefault("criticality_shrinks", crit_shrinks)
-            info.setdefault("preconditioned_reduced", prec_red is not None)
+            info.setdefault("preconditioned_reduced", False)
             info["constraint_violation"] = safe_norm(A_eq @ p + b_eq)
-            info["model_reduction"] = self._model_reduction(H_op, g, p)
+            info["model_reduction"] = self._model_reduction(H, g, p)
         else:
             info = {
-                "status": status.value,
-                "iterations": iters,
-                "normal_step_norm": safe_norm(p_n),
-                "tangential_step_norm": safe_norm(p - p_n),
-                "step_norm": safe_norm(p),
+                "status": status.value if isinstance(status, TRStatus) else str(status),
+                "iterations": int(iters),
+                "normal_step_norm": self._tr_norm(p_n),
+                "tangential_step_norm": self._tr_norm(p - p_n),
+                "step_norm": self._tr_norm(p),
                 "constraint_violation": safe_norm(A_eq @ p + b_eq),
                 "nullspace_dim": Z.shape[1],
-                "model_reduction": self._model_reduction(H_op, g, p),
+                "model_reduction": self._model_reduction(H, g, p),
                 "zeta_used": zeta,
                 "criticality": crit_used,
                 "criticality_shrinks": crit_shrinks,
-                "preconditioned_reduced": prec_red is not None,
+                "preconditioned_reduced": False,
                 "active_constraints": [],
             }
 
-        # --- Multiplier recovery ---
         sigma = self._estimate_sigma(H_op, g, p)
-        lam, nu = self._recover_multipliers(
-            H_op, g, p, sigma, A_eq, A_ineq, active_idx if active_idx else None
-        )
+        lam, nu = self._recover_multipliers(H_op, g, p, sigma, A_eq, A_ineq, active_idx if active_idx else None)
         info["active_constraints"] = active_idx
         self._last_was_criticality = bool(crit_used)
         return p, info, lam, nu
 
-
-    # ---------- Inequality-constrained wrapper ----------
+    # ------------------------- Inequality-only wrapper ------------------------- #
     def _solve_with_inequality_constraints(
         self, H: MatLike, g: Vec, A_ineq: np.ndarray, b_ineq: Vec
     ) -> Tuple[Vec, Dict[str, Any], Vec, Vec]:
-        """Handle inequality constraints via active-set strategy."""
         p, info = self._solve_unconstrained(H, g)
         violations = A_ineq @ p + b_ineq
         violated_idx = violations > self.cfg.constraint_tol
+        H_op = make_operator(H, g.size)
         if not np.any(violated_idx):
             info["active_constraints"] = []
-            sigma = self._estimate_sigma(make_operator(H, g.size), g, p)
-            lam, nu = self._recover_multipliers(
-                make_operator(H, g.size), g, p, sigma, None, A_ineq, None
-            )
+            sigma = self._estimate_sigma(H_op, g, p)
+            lam, nu = self._recover_multipliers(H_op, g, p, sigma, None, A_ineq, None)
             return p, info, lam, nu
-        p, active_idx, info = self._active_set_loop(
-            H, g, np.zeros((0, g.size)), np.array([]), A_ineq, b_ineq, p
-        )
-        sigma = self._estimate_sigma(make_operator(H, g.size), g, p)
-        lam, nu = self._recover_multipliers(
-            make_operator(H, g.size), g, p, sigma, None, A_ineq, active_idx
-        )
+        p, active_idx, info2 = self._active_set_loop(H, g, np.zeros((0, g.size)), np.array([]), A_ineq, b_ineq, p)
+        info.update(info2)
+        sigma = self._estimate_sigma(H_op, g, p)
+        lam, nu = self._recover_multipliers(H_op, g, p, sigma, None, A_ineq, active_idx)
         info["active_constraints"] = active_idx
         return p, info, lam, nu
 
-    # ---------- Active-set loop ----------
+    # ------------------------- Active-set loop (kept; light tidy) ------------------------- #
     def _active_set_loop(
         self,
-        H: MatLike,
-        g: Vec,
-        A_eq: np.ndarray,
-        b_eq: Vec,
-        A_ineq: np.ndarray,
-        b_ineq: Vec,
+        H: MatLike, g: Vec,
+        A_eq: np.ndarray, b_eq: Vec,
+        A_ineq: np.ndarray, b_ineq: Vec,
         p_init: Vec,
     ) -> Tuple[Vec, list, Dict[str, Any]]:
-        """Active-set loop for inequality constraints, augmenting equalities."""
         p = p_init
         active: set[int] = set()
         info: Dict[str, Any] = {}
@@ -965,10 +1077,9 @@ class TrustRegionManager:
             active.add(worst)
             idx = sorted(active)
             A_aug = np.vstack([A_eq, A_ineq[idx]]) if A_eq.size > 0 else A_ineq[idx]
-            b_aug = (
-                np.concatenate([b_eq, b_ineq[idx]]) if b_eq.size > 0 else b_ineq[idx]
-            )
+            b_aug = np.concatenate([b_eq, b_ineq[idx]]) if b_eq.size > 0 else b_ineq[idx]
             p, info_eq, _, _ = self._solve_with_equality_constraints(H, g, A_aug, b_aug)
+            p = self._maybe_enforce_box(p)
             info.update(info_eq)
             it += 1
         info.update(
@@ -985,97 +1096,18 @@ class TrustRegionManager:
         )
         return p, sorted(active), info
 
-    # ---------- Misc helpers ----------
+    # ------------------------- Update logic (de-duplicated) ------------------------- #
     def _adaptive_zeta(self, constraint_violation: float, history_len: int) -> float:
-        """Adapt normal/tangential step ratio based on feasibility and history."""
         base_zeta = self.cfg.zeta
         if constraint_violation < self.cfg.constraint_tol:
             return max(0.1, base_zeta - 0.1 * (1 + history_len / 10))
-        avg_viol = (
-            np.mean(self._feasibility_history[-5:])
-            if self._feasibility_history
-            else constraint_violation
-        )
+        avg_viol = np.mean(self._feasibility_history[-5:]) if self._feasibility_history else constraint_violation
         return min(0.95, base_zeta + 0.05 * (1 + np.log1p(avg_viol)))
 
-    def _model_reduction(self, H: MatLike, g: Vec, p: Vec) -> float:
-        """Predicted reduction for the quadratic model at step p."""
-        H_op = make_operator(H, p.size)
-        return -(float(np.dot(g, p)) + 0.5 * float(np.dot(p, H_op @ p)))
-
-    def model_reduction_alpha(self, H: MatLike, g: Vec, p: Vec, alpha: float) -> float:
-        """
-        Predicted reduction for α p:
-        m(0) - m(αp) = α (-gᵀp) - 0.5 α² pᵀHp
-        Uses a single Hp multiplication if not cached by caller.
-        """
-        if p.size == 0 or alpha == 0.0:
-            return 0.0
-        H_op = make_operator(H, p.size)
-        Hp = H_op @ p
-        gTp = float(np.dot(g, p))
-        pTHp = float(np.dot(p, Hp))
-        return alpha * (-gTp) - 0.5 * (alpha * alpha) * pTHp
-
-    def _estimate_sigma(self, H_op: spla.LinearOperator, g: Vec, p: Vec) -> float:
-        """Estimate trust region multiplier."""
-        if p.size == 0:
-            return 0.0
-        Hp = H_op @ p
-        num = np.dot(p, Hp + g)
-        den = np.dot(p, p)
-        if den <= 1e-14:
-            return 0.0
-        sigma = -num / den
-        return max(0.0, sigma)
-
-    def _recover_multipliers(
-        self,
-        H_op: spla.LinearOperator,
-        g: Vec,
-        p: Vec,
-        sigma: float,
-        A_eq: Optional[np.ndarray],
-        A_ineq: Optional[np.ndarray],
-        active_idx: Optional[list],
-    ) -> Tuple[Vec, Vec]:
-        """Recover Lagrange multipliers for equality and inequality constraints."""
-        n = g.size
-        r = H_op @ p + g + sigma * p
-        m_eq = A_eq.shape[0] if A_eq is not None else 0
-        m_ineq = A_ineq.shape[0] if A_ineq is not None else 0
-        nu = np.zeros(m_eq)
-        lam = np.zeros(m_ineq)
-        if m_eq == 0 and (not active_idx or m_ineq == 0):
-            return lam, nu
-        blocks = []
-        if m_eq > 0:
-            blocks.append(A_eq.T)
-        if active_idx and m_ineq > 0:
-            blocks.append(A_ineq[active_idx].T)
-        if not blocks:
-            return lam, nu
-        AT = np.hstack(blocks)
-        reg = self.cfg.reg_floor
-        try:
-            if AT.shape[1] > 0:
-                aug_AT = np.vstack([AT, np.sqrt(reg) * np.eye(AT.shape[1])])
-                aug_rhs = np.concatenate([-r, np.zeros(AT.shape[1])])
-                y = la.lstsq(aug_AT, aug_rhs, cond=self.cfg.rcond)[0]
-            else:
-                y = np.array([])
-            if m_eq > 0:
-                nu = y[:m_eq]
-                y = y[m_eq:]
-            if active_idx and m_ineq > 0:
-                lam_active = np.maximum(0.0, y)
-                lam[active_idx] = lam_active
-                if m_eq > 0:
-                    rhs = -r - A_ineq[active_idx].T @ lam_active
-                    nu = la.lstsq(A_eq.T, rhs, cond=self.cfg.rcond)[0]
-        except la.LinAlgError:
-            lam, nu = np.zeros(m_ineq), np.zeros(m_eq)
-        return lam, nu
+    def _dynamic_eta(self, constraint_violation: float, iteration: int) -> tuple[float, float]:
+        eta1 = self.cfg.eta1 * min(1.0, 1.0 + constraint_violation)
+        eta2 = self.cfg.eta2 * max(0.5, 1.0 - iteration / self.cfg.max_iter)
+        return float(eta1), float(eta2)
 
     def update(
         self,
@@ -1086,24 +1118,35 @@ class TrustRegionManager:
         H: Optional[MatLike] = None,
         p: Optional[Vec] = None,
     ) -> bool:
-        rho = self._compute_ratio(predicted_reduction, actual_reduction)
-        self._rho_history.append(rho)
+        # Histories
         self._feasibility_history.append(constraint_violation)
-        if len(self._rho_history) > 10:
-            self._rho_history.pop(0)
-        if len(self._feasibility_history) > 10:
+        if len(self._feasibility_history) > self.cfg.history_length:
             self._feasibility_history.pop(0)
 
-        # Feasibility-weighted rho
+        # rho
+        if self.cfg.non_monotone and self._f_history:
+            f_ref = np.max(self._f_history[-self.cfg.non_monotone_window:])
+            rho = (f_ref - actual_reduction) / max(predicted_reduction, 1e-16)
+        else:
+            rho = self._compute_ratio(predicted_reduction, actual_reduction)
+
+        self._rho_history.append(rho)
+        if len(self._rho_history) > self.cfg.history_length:
+            self._rho_history.pop(0)
+
+        # Objective history update hook
+        if hasattr(self, '_last_f_new'):
+            self._f_history.append(self._last_f_new)
+            if len(self._f_history) > self.cfg.non_monotone_window:
+                self._f_history.pop(0)
+
+        # Feasibility weighting
         if self.cfg.feasibility_emphasis:
-            feas_weight = (
-                1.0
-                if constraint_violation < self.cfg.constraint_tol
-                else max(0.1, 1.0 - constraint_violation / max(1.0, constraint_violation))
-            )
-            rho = feas_weight * rho + (1 - feas_weight) * (
-                1.0 if constraint_violation < self.cfg.constraint_tol else -1.0
-            )
+            feas_weight = 1.0 if constraint_violation < self.cfg.constraint_tol else max(0.1, 1.0 - constraint_violation / max(1.0, constraint_violation))
+            rho = feas_weight * rho + (1 - feas_weight) * (1.0 if constraint_violation < self.cfg.constraint_tol else -1.0)
+
+        # Dynamic thresholds
+        eta1, eta2 = self._dynamic_eta(constraint_violation, len(self._rho_history))
 
         # Curvature-aware tweak
         if self.cfg.curvature_aware and H is not None and p is not None:
@@ -1114,57 +1157,157 @@ class TrustRegionManager:
             elif curv is not None and abs(curv) < 1e-12:
                 self.cfg.gamma2 = min(1.2, self.cfg.gamma2)
 
-        # Criticality safeguard: never expand immediately after criticality
-        if rho < self.cfg.eta1:
+        # Radius update
+        rejected = False
+        if rho < eta1:
             self.delta *= self.cfg.gamma1
             self.rejection_count += 1
             self._last_was_criticality = False
-            return True
+            rejected = True
+        else:
+            self.rejection_count = 0
+            if (not self._last_was_criticality) and (rho >= eta2) and (step_norm >= 0.8 * self.delta):
+                self.delta = min(self.cfg.delta_max, self.cfg.gamma2 * self.delta)
+            self._last_was_criticality = False
 
-        self.rejection_count = 0
-        if (not self._last_was_criticality) and (rho >= self.cfg.eta2) and (
-            step_norm >= 0.8 * self.delta
-        ):
-            self.delta = min(self.cfg.delta_max, self.cfg.gamma2 * self.delta)
+        self.delta = float(np.clip(self.delta, self.cfg.delta_min, self.cfg.delta_max))
+        return rejected
 
-        # reset the criticality flag after one update cycle
-        self._last_was_criticality = False
-        self.delta = np.clip(self.delta, self.cfg.delta_min, self.cfg.delta_max)
-        return False
+    def set_f_current(self, f_current: float) -> None:
+        self._last_f_new = f_current
+        self._f_history.append(f_current)
+        if len(self._f_history) > self.cfg.non_monotone_window:
+            self._f_history.pop(0)
 
-    def _compute_ratio(self, pred_red: float, act_red: float) -> float:
-        """Compute trust region ratio with safeguards."""
-        if abs(pred_red) < 1e-14:
-            return 1.0 if abs(act_red) < 1e-14 else (10.0 if act_red > 0 else -10.0)
-        rho = act_red / pred_red
-        return np.clip(rho, -100.0, 100.0)
+    # ------------------------- Boundary intersection & Cauchy (unchanged logic) ------------------------- #
+    def _boundary_intersection_metric(self, p: Vec, d: Vec, Delta: float) -> float:
+        L = self._metric_factor()
+        if L is None:
+            pTp = float(p @ p); pTd = float(p @ d); dTd = float(d @ d)
+            if dTd <= 1e-16: return 0.0
+            disc = max(0.0, pTd * pTd - dTd * (pTp - Delta * Delta))
+            return (-pTd + np.sqrt(disc)) / dTd
+        y0 = L.T @ p
+        yd = L.T @ d
+        a = float(yd @ yd); b = 2.0 * float(y0 @ yd); c = float(y0 @ y0) - Delta * Delta
+        if a <= 1e-16: return 0.0
+        disc = max(0.0, b * b - 4.0 * a * c)
+        return (-b + np.sqrt(disc)) / (2.0 * a)
 
-    def _curvature_along(self, H: MatLike, p: Vec) -> Optional[float]:
-        """Compute curvature along step direction."""
+    def clip_correction_to_radius(self, s: Vec, q: Vec) -> Vec:
+        Delta = self.delta
+        if self._tr_norm(s + q) <= Delta + 1e-14: return q
+        if self._tr_norm(q) <= 1e-16: return q
+        t = float(np.clip(self._boundary_intersection_metric(s, q, Delta), 0.0, 1.0))
+        return t * q
+
+    def _constrained_cauchy_in_tangent(self, H: MatLike, gtilde: Vec, A_eq: np.ndarray, Delta: float) -> Vec:
+        v = self._project_to_tangent(gtilde, A_eq)
+        nv = self._tr_norm(v)
+        if nv <= 1e-14: return np.zeros_like(gtilde)
+        H_op = make_operator(H, gtilde.size)
+        vHv = float(v @ (H_op @ v))
+        if vHv <= 1e-16:
+            return -(Delta / nv) * v
+        alpha = nv**2 / vHv
+        p = -alpha * v
+        return self._clip_to_radius(p, Delta)
+
+    def _kkt_equality_step(self, H: MatLike, g: Vec, A_eq: np.ndarray, b_eq: Vec) -> Tuple[Vec, Vec]:
+        n = g.size; m = A_eq.shape[0]
+        K = np.block([[H, A_eq.T], [A_eq, np.zeros((m, m))]])
+        rhs = -np.concatenate([g, b_eq])
         try:
-            H_op = make_operator(H, p.size)
-            Hp = H_op @ p
-            return float(np.dot(p, Hp) / max(np.dot(p, p), 1e-16))
-        except Exception:
-            return None
+            sol = la.solve(K, rhs, assume_a="sym")
+        except la.LinAlgError:
+            sol = la.lstsq(K, rhs, cond=self.cfg.rcond)[0]
+        return sol[:n], sol[n:]
 
-    # Public interface
-    def get_radius(self) -> float:
-        return self.delta
+    # ------------------------- Multiplier recovery (kept) ------------------------- #
+    def _recover_multipliers(
+        self, H_op: spla.LinearOperator, g: Vec, p: Vec, sigma: float,
+        A_eq: Optional[np.ndarray], A_ineq: Optional[np.ndarray],
+        active_idx: Optional[list],
+    ) -> Tuple[Vec, Vec]:
+        n = g.size
+        r = H_op @ p + g + sigma * p
+        m_eq = A_eq.shape[0] if A_eq is not None else 0
+        m_ineq = A_ineq.shape[0] if A_ineq is not None else 0
+        nu = np.zeros(m_eq); lam = np.zeros(m_ineq)
+        if m_eq == 0 and (not active_idx or m_ineq == 0):
+            return lam, nu
+        blocks = []
+        if m_eq > 0: blocks.append(A_eq.T)
+        if active_idx and m_ineq > 0: blocks.append(A_ineq[active_idx].T)
+        if not blocks: return lam, nu
+        AT = np.hstack(blocks)
+        reg = self.cfg.reg_floor
+        try:
+            if AT.shape[1] > 0:
+                aug_AT = np.vstack([AT, np.sqrt(reg) * np.eye(AT.shape[1])])
+                aug_rhs = np.concatenate([-r, np.zeros(AT.shape[1])])
+                y = la.lstsq(aug_AT, aug_rhs, cond=self.cfg.rcond)[0]
+            else:
+                y = np.array([])
+            if m_eq > 0:
+                nu = y[:m_eq]; y = y[m_eq:]
+            if active_idx and m_ineq > 0:
+                lam_active = np.maximum(0.0, y)
+                lam[active_idx] = lam_active
+                if m_eq > 0:
+                    rhs = -r - A_ineq[active_idx].T @ lam_active
+                    nu = la.lstsq(A_eq.T, rhs, cond=self.cfg.rcond)[0]
+        except la.LinAlgError:
+            lam, nu = np.zeros(m_ineq), np.zeros(m_eq)
+        return lam, nu
 
-    def set_radius(self, radius: float) -> None:
-        self.delta = np.clip(radius, self.cfg.delta_min, self.cfg.delta_max)
+    # ------------------------- Public entry point ------------------------- #
+    def solve(
+        self,
+        H: MatLike, g: Vec,
+        A_ineq: Optional[np.ndarray] = None, b_ineq: Optional[Vec] = None,
+        A_eq: Optional[np.ndarray] = None, b_eq: Optional[Vec] = None,
+        *, x: Optional[np.ndarray] = None, lb: Optional[np.ndarray] = None, ub: Optional[np.ndarray] = None,
+    ) -> Tuple[Vec, Dict[str, Any], Vec, Vec]:
 
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "radius": self.delta,
-            "rejections": self.rejection_count,
-            "avg_ratio": np.mean(self._rho_history) if self._rho_history else None,
-            "avg_feasibility": (
-                np.mean(self._feasibility_history)
-                if self._feasibility_history
-                else None
-            ),
-            "curvature_estimate": self._curvature_estimate,
-            "config": self.cfg,
-        }
+        self._box_ctx = (x, lb, ub) if x is not None else None
+
+        # Normalize empties
+        if A_eq is not None and (A_eq.size == 0 or A_eq.shape[0] == 0): A_eq, b_eq = None, None
+        if A_ineq is not None and (A_ineq.size == 0 or A_ineq.shape[0] == 0): A_ineq, b_ineq = None, None
+
+        n = g.size
+        if g.ndim != 1:
+            raise ValueError("g must be 1D")
+        if H is None:
+            raise ValueError("H must be provided")
+        if isinstance(H, np.ndarray) and H.shape != (n, n):
+            raise ValueError(f"H must be ({n},{n})")
+
+        if A_eq is not None:
+            A_eq = np.asarray(A_eq, dtype=float)
+            if A_eq.shape[1] != n: raise ValueError(f"A_eq must have {n} columns")
+            if b_eq is None or b_eq.size != A_eq.shape[0]: raise ValueError("b_eq must match A_eq rows")
+            b_eq = np.asarray(b_eq, dtype=float).ravel()
+
+        if A_ineq is not None:
+            A_ineq = np.asarray(A_ineq, dtype=float)
+            if A_ineq.shape[1] != n: raise ValueError(f"A_ineq must have {n} columns")
+            if b_ineq is None or b_ineq.size != A_ineq.shape[0]: raise ValueError("b_ineq must match A_ineq rows")
+            b_ineq = np.asarray(b_ineq, dtype=float).ravel()
+
+        if A_eq is not None:
+            p, info, lam, nu = self._solve_with_equality_constraints(H, g, A_eq, b_eq, A_ineq, b_ineq)
+        elif A_ineq is not None:
+            p, info, lam, nu = self._solve_with_inequality_constraints(H, g, A_ineq, b_ineq)
+        else:
+            p, info = self._solve_unconstrained(H, g)
+            lam, nu = np.array([]), np.array([])
+
+        # Global box enforcement & consistent info
+        if x is not None:
+            p = self._maybe_enforce_box(p)
+        H_op = make_operator(H, g.size)
+        info["step_norm"] = self._tr_norm(p)
+        info["model_reduction"] = self._model_reduction(H, g, p)
+        return p, info, lam, nu

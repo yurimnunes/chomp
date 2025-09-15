@@ -46,18 +46,16 @@ if(NOT COMMAND CPMAddPackage)
   include(${cpm_SOURCE_DIR}/cmake/CPM.cmake)
 endif()
 
-cpmaddpackage(
-  NAME fmt GITHUB_REPOSITORY fmtlib/fmt GIT_TAG 11.0.1 # Specify the version of
-                                                       # fmt you want to use
-)
+
 # fmt (header-only/targets)
+find_package(fmt CONFIG QUIET)
+if (NOT fmt_FOUND)
+  message(STATUS "fmt not found via find_package; will use CPM to fetch it.")
 CPMAddPackage(
   NAME fmt
   GITHUB_REPOSITORY fmtlib/fmt
-  GIT_TAG 11.0.1
+  GIT_TAG 11.2.0
 )
-if(NOT fmt_ADDED)
-  find_package(fmt REQUIRED)
 endif()
 
 # pybind11 (preferred via package config; fall back to CPM)
@@ -207,10 +205,10 @@ set(L1_SOURCES
 # ------------------------------------------------------------------
 if(AD_ENABLE_L1CORE)
   ad_add_pybind_module(l1core ${L1_SOURCES})
+  ad_add_pybind_module(simplex_core src/simplex_bindings.cpp)
 endif()
 
 if(AD_ENABLE_PIQP)
-  # piqp_cpp
   ad_add_pybind_module(piqp_cpp src/piqp_bindings.cpp)
 endif()
 
@@ -223,13 +221,12 @@ if(AD_ENABLE_OSQP)
   ad_add_pybind_module(osqp_cpp src/osqp_bindings.cpp)
 endif()
 
-  ad_add_pybind_module(simplex_core src/simplex_bindings.cpp)
-
-
 if(AD_ENABLE_QDLDL)
   # qdldl_cpp
   ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
 endif()
+
+#ad_add_pybind_module(lbl_cpp src/lbl_bindings.cpp)
 
 # ------------------------------------------------------------------
 # Summary

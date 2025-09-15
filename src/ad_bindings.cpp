@@ -955,21 +955,7 @@ PYBIND11_MODULE(ad, m) {
     m.def(
         "log", [](py::object x) { return unary_dispatch(x, Operator::Log); },
         "log(x)");
-    m.def("tanh",
-          [](py::object x) { return unary_dispatch(x, Operator::Tanh); },
-          "tanh(x)");
-    m.def("gelu",
-          [](py::object x) { return unary_dispatch(x, Operator::Gelu); },
-          "gelu(x)");
-    m.def("relu",
-          [](py::object x) { return unary_dispatch(x, Operator::Relu); },
-          "relu(x)");
-    m.def("silu",
-          [](py::object x) { return unary_dispatch(x, Operator::Silu); },
-          "silu(x)");
-    m.def("softmax",
-          [](py::object x) { return unary_dispatch(x, Operator::Softmax); },
-          "softmax(x) with subgradient 0.5 at ties");
+
 
     // max / pow
     m.def(

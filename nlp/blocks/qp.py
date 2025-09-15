@@ -142,7 +142,6 @@ def _choose_L_from_P(P_csc: sp.csc_matrix, n: int, mode: str = "auto") -> sp.csc
         # Attempt incomplete Cholesky (fallback to Jacobi if fails)
         try:
             from scipy.sparse import tril
-            from scipy.sparse.linalg import spsolve_triangular
             
             # Simple incomplete Cholesky with drop tolerance
             P_lower = tril(P_csc, format="csc")
@@ -227,40 +226,51 @@ class QPSolver:
             self.I = sp.eye(n, format="csc")
             self.negI = (-1.0) * self.I
 
-    def _build_G_h_for_p(self, n, A_ineq, b_ineq, lb, ub):
+    def _build_G_h_for_p(self, n, A_ineq, b_ineq, lb, ub, x=None):
         """
-        Build inequality matrix G and vector h for base variables p only.
-
-        Conventions
-        -----------
-        - User passes A_ineq p ≤ -b_ineq (i.e., b_ineq stores the original c_I(x) values).
-        - Variable bounds are appended as p ≤ ub and -p ≤ -lb.
-
-        Returns
-        -------
-        G : sp.csc_matrix | None
-        h : np.ndarray | None
-        m_ineq : int
-            Number of user-supplied inequality rows (excludes bound rows).
+        Build G,h for PIQP with conventions:
+        - A_ineq p ≤ -b_ineq   (user inequalities)
+        - (lb - x) ≤ p ≤ (ub - x)   (variable bounds turned into step bounds)
+        Returns:
+        G, h, m_ineq_user   (where m_ineq_user excludes bound rows)
         """
         self._ensure_eye(n)
-
         G_blocks, h_parts = [], []
         m_ineq = 0
 
         if A_ineq is not None and b_ineq is not None:
             G_blocks.append(sp.csc_matrix(A_ineq))
-            # convention: A_ineq p ≤ -b_ineq  -> h = -b_ineq
-            h_parts.append(-np.asarray(b_ineq, dtype=float))
+            h_parts.append(-np.asarray(b_ineq, float))
             m_ineq = A_ineq.shape[0]
 
-        if ub is not None:
-            G_blocks.append(self.I)  # p ≤ ub
-            h_parts.append(np.asarray(ub, dtype=float))
+        # convert to step-bounds if x is provided
+        if x is not None:
+            if lb is not None:
+                lb_step = np.asarray(lb, float) - np.asarray(x, float)
+            else:
+                lb_step = None
+            if ub is not None:
+                ub_step = np.asarray(ub, float) - np.asarray(x, float)
+            else:
+                ub_step = None
+        else:
+            # bounds are already on p
+            lb_step = None if lb is None else np.asarray(lb, float)
+            ub_step = None if ub is None else np.asarray(ub, float)
 
-        if lb is not None:
-            G_blocks.append(self.negI)  # -p ≤ -lb  (i.e., p ≥ lb)
-            h_parts.append(-np.asarray(lb, dtype=float))
+        # Add finite upper bounds:  p ≤ ub_step
+        if ub_step is not None:
+            mask = np.isfinite(ub_step)
+            if np.any(mask):
+                G_blocks.append(self.I[mask, :])              # select rows with finite ub
+                h_parts.append(ub_step[mask])
+
+        # Add finite lower bounds: -p ≤ -lb_step  (i.e., p ≥ lb_step)
+        if lb_step is not None:
+            mask = np.isfinite(lb_step)
+            if np.any(mask):
+                G_blocks.append(self.negI[mask, :])           # select rows with finite lb
+                h_parts.append(-lb_step[mask])
 
         G = sp.vstack(G_blocks, format="csc") if G_blocks else None
         h = np.concatenate(h_parts) if h_parts else None
@@ -522,8 +532,9 @@ class QPSolver:
         A, b = self._build_A_b_for_p(A_eq, b_eq)
         m_eq_user = A.shape[0] if A is not None else 0
 
-        G, h, m_ineq_user = self._build_G_h_for_p(n, A_ineq, b_ineq, lb, ub)
-
+        G, h, m_ineq_user = self._build_G_h_for_p(
+            n, A_ineq, b_ineq, lb, ub, x=prox_x if prox_x is not None else None
+        )
         # --- Optional TR augmentation ---
         n_added = 0
         t_index = None  # index of t in decision vector for sigma-mode

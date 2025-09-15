@@ -49,8 +49,8 @@ enum class Operator {
     Tanh,    // NEW
     Silu,    // NEW
     Gelu,    // NEW
-    Relu,     // NEW
-    Softmax
+    Relu,    // NEW
+    Softmax  // NEW
 };
 enum class NLP { NA, Bilinear };
 

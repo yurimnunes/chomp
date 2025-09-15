@@ -1,8 +1,8 @@
 // Expression.cpp
-#include "../include/ad/Expression.h"
-#include "../include/ad/ADGraph.h"
-#include "../include/ad/Operators.h"  // make_const_node(g, double)
-#include "../include/ad/Variable.h"
+#include "../../include/ad/Expression.h"
+#include "../../include/ad/ADGraph.h"
+#include "../../include/ad/Operators.h"  // make_const_node(g, double)
+#include "../../include/ad/Variable.h"
 
 #include <memory>
 

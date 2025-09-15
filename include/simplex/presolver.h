@@ -148,7 +148,7 @@ public:
         // passes
         int max_passes = 5;
         bool enable_rowreduce = true;
-        bool enable_scaling = true;      // row scaling only
+        bool enable_scaling = true;     // row scaling only
         bool enable_col_scaling = true; // OFF in non-destructive mode
 
         // behavior
@@ -332,36 +332,53 @@ private:
         }
         return {Dr, Dc};
     }
-bool detect_unboundedness(const LP &P) const {
-    const int n = (int)P.A.cols(), m=(int)P.A.rows();
-    for (int j=0;j<n;++j) {
-        const bool can_inc = !is_finite(P.u(j));
-        const bool can_dec = !is_finite(P.l(j));
-        if (!can_inc && !can_dec) continue;
+    bool detect_unboundedness(const LP &P) const {
+        const int n = (int)P.A.cols(), m = (int)P.A.rows();
+        for (int j = 0; j < n; ++j) {
+            const bool can_inc = !is_finite(P.u(j));
+            const bool can_dec = !is_finite(P.l(j));
+            if (!can_inc && !can_dec)
+                continue;
 
-        // guard: if column is numerically zero, don’t use it to declare unbounded
-        if (P.A.col(j).cwiseAbs().maxCoeff() <= opt_.zero_tol) {
-            if ((can_inc || can_dec) && std::abs(P.c(j)) > opt_.zero_tol) {
-                // only suspicious if literally free and improving, but we still skip declaring here
-                continue; // let the solver (not presolve) decide
+            // guard: if column is numerically zero, don’t use it to declare
+            // unbounded
+            if (P.A.col(j).cwiseAbs().maxCoeff() <= opt_.zero_tol) {
+                if ((can_inc || can_dec) && std::abs(P.c(j)) > opt_.zero_tol) {
+                    // only suspicious if literally free and improving, but we
+                    // still skip declaring here
+                    continue; // let the solver (not presolve) decide
+                }
+                continue;
             }
-            continue;
-        }
 
-        bool blocks_plus=false, blocks_minus=false;
-        for (int i=0;i<m;++i) {
-            const double aij = P.A(i,j);
-            if (std::abs(aij) <= opt_.zero_tol) continue;
-            if (P.sense[i]==RowSense::EQ) { blocks_plus=blocks_minus=true; break; }
-            if (P.sense[i]==RowSense::LE) { if (aij>0) blocks_plus=true; if (aij<0) blocks_minus=true; }
-            else if (P.sense[i]==RowSense::GE) { if (aij<0) blocks_plus=true; if (aij>0) blocks_minus=true; }
+            bool blocks_plus = false, blocks_minus = false;
+            for (int i = 0; i < m; ++i) {
+                const double aij = P.A(i, j);
+                if (std::abs(aij) <= opt_.zero_tol)
+                    continue;
+                if (P.sense[i] == RowSense::EQ) {
+                    blocks_plus = blocks_minus = true;
+                    break;
+                }
+                if (P.sense[i] == RowSense::LE) {
+                    if (aij > 0)
+                        blocks_plus = true;
+                    if (aij < 0)
+                        blocks_minus = true;
+                } else if (P.sense[i] == RowSense::GE) {
+                    if (aij < 0)
+                        blocks_plus = true;
+                    if (aij > 0)
+                        blocks_minus = true;
+                }
+            }
+            if (P.c(j) < -opt_.zero_tol && can_inc && !blocks_plus)
+                return true;
+            if (P.c(j) > opt_.zero_tol && can_dec && !blocks_minus)
+                return true;
         }
-        if (P.c(j) < -opt_.zero_tol && can_inc && !blocks_plus) return true;
-        if (P.c(j) >  opt_.zero_tol && can_dec && !blocks_minus) return true;
+        return false;
     }
-    return false;
-}
-
 
     void scale_rows_unit_inf(LP &P) {
         const int m = (int)P.A.rows();

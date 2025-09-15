@@ -494,20 +494,24 @@ class NLPSolver:
         line = ROW.replace("{ST:>2}", st_cell_col) + star
 
         print(line)
-
+        
     def _watchdog_update(self, x_cand: Optional[np.ndarray] = None) -> None:
         x_eval = self.x if x_cand is None else np.asarray(x_cand, float)
+        if not np.all(np.isfinite(x_eval)):  # Add: Skip invalid candidates
+            return
         d = self.model.eval_all(x_eval)
         f_new = float(d["f"])
         th_new = self.model.constraint_violation(x_eval)
+        if not (np.isfinite(f_new) and np.isfinite(th_new)):  # Add: Skip NaN/inf
+            return
         x_best, f_best, th_best = self.best_point
-
-        rel = 1e-3
+        rel = getattr(self.cfg, 'watchdog_rel_tol', 1e-3)  # Make configurable
         th_small = self.cfg.filter_theta_min
+        tol_feas = getattr(self.cfg, 'tol_feas', 1e-6)  # Use consistent tol
         improved_theta = th_new < max(th_best * (1.0 - rel), th_best - 1e-14)
         improved_f_small_th = (
-            th_new <= max(th_small, 1e-12)
-            and th_best <= max(th_small, 1e-12)
+            th_new <= tol_feas  # Use tol_feas instead of max(th_small, 1e-12)
+            and th_best <= tol_feas
             and f_new < max(f_best * (1.0 - rel), f_best - 1e-14)
         )
         if (th_best == float("inf")) or improved_theta or improved_f_small_th:
@@ -515,17 +519,17 @@ class NLPSolver:
             self.watchdog_counter = 0
             if self.filter:
                 self.filter.add_if_acceptable(th_new, f_new)
+            if self.funnel:
+                self.funnel.add_if_acceptable(th_new, f_new)
             return
-
         self.watchdog_counter += 1
-        if self.watchdog_counter < self.watchdog_patience:
+        if self.watchdog_counter < self.cfg.watchdog_patience:
             return
-
         self.watchdog_counter = 0
         x_b, f_b, th_b = self.best_point
         if np.all(np.isfinite(x_b)):
             self.x = x_b.copy()
-            # cheap multiplier refresh
+            # Cheap multiplier refresh
             try:
                 data_rb = self.model.eval_all(self.x)
                 H_rb, _ = make_psd_advanced(
@@ -546,8 +550,8 @@ class NLPSolver:
                 self.lam, self.nu = lam_rb, nu_rb
             except Exception:
                 pass
-            if self.tr:
-                self.tr.radius = max(1e-12, self.cfg.tr_gamma_dec * self.tr.radius)
-            if self.filter:
-                self.filter.reset()
-                self.filter.add_if_acceptable(th_b, f_b)
+        if self.tr:
+            self.tr.delta = max(1e-12, self.cfg.tr_gamma_dec * self.tr.delta)  # Use 'delta'
+        if self.filter:
+            self.filter.reset()
+            self.filter.add_if_acceptable(th_b, f_b)

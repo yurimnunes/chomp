@@ -35,6 +35,11 @@ inline void _dispatch_op(ADNode& n, Fn&& fn){
         case Operator::Multiply: fn.template operator()<Operator::Multiply>(); break;
         case Operator::Divide:   fn.template operator()<Operator::Divide>(); break;
         case Operator::Max:      fn.template operator()<Operator::Max>(); break;
+        case Operator::Tanh:     fn.template operator()<Operator::Tanh>(); break;
+        case Operator::Silu:     fn.template operator()<Operator::Silu>(); break;
+        case Operator::Gelu:     fn.template operator()<Operator::Gelu>(); break;
+        case Operator::Relu:     fn.template operator()<Operator::Relu>(); break;
+        case Operator::Softmax:  fn.template operator()<Operator::Softmax>(); break;
         default: /* Unknown/NA */ break;
     }
 }
