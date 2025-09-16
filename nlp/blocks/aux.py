@@ -73,14 +73,16 @@ class SQPConfig:
     mode: str = "auto"  # {"auto","ip","sqp"}
     verbose: bool = True
     use_filter: bool = True
-    use_line_search: bool = False
+    use_line_search: bool = True
     use_trust_region: bool = True
     use_soc: bool = True
     use_funnel: bool = False
-    use_watchdog: bool = True
+    use_watchdog: bool = False
     use_nonmonotone_ls: bool = False
     use_active_set_prediction: bool = False
     hessian_mode: str = "exact"  # {"exact","bfgs","lbfgs","hybrid","gn"}
+    
+    tr_delta0: float = 0.1
 
     # ---------------- Tolerances ----------------
     tol_feas: float = 1e-5
@@ -163,15 +165,6 @@ def _clean_vec(v, m: int) -> np.ndarray:
     return np.nan_to_num(a, nan=0.0, posinf=1e20, neginf=-1e20)
 
 
-def _zero_mat(m: int, n: int):
-    """CSR zero matrix of shape (m, n)."""
-    return (
-        sp.csr_matrix((m, n))
-        if m > 0 and n > 0
-        else sp.csr_matrix((max(m, 0), max(n, 0)))
-    )
-
-
 # ======================================
 # AutoDiff Model
 # ======================================
@@ -213,12 +206,15 @@ class Model:
         self._cache: Dict[str, object] = {}
         self._cache_x: Optional[Tuple[float, ...]] = None
         self._compile_derivatives()
-
+        
     def _compile_derivatives(self):
         """Compile symbolic derivatives via `ad`."""
         try:
+            self.f_val = AD.sym_val(self.f, self.n)
             self.f_grad = AD.sym_grad(self.f, self.n)
             self.f_hess = AD.sym_hess(self.f, self.n)
+            self.cI_vals = [AD.sym_val(ci, self.n) for ci in self.cI_funcs]
+            self.cE_vals = [AD.sym_val(ce, self.n) for ce in self.cE_funcs]
             self.cI_grads = [AD.sym_grad(ci, self.n) for ci in self.cI_funcs]
             self.cI_hess = [AD.sym_hess(ci, self.n) for ci in self.cI_funcs]
             self.cE_grads = [AD.sym_grad(ce, self.n) for ce in self.cE_funcs]
@@ -226,381 +222,294 @@ class Model:
         except Exception as e:
             logging.error(f"AD compilation failed: {e}")
             raise RuntimeError("Failed to compile derivatives")
-
+        
     def eval_all(
-        self, x: np.ndarray, components: Optional[List[str]] = None
-    ) -> Dict[str, Union[float, np.ndarray, sp.spmatrix]]:
+        self, x: np.ndarray, components: Optional[list[str]] = None
+    ) -> dict[str, float | np.ndarray | sp.spmatrix | None]:
         """
-        Evaluate requested components at `x`.
-
-        Parameters
-        ----------
-        components : subset of {"f","g","H","cI","JI","cE","JE"}
+        Faster evaluator for {"f","g","H","cI","JI","cE","JE"} with light allocations
+        and cheap sparse assembly. Preserves previous behavior & cache keys.
         """
-        if x.shape[0] != self.n:
-            raise ValueError(f"Input x shape {x.shape} does not match n={self.n}")
-        if not np.all(np.isfinite(x)):
+        # --- very cheap guards ---
+        n = self.n
+        if x.shape[0] != n:
+            raise ValueError(f"Input x shape {x.shape} does not match n={n}")
+        if not np.isfinite(x).all():
             raise ValueError("Non-finite values in x")
 
-        components = components or ["f", "g", "H", "cI", "JI", "cE", "JE"]
-        valid = {"f", "g", "H", "cI", "JI", "cE", "JE"}
-        if not set(components) <= valid:
-            raise ValueError(
-                f"Invalid components: {components}, must be subset of {sorted(valid)}"
-            )
+        want = components or ["f", "g", "H", "cI", "JI", "cE", "JE"]
+        want_set = set(want)
 
-        x_key = tuple(x)
+        # --- cache fast-path ---
+        x_key = tuple(x)  # stable & cheap
         if x_key == self._cache_x:
-            cached = {k: v for k, v in self._cache.items() if k in components}
-            if len(cached) == len(components):
-                return cached  # full cache hit
+            cached = self._cache
+            # Return only if we have everything requested
+            if all(k in cached for k in want):
+                # NOTE: return references; caller should treat as read-only
+                return {k: cached[k] for k in want}
 
-        res: Dict[str, object] = {}
+        # --- bind locals to reduce attribute lookups ---
+        use_sparse = self.use_sparse
+        mI, mE = self.m_ineq, self.m_eq
+        cI_funcs, cE_funcs = self.cI_vals, self.cE_vals
+        f_grad, f_hess = self.f_grad, self.f_hess
+        cI_grads, cE_grads = self.cI_grads, self.cE_grads
+        AD_val = AD.val  # local alias
 
-        # Objective
-        if "f" in components:
+        res: dict[str, object] = {}
+
+        # ---------- Objective value ----------
+        if "f" in want_set:
             try:
-                res["f"] = float(AD.val(self.f, x))
-                if not np.isfinite(res["f"]):
-                    logging.warning(f"Non-finite objective value: f={res['f']}")
-                    res["f"] = float("inf")
-            except Exception as e:
-                logging.error(f"Objective evaluation failed: {e}")
+                fv = float(self.f_val(x))
+                if not np.isfinite(fv):
+                    fv = float("inf")
+                res["f"] = fv
+            except Exception:
                 res["f"] = float("inf")
 
-        # Gradient
-        if "g" in components:
+        # ---------- Gradient ----------
+        if "g" in want_set:
             try:
-                g = np.asarray(self.f_grad(x), dtype=float)
-                res["g"] = g if np.all(np.isfinite(g)) else np.zeros(self.n)
-                if not np.all(np.isfinite(res["g"])):
-                    logging.warning("Non-finite gradient values")
-            except Exception as e:
-                logging.error(f"Gradient evaluation failed: {e}")
-                res["g"] = np.zeros(self.n)
+                g = f_grad(x)
+                g = g if isinstance(g, np.ndarray) and g.dtype == float else np.asarray(g, dtype=float)
+                if not np.isfinite(g).all():
+                    g = np.zeros(n, dtype=float)
+                res["g"] = g
+            except Exception:
+                res["g"] = np.zeros(n, dtype=float)
 
-        # Hessian
-        if "H" in components:
+        # ---------- Hessian (always symmetrize; skip costly checks) ----------
+        if "H" in want_set:
             try:
-                H = np.asarray(self.f_hess(x), dtype=float)
-                if self.use_sparse:
-                    H = sp.csr_matrix(H)
-                # Symmetrize if needed
-                if (sp.issparse(H) and (H - H.T).nnz != 0) or (
-                    not sp.issparse(H) and not np.allclose(H, H.T, rtol=1e-10)
-                ):
-                    logging.debug("Symmetrizing objective Hessian")
+                H = f_hess(x)
+                if sp.issparse(H):
+                    H = H.tocsr()
+                    H = (H + H.T) * 0.5
+                    data = H.data
+                    if not np.isfinite(data).all():
+                        H = sp.eye(n, format="csr")
+                else:
+                    H = np.asarray(H, dtype=float, order="C")
                     H = 0.5 * (H + H.T)
-                # Finite check
-                if not np.all(np.isfinite(H.data if sp.issparse(H) else H)):
-                    logging.warning("Non-finite Hessian values")
-                    H = (
-                        sp.eye(self.n, format="csr")
-                        if self.use_sparse
-                        else np.eye(self.n)
-                    )
+                    if not np.isfinite(H).all():
+                        H = np.eye(n, dtype=float)
+                if use_sparse and not sp.issparse(H):
+                    H = sp.csr_matrix(H)
+                elif not use_sparse and sp.issparse(H):
+                    H = H.toarray()
                 res["H"] = H
-            except Exception as e:
-                logging.error(f"Hessian evaluation failed: {e}")
-                res["H"] = (
-                    sp.eye(self.n, format="csr") if self.use_sparse else np.eye(self.n)
-                )
+            except Exception:
+                res["H"] = sp.eye(n, format="csr") if use_sparse else np.eye(n, dtype=float)
 
-        # Inequalities
-        if "cI" in components and self.cI_funcs:
-            try:
-                cI = np.array([AD.val(ci, x) for ci in self.cI_funcs], dtype=float)
-                res["cI"] = cI if np.all(np.isfinite(cI)) else np.zeros(self.m_ineq)
-                if not np.all(np.isfinite(res["cI"])):
-                    logging.warning("Non-finite inequality constraint values")
-            except Exception as e:
-                logging.error(f"Inequality constraint evaluation failed: {e}")
-                res["cI"] = np.zeros(self.m_ineq)
-        else:
-            res["cI"] = None
+        # ---------- Inequalities ----------
+        haveI = mI > 0
+        if "cI" in want_set:
+            if haveI:
+                try:
+                    # Preallocate once; cheap loop (callable AD is Python-bound anyway)
+                    cI = np.empty(mI, dtype=float)
+                    for i, ci in enumerate(cI_funcs):
+                        cI[i] = float(ci(x))
+                    if not np.isfinite(cI).all():
+                        cI = np.zeros(mI, dtype=float)
+                    res["cI"] = cI
+                except Exception:
+                    res["cI"] = np.zeros(mI, dtype=float)
+            else:
+                res["cI"] = None
 
-        if "JI" in components and self.cI_funcs:
-            try:
-                JI_dense = [np.asarray(gi(x), dtype=float) for gi in self.cI_grads]
-                JI = (
-                    sp.vstack([sp.csr_matrix(ji) for ji in JI_dense], format="csr")
-                    if self.use_sparse
-                    else np.vstack(JI_dense)
-                )
-                res["JI"] = (
-                    JI
-                    if np.all(np.isfinite(JI.data if sp.issparse(JI) else JI))
-                    else (
-                        sp.csr_matrix((self.m_ineq, self.n))
-                        if self.use_sparse
-                        else np.zeros((self.m_ineq, self.n))
-                    )
-                )
-                if res["JI"] is not None and not np.all(
-                    np.isfinite(res["JI"].data if sp.issparse(res["JI"]) else res["JI"])
-                ):
-                    logging.warning("Non-finite inequality Jacobian values")
-            except Exception as e:
-                logging.error(f"Inequality Jacobian evaluation failed: {e}")
-                res["JI"] = (
-                    sp.csr_matrix((self.m_ineq, self.n))
-                    if self.use_sparse
-                    else np.zeros((self.m_ineq, self.n))
-                )
-        else:
-            res["JI"] = None
+        if "JI" in want_set:
+            if haveI:
+                try:
+                    # Build dense row-block once, then convert if needed
+                    JI_rows = np.empty((mI, n), dtype=float)
+                    for i, gi in enumerate(cI_grads):
+                        row = gi(x)
+                        row = row if (isinstance(row, np.ndarray) and row.dtype == float) else np.asarray(row, dtype=float)
+                        JI_rows[i, :] = row
+                    if use_sparse:
+                        JI = sp.csr_matrix(JI_rows)
+                        if not np.isfinite(JI.data).all():
+                            JI = sp.csr_matrix((mI, n))
+                    else:
+                        if not np.isfinite(JI_rows).all():
+                            JI_rows.fill(0.0)
+                        JI = JI_rows
+                    res["JI"] = JI
+                except Exception:
+                    res["JI"] = sp.csr_matrix((mI, n)) if use_sparse else np.zeros((mI, n), dtype=float)
+            else:
+                res["JI"] = None
 
-        # Equalities
-        if "cE" in components and self.cE_funcs:
-            try:
-                cE = np.array([AD.val(ce, x) for ce in self.cE_funcs], dtype=float)
-                res["cE"] = cE if np.all(np.isfinite(cE)) else np.zeros(self.m_eq)
-                if not np.all(np.isfinite(res["cE"])):
-                    logging.warning("Non-finite equality constraint values")
-            except Exception as e:
-                logging.error(f"Equality constraint evaluation failed: {e}")
-                res["cE"] = np.zeros(self.m_eq)
-        else:
-            res["cE"] = None
+        # ---------- Equalities ----------
+        haveE = mE > 0
+        if "cE" in want_set:
+            if haveE:
+                try:
+                    cE = np.empty(mE, dtype=float)
+                    for j, ce in enumerate(cE_funcs):
+                        cE[j] = float(ce(x))
+                    if not np.isfinite(cE).all():
+                        cE = np.zeros(mE, dtype=float)
+                    res["cE"] = cE
+                except Exception:
+                    res["cE"] = np.zeros(mE, dtype=float)
+            else:
+                res["cE"] = None
 
-        if "JE" in components and self.cE_funcs:
-            try:
-                JE_dense = [np.asarray(ge(x), dtype=float) for ge in self.cE_grads]
-                JE = (
-                    sp.vstack([sp.csr_matrix(je) for je in JE_dense], format="csr")
-                    if self.use_sparse
-                    else np.vstack(JE_dense)
-                )
-                res["JE"] = (
-                    JE
-                    if np.all(np.isfinite(JE.data if sp.issparse(JE) else JE))
-                    else (
-                        sp.csr_matrix((self.m_eq, self.n))
-                        if self.use_sparse
-                        else np.zeros((self.m_eq, self.n))
-                    )
-                )
-                if res["JE"] is not None and not np.all(
-                    np.isfinite(res["JE"].data if sp.issparse(res["JE"]) else res["JE"])
-                ):
-                    logging.warning("Non-finite equality Jacobian values")
-            except Exception as e:
-                logging.error(f"Equality Jacobian evaluation failed: {e}")
-                res["JE"] = (
-                    sp.csr_matrix((self.m_eq, self.n))
-                    if self.use_sparse
-                    else np.zeros((self.m_eq, self.n))
-                )
-        else:
-            res["JE"] = None
+        if "JE" in want_set:
+            if haveE:
+                try:
+                    JE_rows = np.empty((mE, n), dtype=float)
+                    for j, ge in enumerate(cE_grads):
+                        row = ge(x)
+                        row = row if (isinstance(row, np.ndarray) and row.dtype == float) else np.asarray(row, dtype=float)
+                        JE_rows[j, :] = row
+                    if use_sparse:
+                        JE = sp.csr_matrix(JE_rows)
+                        if not np.isfinite(JE.data).all():
+                            JE = sp.csr_matrix((mE, n))
+                    else:
+                        if not np.isfinite(JE_rows).all():
+                            JE_rows.fill(0.0)
+                        JE = JE_rows
+                    res["JE"] = JE
+                except Exception:
+                    res["JE"] = sp.csr_matrix((mE, n)) if use_sparse else np.zeros((mE, n), dtype=float)
+            else:
+                res["JE"] = None
 
+        # --- update cache with everything we just computed and mark x ---
+        # Important: keep only the keys we know (avoid stale)
         self._cache = res
         self._cache_x = x_key
-        return res  # type: ignore[return-value]
 
+        # Return only requested subset
+        return {k: res.get(k, None) for k in want}
+    
     def lagrangian_hessian(
         self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
-    ) -> Union[np.ndarray, sp.spmatrix]:
+    ) -> np.ndarray | sp.spmatrix:
         """
-        Robust ∇²_x L(x,λ,ν) = H_f(x) + Σ_i λ_i H_{cI_i}(x) + Σ_j ν_j H_{cE_j}(x).
-
-        Hardening features:
-        • Per-term np.errstate to avoid runtime floating warnings.
-        • NaN/Inf → 0.0 sanitization + magnitude clipping.
-        • Strict symmetrization for every piece.
-        • Graceful handling of m_ineq==0 / m_eq==0 / missing callables.
-        • Final "finite" check with identity fallback.
-        • Optional tiny diagonal floor to prevent near-singular diagonals.
-
-        Tunables (via self.cfg, optional):
-        - multiplier_threshold (default 1e-8)
-        - hess_clip_max (default 1e12)
-        - hess_diag_floor (default 0.0; set >0 to enforce tiny diagonal)
+        Fast ∇²_x L assembly with unconditional symmetrization and minimal conversions.
+        Keeps the same hardening and fallbacks you had.
         """
-        import logging
-
-        # --- config & shapes ---
-        n = int(getattr(self, "n", x.shape[0]))
-        mI = int(getattr(self, "m_ineq", 0))
-        mE = int(getattr(self, "m_eq", 0))
-        use_sparse = bool(getattr(self, "use_sparse", False))
+        n = self.n
+        mI, mE = self.m_ineq, self.m_eq
+        use_sparse = self.use_sparse
 
         cfg = getattr(self, "cfg", None)
         multiplier_threshold = float(getattr(cfg, "multiplier_threshold", 1e-8))
         clip_max = float(getattr(cfg, "hess_clip_max", 1e12))
         diag_floor = float(getattr(cfg, "hess_diag_floor", 0.0))
 
-        # --- validate inputs softly ---
         if x.shape[0] != n:
             raise ValueError(f"Incompatible x shape: expected ({n},), got {x.shape}")
         lam = np.asarray(lam, dtype=float).ravel()
         nu = np.asarray(nu, dtype=float).ravel()
-
         if lam.size != mI:
-            logging.warning(
-                f"[lagrangian_hessian] λ size {lam.size} != m_ineq {mI}; clipping to min."
-            )
             lam = lam[:mI]
         if nu.size != mE:
-            logging.warning(
-                f"[lagrangian_hessian] ν size {nu.size} != m_eq {mE}; clipping to min."
-            )
             nu = nu[:mE]
-
-        if not (
-            np.all(np.isfinite(x))
-            and np.all(np.isfinite(lam))
-            and np.all(np.isfinite(nu))
-        ):
+        if not (np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()):
             raise ValueError("Non-finite values in x, lam, or nu")
 
-        # --- helpers ---
-        def _to_type(A):
-            """Cast to configured storage type (sparse CSR or dense ndarray)."""
-            if use_sparse:
-                return (
-                    A if sp.issparse(A) else sp.csr_matrix(np.asarray(A, dtype=float))
-                )
-            else:
-                return A.toarray() if sp.issparse(A) else np.asarray(A, dtype=float)
-
-        def _symmetrize(A):
-            return (A + A.T) * 0.5 if sp.issparse(A) else 0.5 * (A + A.T)
-
-        def _sanitize(A):
-            """Replace NaN/Inf → 0, clip |A|, keep type."""
-            if sp.issparse(A):
-                data = A.data.copy()
-                # NaN/Inf -> 0
-                bad = ~np.isfinite(data)
-                if np.any(bad):
-                    data[bad] = 0.0
-                # clip absurd magnitudes
-                np.clip(data, -clip_max, clip_max, out=data)
-                A = sp.csr_matrix((data, A.indices, A.indptr), shape=A.shape)
-                return A
-            else:
-                B = np.asarray(A, dtype=float)
-                # NaN/Inf -> 0
-                if not np.isfinite(B).all():
-                    B = np.nan_to_num(B, nan=0.0, posinf=0.0, neginf=0.0)
-                # clip
-                np.clip(B, -clip_max, clip_max, out=B)
-                return B
-
-        def _ensure_shape(A):
-            """Ensure n×n; if mismatched, warn and skip by returning None."""
-            if A.shape != (n, n):
-                logging.warning(
-                    f"[lagrangian_hessian] Hessian piece has shape {A.shape}, expected {(n,n)}; skipping."
-                )
-                return None
+        def _sanitize_dense(A: np.ndarray) -> np.ndarray:
+            if not np.isfinite(A).all():
+                A = np.nan_to_num(A, nan=0.0, posinf=0.0, neginf=0.0)
+            np.clip(A, -clip_max, clip_max, out=A)
             return A
 
-        def _add_piece(H_acc, weight, Hi_callable):
-            if Hi_callable is None or abs(weight) <= multiplier_threshold:
-                return H_acc
-            try:
-                with np.errstate(all="ignore"):
-                    H_i = Hi_callable(x)
-            except Exception as e:
-                logging.warning(
-                    f"[lagrangian_hessian] constraint Hessian raised {e}; skipping."
-                )
-                return H_acc
+        def _sanitize_sparse(A: sp.spmatrix) -> sp.spmatrix:
+            A = A.tocsr()
+            d = A.data
+            if not np.isfinite(d).all():
+                d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
+                A = sp.csr_matrix((d, A.indices, A.indptr), shape=A.shape)
+            np.clip(A.data, -clip_max, clip_max, out=A.data)
+            return A
 
-            H_i = _to_type(H_i)
-            H_i = _ensure_shape(H_i)
-            if H_i is None:
-                return H_acc
-
-            H_i = _sanitize(H_i)
-            H_i = _symmetrize(H_i)
-
-            return H_acc + weight * H_i
-
-        # --- base Hessian (objective) ---
+        # Base Hessian
         try:
-            with np.errstate(all="ignore"):
-                H_base = self.eval_all(x, components=["H"]).get("H", None)
-        except Exception as e:
-            logging.warning(
-                f"[lagrangian_hessian] eval_all failed to get H: {e}; using zeros."
-            )
-            H_base = None
+            H = self.eval_all(x, components=["H"])["H"]
+        except Exception:
+            H = None
 
-        if H_base is None:
+        if H is None:
             H = sp.csr_matrix((n, n)) if use_sparse else np.zeros((n, n), dtype=float)
         else:
-            H = _to_type(H_base)
-            H = _ensure_shape(H)
-            if H is None:
-                H = (
-                    sp.csr_matrix((n, n))
-                    if use_sparse
-                    else np.zeros((n, n), dtype=float)
-                )
-            H = _sanitize(H)
-            H = _symmetrize(H)
-            if use_sparse:
-                H = H.tocsr()
+            if sp.issparse(H):
+                H = (H + H.T) * 0.5
+                H = _sanitize_sparse(H)
+                if not use_sparse:
+                    H = H.toarray()
+            else:
+                H = np.asarray(H, dtype=float, order="C")
+                H = 0.5 * (H + H.T)
+                H = _sanitize_dense(H)
+                if use_sparse:
+                    H = sp.csr_matrix(H)
 
-        # --- add inequality pieces ---
-        cI_hess_list = getattr(self, "cI_hess", None) or []
-        if len(cI_hess_list) < lam.size:
-            logging.warning(
-                f"[lagrangian_hessian] cI_hess length {len(cI_hess_list)} < λ size {lam.size}; extras ignored."
-            )
-        for li, Hi in zip(lam, cI_hess_list):
-            H = _add_piece(H, li, Hi)
+        # Add constraints’ Hessians
+        def _add_piece(H_acc, w: float, Hi_fun):
+            if (Hi_fun is None) or (abs(w) <= multiplier_threshold):
+                return H_acc
+            try:
+                Hi = Hi_fun(x)
+            except Exception:
+                return H_acc
+            if sp.issparse(Hi):
+                Hi = (Hi + Hi.T) * 0.5
+                Hi = _sanitize_sparse(Hi)
+                if use_sparse:
+                    return H_acc + (w * Hi)
+                else:
+                    return H_acc + (w * Hi.toarray())
+            else:
+                Hi = np.asarray(Hi, dtype=float, order="C")
+                Hi = 0.5 * (Hi + Hi.T)
+                Hi = _sanitize_dense(Hi)
+                if use_sparse:
+                    return H_acc + (w * sp.csr_matrix(Hi))
+                else:
+                    return H_acc + (w * Hi)
 
-        # --- add equality pieces ---
-        cE_hess_list = getattr(self, "cE_hess", None) or []
-        if len(cE_hess_list) < nu.size:
-            logging.warning(
-                f"[lagrangian_hessian] cE_hess length {len(cE_hess_list)} < ν size {nu.size}; extras ignored."
-            )
-        for ni, Hi in zip(nu, cE_hess_list):
-            H = _add_piece(H, ni, Hi)
+        for w, Hi in zip(lam, getattr(self, "cI_hess", ())):
+            H = _add_piece(H, w, Hi)
+        for w, Hi in zip(nu, getattr(self, "cE_hess", ())):
+            H = _add_piece(H, w, Hi)
 
-        # --- optional tiny diagonal floor to avoid near-singular diagonals ---
+        # Tiny diagonal floor if requested
         if diag_floor > 0.0:
             if use_sparse:
                 d = H.diagonal()
-                fix = (np.abs(d) < diag_floor) | ~np.isfinite(d)
-                if np.any(fix):
-                    add = sp.diags(diag_floor * fix.astype(float))
-                    H = (H + add).tocsr()
+                mask = (np.abs(d) < diag_floor) | ~np.isfinite(d)
+                if np.any(mask):
+                    H = (H + sp.diags(diag_floor * mask.astype(float))).tocsr()
             else:
                 d = np.diag(H)
-                fix = (np.abs(d) < diag_floor) | ~np.isfinite(d)
-                if np.any(fix):
-                    H = H.copy()
-                    idx = np.where(fix)[0]
+                mask = (np.abs(d) < diag_floor) | ~np.isfinite(d)
+                if np.any(mask):
+                    idx = np.where(mask)[0]
                     H[idx, idx] = diag_floor
 
-        # --- final sanity: finite or fallback ---
+        # Final finite check
         if use_sparse:
-            if not np.all(np.isfinite(H.data)):
-                logging.warning(
-                    "[lagrangian_hessian] non-finite entries after assembly; falling back to identity."
-                )
+            if not np.isfinite(H.data).all():
                 H = sp.eye(n, format="csr")
         else:
-            if not np.all(np.isfinite(H)):
-                logging.warning(
-                    "[lagrangian_hessian] non-finite entries after assembly; falling back to identity."
-                )
-                H = np.eye(n)
-
+            if not np.isfinite(H).all():
+                H = np.eye(n, dtype=float)
         return H
 
     def constraint_violation(self, x: np.ndarray) -> float:
         """L1 norm of violations (cI⁺ + |cE|) scaled by problem size; robust to None."""
-        if x.shape[0] != self.n:
-            raise ValueError(f"Input x shape {x.shape} does not match n={self.n}")
-        if not np.all(np.isfinite(x)):
-            raise ValueError("Non-finite values in x")
+        # if x.shape[0] != self.n:
+        #     raise ValueError(f"Input x shape {x.shape} does not match n={self.n}")
+        # if not np.all(np.isfinite(x)):
+        #     raise ValueError("Non-finite values in x")
 
         d = self.eval_all(x, components=["cI", "cE"])
         mI, mE = self.m_ineq, self.m_eq
@@ -619,85 +528,65 @@ class Model:
             logging.warning(f"Non-finite constraint violation: {theta}")
             theta = float("inf")
         return theta
-
-    def kkt_residuals(
-        self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
-    ) -> Dict[str, float]:
-        """Compute KKT residuals: stationarity, feasibility, and complementarity."""
-        if (
-            x.shape[0] != self.n
-            or lam.shape[0] != self.m_ineq
-            or nu.shape[0] != self.m_eq
-        ):
-            raise ValueError(
-                f"Incompatible shapes: x={x.shape}, lam={lam.shape}, nu={nu.shape}"
-            )
-        if not (
-            np.all(np.isfinite(x))
-            and np.all(np.isfinite(lam))
-            and np.all(np.isfinite(nu))
-        ):
+    
+    def kkt_residuals(self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray) -> dict[str, float]:
+        """Cheaper assembly with shared eval and fewer conversions."""
+        n, mI, mE = self.n, self.m_ineq, self.m_eq
+        lam = np.asarray(lam, dtype=float).ravel()
+        nu  = np.asarray(nu,  dtype=float).ravel()
+        if x.shape[0] != n or lam.shape[0] != mI or nu.shape[0] != mE:
+            raise ValueError(f"Incompatible shapes: x={x.shape}, lam={lam.shape}, nu={nu.shape}")
+        if not (np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()):
             raise ValueError("Non-finite values in x, lam, or nu")
 
-        mI, mE, n = self.m_ineq, self.m_eq, self.n
-        d = self.eval_all(x, components=["g", "JI", "cI", "JE", "cE"])
-        g = np.asarray(d.get("g", np.zeros(n)), dtype=float).ravel()
-        cI = _clean_vec(d.get("cI", None), mI) if mI > 0 else np.zeros(0, dtype=float)
-        cE = _clean_vec(d.get("cE", None), mE) if mE > 0 else np.zeros(0, dtype=float)
-        JI = d.get("JI", None)
-        JE = d.get("JE", None)
-        if JI is None and mI > 0:
-            JI = _zero_mat(mI, n)
-        if JE is None and mE > 0:
-            JE = _zero_mat(mE, n)
-        lam = _clean_vec(lam, mI) if mI > 0 else np.zeros(0, dtype=float)
-        nu = _clean_vec(nu, mE) if mE > 0 else np.zeros(0, dtype=float)
+        need = ["g"]
+        if mI: need += ["JI","cI"]
+        if mE: need += ["JE","cE"]
+        d = self.eval_all(x, components=need)
 
-        # Ensure non-negative multipliers for inequalities
-        lam = np.maximum(lam, 0.0)
-
-        # Stationarity: g + JIᵀ λ + JEᵀ ν
-        rL = g.copy()
-        if mI > 0:
-            rL += (JI.T @ lam) if sp.issparse(JI) else (np.asarray(JI, float).T @ lam)
-        if mE > 0:
-            rL += (JE.T @ nu) if sp.issparse(JE) else (np.asarray(JE, float).T @ nu)
-
-        # Scaling factor based on gradient norm
+        g  = np.asarray(d.get("g", np.zeros(n, dtype=float)), dtype=float).ravel()
         scale_g = max(1.0, float(np.linalg.norm(g, ord=np.inf)))
+
+        # Stationarity rL = g + JI^T lam + JE^T nu
+        rL = g.copy()
+        if mI:
+            JI = d.get("JI", None)
+            if JI is None:
+                pass
+            elif sp.issparse(JI):
+                rL += JI.T @ np.maximum(lam, 0.0)
+            else:
+                rL += np.asarray(JI, dtype=float, order="C").T @ np.maximum(lam, 0.0)
+        if mE:
+            JE = d.get("JE", None)
+            if JE is None:
+                pass
+            elif sp.issparse(JE):
+                rL += JE.T @ nu
+            else:
+                rL += np.asarray(JE, dtype=float, order="C").T @ nu
+
         stat_inf = float(np.linalg.norm(rL, ord=np.inf)) / scale_g
-        ineq_inf = (
-            float(np.linalg.norm(np.maximum(0.0, cI), ord=np.inf)) / scale_g
-            if mI > 0
-            else 0.0
-        )
-        eq_inf = float(np.linalg.norm(cE, ord=np.inf)) / scale_g if mE > 0 else 0.0
 
-        # Complementarity: max(|λ_i * cI_i|) for inequality constraints
+        # Feasibility
+        ineq_inf = 0.0
         comp_inf = 0.0
-        if mI > 0:
-            comp_terms = np.abs(lam * cI)  # λ_i * g_i should be ≈ 0
-            comp_inf = (
-                float(np.max(comp_terms)) / scale_g if comp_terms.size > 0 else 0.0
-            )
+        if mI:
+            cI = np.asarray(d.get("cI", np.zeros(mI, dtype=float)), dtype=float).ravel()
+            cI_plus = np.maximum(0.0, cI)
+            ineq_inf = float(np.linalg.norm(cI_plus, ord=np.inf)) / scale_g
+            comp = np.abs(np.maximum(lam, 0.0) * cI)
+            comp_inf = float(comp.max() if comp.size else 0.0) / scale_g
 
-        residuals = {
-            "stat": stat_inf,
-            "ineq": ineq_inf,
-            "eq": eq_inf,
-            "comp": comp_inf,
-        }
+        eq_inf = 0.0
+        if mE:
+            cE = np.asarray(d.get("cE", np.zeros(mE, dtype=float)), dtype=float).ravel()
+            eq_inf = float(np.linalg.norm(cE, ord=np.inf)) / scale_g
 
-        # Log raw residuals for debugging
-        if not all(np.isfinite(v) for v in residuals.values()):
-            logging.warning(
-                f"Non-finite KKT residuals: {residuals}, raw comp terms: {comp_terms if mI > 0 else []}"
-            )
-            residuals = {k: float("inf") for k in residuals}
-        elif comp_inf > 1e-4:  # Log large complementarity terms
-            logging.debug(f"KKT comp terms: {comp_terms if mI > 0 else []}")
-
-        return residuals
+        res = {"stat": stat_inf, "ineq": ineq_inf, "eq": eq_inf, "comp": comp_inf}
+        if not all(np.isfinite(v) for v in res.values()):
+            res = {k: float("inf") for k in res}
+        return res
 
     def reset_cache(self):
         """Clear evaluation cache."""

@@ -1,10 +1,10 @@
-// ad.cpp  —  PyBind11 + NumPy fast paths + GIL release
+// ad.cpp  —  PyBind11 + NumPy fast paths + GIL release (optimized)
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
 #include "../include/ad/ADGraph.h"
-#include "../include/ad/Definitions.h" // ensure_epoch_ & epoch fields
+#include "../include/ad/Definitions.h" // ensure set_epoch_value & *_epoch fields
 #include "../include/ad/Expression.h"
 #include "../include/ad/Variable.h"
 
@@ -28,9 +28,16 @@ static inline bool is_sequence(const py::handle &h) {
 }
 static py::tuple to_tuple(const std::vector<py::object> &vec) {
     py::tuple t(vec.size());
-    for (size_t i = 0; i < vec.size(); ++i)
-        t[i] = vec[i];
+    for (size_t i = 0; i < vec.size(); ++i) t[i] = vec[i];
     return t;
+}
+// Epoch bump helper: works for uint32_t/uint64_t/size_t and atomics.
+template <class T>
+static inline void bump_epoch(T& e) noexcept { ++e; }
+
+template <class T>
+static inline void bump_epoch(std::atomic<T>& e) noexcept {
+    e.fetch_add(1, std::memory_order_relaxed);
 }
 
 // NumPy helpers
@@ -38,13 +45,11 @@ using Arr1D = py::array_t<double, py::array::c_style | py::array::forcecast>;
 using Arr2D = py::array_t<double, py::array::c_style | py::array::forcecast>;
 
 static std::span<const double> as_span_1d(const Arr1D &a) {
-    if (a.ndim() != 1)
-        throw std::invalid_argument("expected 1D float64 array");
+    if (a.ndim() != 1) throw std::invalid_argument("expected 1D float64 array");
     return {a.data(), static_cast<size_t>(a.shape(0))};
 }
 static std::pair<ssize_t, ssize_t> shape_2d(const Arr2D &a) {
-    if (a.ndim() != 2)
-        throw std::invalid_argument("expected 2D float64 array");
+    if (a.ndim() != 2) throw std::invalid_argument("expected 2D float64 array");
     return {a.shape(0), a.shape(1)};
 }
 
@@ -53,26 +58,21 @@ static ADNodePtr make_const_node(const ADGraphPtr &g, double v) {
     auto n = std::make_shared<ADNode>();
     n->type = Operator::cte;
     n->value = v;
-    if (g)
-        g->addNode(n);
+    if (g) g->addNode(n);
     return n;
 }
-static std::shared_ptr<Expression> make_const_expr(double val,
-                                                   const ADGraphPtr &g) {
+static std::shared_ptr<Expression> make_const_expr(double val, const ADGraphPtr &g) {
     auto n = make_const_node(g, val);
     return std::make_shared<Expression>(n, g);
 }
-static std::shared_ptr<Expression>
-make_expr_from_variable(const std::shared_ptr<Variable> &v,
-                        const ADGraphPtr &g) {
+static std::shared_ptr<Expression> make_expr_from_variable(const std::shared_ptr<Variable> &v,
+                                                           const ADGraphPtr &g) {
     return std::make_shared<Expression>(v, 1.0, g);
 }
-static std::shared_ptr<Expression> make_expr_from_number(double val,
-                                                         const ADGraphPtr &g) {
+static std::shared_ptr<Expression> make_expr_from_number(double val, const ADGraphPtr &g) {
     return make_const_expr(val, g);
 }
-static std::shared_ptr<Expression> as_expression(const py::handle &h,
-                                                 const ADGraphPtr &g) {
+static std::shared_ptr<Expression> as_expression(const py::handle &h, const ADGraphPtr &g) {
     if (py::isinstance<Expression>(h)) {
         return h.cast<std::shared_ptr<Expression>>();
     }
@@ -83,32 +83,25 @@ static std::shared_ptr<Expression> as_expression(const py::handle &h,
     if (is_number(h)) {
         return make_expr_from_number(py::cast<double>(h), g);
     }
-    throw std::invalid_argument(
-        "Argument must be Expression, Variable, int, or float.");
+    throw std::invalid_argument("Argument must be Expression, Variable, int, or float.");
 }
-static std::shared_ptr<Expression> ensure_expression(const py::handle &ret,
-                                                     const ADGraphPtr &g) {
-    if (py::isinstance<Expression>(ret))
-        return ret.cast<std::shared_ptr<Expression>>();
-    if (is_number(ret))
-        return make_expr_from_number(py::cast<double>(ret), g);
-    throw std::invalid_argument(
-        "Function must return Expression or a numeric value.");
+static std::shared_ptr<Expression> ensure_expression(const py::handle &ret, const ADGraphPtr &g) {
+    if (py::isinstance<Expression>(ret)) return ret.cast<std::shared_ptr<Expression>>();
+    if (is_number(ret)) return make_expr_from_number(py::cast<double>(ret), g);
+    throw std::invalid_argument("Function must return Expression or a numeric value.");
 }
 
 // ========= Unary ops dispatch =========
-static std::shared_ptr<Expression>
-unary_from_expression(Operator op, const std::shared_ptr<Expression> &x) {
+static std::shared_ptr<Expression> unary_from_expression(Operator op,
+                                                         const std::shared_ptr<Expression> &x) {
     auto g = x->graph;
     auto e = std::make_shared<Expression>(g);
     e->node->type = op;
     e->node->addInput(x->node);
-    if (g)
-        g->addNode(e->node);
+    if (g) g->addNode(e->node);
     return e;
 }
-static std::shared_ptr<Expression>
-unary_from_variable(Operator op, const std::shared_ptr<Variable> &v) {
+static std::shared_ptr<Expression> unary_from_variable(Operator op, const std::shared_ptr<Variable> &v) {
     auto g = std::make_shared<ADGraph>();
     auto x = make_expr_from_variable(v, g);
     return unary_from_expression(op, x);
@@ -125,27 +118,19 @@ static py::object unary_dispatch(py::object x, Operator op) {
     if (is_number(x)) {
         const double a = py::cast<double>(x);
         switch (op) {
-        case Operator::Sin:
-            return py::float_(std::sin(a));
-        case Operator::Cos:
-            return py::float_(std::cos(a));
-        case Operator::Tan:
-            return py::float_(std::tan(a));
-        case Operator::Exp:
-            return py::float_(std::exp(a));
-        case Operator::Log:
-            return py::float_(std::log(a));
-        default:
-            return py::float_(a);
+            case Operator::Sin: return py::float_(std::sin(a));
+            case Operator::Cos: return py::float_(std::cos(a));
+            case Operator::Tan: return py::float_(std::tan(a));
+            case Operator::Exp: return py::float_(std::exp(a));
+            case Operator::Log: return py::float_(std::log(a));
+            default:            return py::float_(a);
         }
     }
-    throw std::invalid_argument(
-        "Argument must be Expression, Variable, int, or float.");
+    throw std::invalid_argument("Argument must be Expression, Variable, int, or float.");
 }
 
 // ========= pow helpers =========
-static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
-                           long long e) {
+static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base, long long e) {
     if (e == 0) {
         auto one = std::make_shared<ADNode>();
         one->type = Operator::cte;
@@ -175,8 +160,7 @@ static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
         }
         return have_result ? result : base;
     };
-    if (e > 0)
-        return pow_pos(e);
+    if (e > 0) return pow_pos(e);
     auto num = std::make_shared<ADNode>();
     num->type = Operator::cte;
     num->value = 1.0;
@@ -189,12 +173,10 @@ static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
     g->addNode(div);
     return div;
 }
-
 static std::shared_ptr<Expression> expr_pow_any(py::object x, double p) {
     ADGraphPtr g = std::make_shared<ADGraph>();
     auto ex = as_expression(x, g);
-    if (ex->node)
-        g->adoptSubgraph(ex->node);
+    if (ex->node) g->adoptSubgraph(ex->node);
 
     double pr = std::round(p);
     bool is_int = std::fabs(p - pr) < 1e-12 && std::isfinite(pr);
@@ -221,14 +203,10 @@ static std::shared_ptr<Expression> expr_pow_any(py::object x, double p) {
     g->addNode(e_exp->node);
     return e_exp;
 }
-
-static std::shared_ptr<Expression>
-scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
-    if (s <= 0.0)
-        throw std::domain_error("scalar ** Expression requires base > 0");
+static std::shared_ptr<Expression> scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
+    if (s <= 0.0) throw std::domain_error("scalar ** Expression requires base > 0");
     ADGraphPtr g = x->graph ? x->graph : std::make_shared<ADGraph>();
-    if (x->node)
-        g->adoptSubgraph(x->node);
+    if (x->node) g->adoptSubgraph(x->node);
 
     auto e_mul = std::make_shared<Expression>(g);
     e_mul->node->type = Operator::Multiply;
@@ -253,10 +231,8 @@ static py::object binary_max_dispatch(py::object x, py::object y) {
     ADGraphPtr g = std::make_shared<ADGraph>();
     auto ex = as_expression(x, g);
     auto ey = as_expression(y, g);
-    if (ex->graph)
-        g = ex->graph;
-    if (ey->graph)
-        g = ey->graph;
+    if (ex->graph) g = ex->graph;
+    if (ey->graph) g = ey->graph;
     g->adoptSubgraph(ex->node);
     g->adoptSubgraph(ey->node);
 
@@ -269,22 +245,18 @@ static py::object binary_max_dispatch(py::object x, py::object y) {
 }
 
 // ========= Call adapters =========
-static py::object
-call_with_positional(py::function f, const std::vector<py::object> &expr_args) {
+static py::object call_with_positional(py::function f, const std::vector<py::object> &expr_args) {
     return f(*to_tuple(expr_args));
 }
-static py::object
-call_with_single_sequence(py::function f,
-                          const std::vector<py::object> &expr_list) {
+static py::object call_with_single_sequence(py::function f, const std::vector<py::object> &expr_list) {
     py::list l(expr_list.size());
-    for (size_t i = 0; i < expr_list.size(); ++i)
-        l[i] = expr_list[i];
+    for (size_t i = 0; i < expr_list.size(); ++i) l[i] = expr_list[i];
     return f(l);
 }
 
 // ========= High-level immediate APIs =========
 
-// value: list/tuple compatibility
+// value: list/tuple compatibility (kept)
 static double py_value(py::function f, py::args xs) {
     auto g = std::make_shared<ADGraph>();
     if (xs.size() == 1 && is_sequence(xs[0])) {
@@ -301,8 +273,7 @@ static double py_value(py::function f, py::args xs) {
     }
     std::vector<py::object> expr_args;
     expr_args.reserve(xs.size());
-    for (auto &a : xs)
-        expr_args.emplace_back(py::cast(as_expression(a, g)));
+    for (auto &a : xs) expr_args.emplace_back(py::cast(as_expression(a, g)));
     auto ret = call_with_positional(f, expr_args);
     auto expr = ensure_expression(ret, g);
     py::gil_scoped_release nogil;
@@ -311,7 +282,6 @@ static double py_value(py::function f, py::args xs) {
 
 // FAST value: NumPy 1D
 static double py_value_numpy(py::function f, Arr1D x_in) {
-    // Build a graph with Variables seeded from ndarray
     auto g = std::make_shared<ADGraph>();
     auto x = as_span_1d(x_in);
     std::vector<py::object> expr_elems;
@@ -341,23 +311,18 @@ static py::list py_gradient(py::function f, py::args xs) {
             if (py::isinstance<Variable>(item)) {
                 auto v = item.cast<std::shared_ptr<Variable>>();
                 var_names[i] = v->getName();
-                expr_elems.emplace_back(
-                    py::cast(make_expr_from_variable(v, g)));
+                expr_elems.emplace_back(py::cast(make_expr_from_variable(v, g)));
             } else if (is_number(item)) {
                 double v = py::cast<double>(item);
-                auto vx =
-                    std::make_shared<Variable>("x" + std::to_string(i), v);
+                auto vx = std::make_shared<Variable>("x" + std::to_string(i), v);
                 var_names[i] = vx->getName();
-                expr_elems.emplace_back(
-                    py::cast(make_expr_from_variable(vx, g)));
+                expr_elems.emplace_back(py::cast(make_expr_from_variable(vx, g)));
             } else if (py::isinstance<Expression>(item)) {
                 auto e = item.cast<std::shared_ptr<Expression>>();
                 g->adoptSubgraph(e->node);
                 expr_elems.emplace_back(py::cast(e));
             } else {
-                throw std::invalid_argument(
-                    "gradient: sequence elements must be Variable / Expression "
-                    "/ number.");
+                throw std::invalid_argument("gradient: sequence elements must be Variable / Expression / number.");
             }
         }
         auto ret = call_with_single_sequence(f, expr_elems);
@@ -372,8 +337,7 @@ static py::list py_gradient(py::function f, py::args xs) {
             double gi = 0.0;
             if (!var_names[i].empty()) {
                 auto it = grad_map.find(var_names[i]);
-                if (it != grad_map.end())
-                    gi = it->second;
+                if (it != grad_map.end()) gi = it->second;
             }
             out[i] = py::float_(gi);
         }
@@ -400,8 +364,7 @@ static py::list py_gradient(py::function f, py::args xs) {
             g->adoptSubgraph(e->node);
             expr_args.emplace_back(py::cast(e));
         } else {
-            throw std::invalid_argument(
-                "gradient: args must be Variable / Expression / number.");
+            throw std::invalid_argument("gradient: args must be Variable / Expression / number.");
         }
     }
     auto ret = call_with_positional(f, expr_args);
@@ -416,12 +379,46 @@ static py::list py_gradient(py::function f, py::args xs) {
         double gi = 0.0;
         if (!var_names[i].empty()) {
             auto it = grad_map.find(var_names[i]);
-            if (it != grad_map.end())
-                gi = it->second;
+            if (it != grad_map.end()) gi = it->second;
         }
         out[i] = py::float_(gi);
     }
     return out;
+}
+
+// ---- FAST fused value+grad (ndarray) ----
+static std::pair<double, py::array_t<double>>
+py_value_grad_numpy(py::function f, Arr1D x_in) {
+    auto x = as_span_1d(x_in);
+    const size_t n = x.size();
+
+    auto g = std::make_shared<ADGraph>();
+    std::vector<ADNodePtr> var_nodes; var_nodes.reserve(n);
+    std::vector<py::object> expr_elems; expr_elems.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        auto v  = std::make_shared<Variable>("x" + std::to_string(i), x[i]);
+        auto ex = std::make_shared<Expression>(v, 1.0, g);
+        var_nodes.push_back(ex->node);
+        expr_elems.emplace_back(py::cast(ex));
+    }
+    auto ret  = call_with_single_sequence(f, expr_elems);
+    auto expr = ensure_expression(ret, g);
+    g->adoptSubgraph(expr->node);
+
+    double fval;
+    py::array_t<double> grad((ssize_t)n);
+    {
+        py::gil_scoped_release nogil;
+        g->resetGradients();
+        g->computeForwardPass();
+        fval = expr->node->value;
+        set_epoch_value(expr->node->gradient, expr->node->grad_epoch,
+                        g->cur_grad_epoch_, 1.0);
+        g->initiateBackwardPass(expr->node);
+    }
+    auto gm = grad.mutable_unchecked<1>();
+    for (ssize_t i = 0; i < (ssize_t)n; ++i) gm(i) = var_nodes[(size_t)i]->gradient;
+    return {fval, grad};
 }
 
 // ---- FAST immediate gradient: grad(f, x: ndarray) -> ndarray ----
@@ -429,111 +426,176 @@ static py::array_t<double> py_gradient_numpy(py::function f, Arr1D x_in) {
     auto x = as_span_1d(x_in);
     const size_t n = x.size();
 
-    // 1) Build a graph and symbolic inputs (Variables) seeded from x
     auto g = std::make_shared<ADGraph>();
-    std::vector<py::object> expr_elems;
-    expr_elems.reserve(n);
-    std::vector<ADNodePtr> var_nodes;
-    var_nodes.reserve(n);
+    std::vector<ADNodePtr> var_nodes; var_nodes.reserve(n);
+    std::vector<py::object> expr_elems; expr_elems.reserve(n);
 
     for (size_t i = 0; i < n; ++i) {
-        auto v = std::make_shared<Variable>("x" + std::to_string(i), x[i]);
+        auto v  = std::make_shared<Variable>("x" + std::to_string(i), x[i]);
         auto ex = std::make_shared<Expression>(v, 1.0, g);
-        expr_elems.emplace_back(py::cast(ex));
         var_nodes.push_back(ex->node);
+        expr_elems.emplace_back(py::cast(ex));
     }
 
-    // 2) Call user function and ensure we got an Expression on our graph
-    auto ret = call_with_single_sequence(f, expr_elems);
+    auto ret  = call_with_single_sequence(f, expr_elems);
     auto expr = ensure_expression(ret, g);
     g->adoptSubgraph(expr->node);
 
-    // 3) Do forward + reverse without the GIL
+    py::array_t<double> out((ssize_t)n);
     {
         py::gil_scoped_release nogil;
-        g->resetGradients();        // zero gradients
-        g->computeForwardPass();    // compute .value across graph
-        expr->node->gradient = 1.0; // seed
+        g->resetGradients();
+        g->computeForwardPass();
+        set_epoch_value(expr->node->gradient, expr->node->grad_epoch,
+                        g->cur_grad_epoch_, 1.0);
         g->initiateBackwardPass(expr->node);
     }
-
-    // 4) Pack result into a 1D float64 ndarray
-    py::array_t<double> out((ssize_t)n);
     auto om = out.mutable_unchecked<1>();
-    for (ssize_t i = 0; i < (ssize_t)n; ++i)
-        om(i) = var_nodes[(size_t)i]->gradient;
-
+    for (ssize_t i = 0; i < (ssize_t)n; ++i) om(i) = var_nodes[(size_t)i]->gradient;
     return out;
 }
 
-// ---- add near the other NumPy helpers ----
+// ---- FAST Hessian via HVP columns with epoch bumps ----
 static py::array_t<double> py_hessian_numpy(py::function f, Arr1D x_in) {
     auto x = as_span_1d(x_in);
     const size_t n = x.size();
 
-    // Build graph and symbolic inputs once
     auto g = std::make_shared<ADGraph>();
-    std::vector<py::object> expr_elems;
-    expr_elems.reserve(n);
+    std::vector<ADNodePtr> var_nodes; var_nodes.reserve(n);
+    std::vector<py::object> expr_elems; expr_elems.reserve(n);
     for (size_t i = 0; i < n; ++i) {
-        auto vx = std::make_shared<Variable>("x" + std::to_string(i), x[i]);
-        expr_elems.emplace_back(py::cast(make_expr_from_variable(vx, g)));
+        auto v  = std::make_shared<Variable>("x" + std::to_string(i), x[i]);
+        auto ex = std::make_shared<Expression>(v, 1.0, g);
+        var_nodes.push_back(ex->node);
+        expr_elems.emplace_back(py::cast(ex));
     }
-
-    // Call user f and get Expression
-    auto ret = call_with_single_sequence(f, expr_elems);
+    auto ret  = call_with_single_sequence(f, expr_elems);
     auto expr = ensure_expression(ret, g);
+    g->adoptSubgraph(expr->node);
 
-    // Compute H via HVP columns, no GIL
     py::array_t<double> H({(ssize_t)n, (ssize_t)n});
     auto Hm = H.mutable_unchecked<2>();
 
-    // We rely on g->initializeNodeVariables() if your HVP uses it
-    g->initializeNodeVariables();
-
-    std::vector<ADNodePtr> var_nodes;
-    var_nodes.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        // Reuse the nodes from the variables we created above
-        auto vx = std::static_pointer_cast<Expression>(
-            expr_elems[i].cast<std::shared_ptr<Expression>>());
-        var_nodes.push_back(vx->node);
-    }
-
-    auto hvp_once = [&](const std::vector<double> &v) {
-        std::vector<double> Hv(n, 0.0);
+    {
         py::gil_scoped_release nogil;
 
-        g->resetTangents();
-        for (size_t i = 0; i < n; ++i) {
-            auto &nd = var_nodes[i];
-            set_epoch_value(nd->dot, nd->dot_epoch, g->cur_dot_epoch_, v[i]);
-        }
+        // Base forward once
         g->resetForwardPass();
-        g->computeForwardPassWithDot();
-        g->resetGradients();
-        g->resetGradDot();
-        set_epoch_value(expr->node->gradient, expr->node->grad_epoch,
-                        g->cur_grad_epoch_, 1.0);
-        set_epoch_value(expr->node->grad_dot, expr->node->gdot_epoch,
-                        g->cur_gdot_epoch_, 0.0);
-        g->initiateBackwardPassHVP();
+        g->computeForwardPass();
 
-        for (size_t i = 0; i < n; ++i)
-            Hv[i] = var_nodes[i]->grad_dot;
-        return Hv;
-    };
+        // References to epochs for quick bumping
+        auto &dot_epoch  = g->cur_dot_epoch_;
+        auto &grad_epoch = g->cur_grad_epoch_;
+        auto &gdot_epoch = g->cur_gdot_epoch_;
 
-    std::vector<double> e(n, 0.0);
-    for (size_t j = 0; j < n; ++j) {
-        std::fill(e.begin(), e.end(), 0.0);
-        e[j] = 1.0;
-        auto col = hvp_once(e);
-        for (size_t i = 0; i < n; ++i)
-            Hm((ssize_t)i, (ssize_t)j) = col[i];
+        for (size_t j = 0; j < n; ++j) {
+            // Seed e_j via epoch bump
+            bump_epoch(dot_epoch);
+            for (size_t i = 0; i < n; ++i) {
+                set_epoch_value(var_nodes[i]->dot, var_nodes[i]->dot_epoch,
+                                dot_epoch, (i == j) ? 1.0 : 0.0);
+            }
+
+            // Forward with dot
+            g->resetForwardPass();
+            g->computeForwardPassWithDot();
+
+            // Reverse with grad & grad_dot
+            bump_epoch(grad_epoch);
+            bump_epoch(gdot_epoch);
+            set_epoch_value(expr->node->gradient, expr->node->grad_epoch,
+                            grad_epoch, 1.0);
+            set_epoch_value(expr->node->grad_dot, expr->node->gdot_epoch,
+                            gdot_epoch, 0.0);
+            g->initiateBackwardPassHVP();
+
+            // Write column j
+            for (size_t i = 0; i < n; ++i)
+                Hm((ssize_t)i, (ssize_t)j) = var_nodes[i]->grad_dot;
+        }
     }
     return H;
 }
+
+// Compiled Value (fast ndarray path)
+class ValFn {
+public:
+    ADGraphPtr g;
+    ADNodePtr  expr_root;
+    std::vector<ADNodePtr> var_nodes;
+    bool vector_mode;
+
+    std::string expr_str() const {
+        return (g && expr_root) ? g->getExpression(expr_root) : std::string();
+    }
+
+    ValFn(py::function f, size_t arity, bool vector_input)
+        : g(std::make_shared<ADGraph>()), vector_mode(vector_input) {
+        std::vector<py::object> expr_args; expr_args.reserve(arity);
+        var_nodes.reserve(arity);
+        for (size_t i = 0; i < arity; ++i) {
+            auto vx = std::make_shared<Variable>("", 0.0);            // no names needed for value
+            auto ex = std::make_shared<Expression>(vx, 1.0, g);
+            var_nodes.push_back(ex->node);
+            expr_args.emplace_back(py::cast(ex));
+        }
+        py::object ret;
+        if (vector_mode) {
+            py::list l(arity);
+            for (size_t i = 0; i < arity; ++i) l[i] = expr_args[i];
+            ret = f(l);
+        } else {
+            py::tuple args(expr_args.size());
+            for (size_t i = 0; i < expr_args.size(); ++i) args[i] = expr_args[i];
+            ret = f(*args);
+        }
+        if (ret.is_none()) throw std::invalid_argument("compile_value: function returned None");
+        auto expr = ret.cast<std::shared_ptr<Expression>>();
+        g->adoptSubgraph(expr->node);
+        expr_root = expr->node;
+        g->initializeNodeVariables();
+    }
+
+    // FAST: __call__(x: ndarray) -> float
+    double operator()(Arr1D x_in) {
+        auto x = as_span_1d(x_in);
+        if (x.size() != var_nodes.size())
+            throw std::invalid_argument("ValFn: wrong input length");
+        for (size_t i = 0; i < x.size(); ++i) var_nodes[i]->value = x[i];
+        double fval;
+        {
+            py::gil_scoped_release nogil;
+            g->resetForwardPass();
+            g->computeForwardPass();
+            fval = expr_root->value;
+        }
+        return fval;
+    }
+
+    // optional list/tuple compat
+    double call_seq(py::object xseq) {
+        if (!py::isinstance<py::sequence>(xseq) || py::isinstance<py::str>(xseq))
+            throw std::invalid_argument("ValFn: expected list/tuple");
+        py::sequence s = xseq.cast<py::sequence>();
+        if ((size_t)s.size() != var_nodes.size())
+            throw std::invalid_argument("ValFn: wrong input length");
+        for (size_t i = 0; i < var_nodes.size(); ++i)
+            var_nodes[i]->value = py::cast<double>(s[i]);
+        double fval;
+        {
+            py::gil_scoped_release nogil;
+            g->resetForwardPass();
+            g->computeForwardPass();
+            fval = expr_root->value;
+        }
+        return fval;
+    }
+};
+
+static std::shared_ptr<ValFn> py_compile_value(py::function f, size_t arity, bool vector_input) {
+    return std::make_shared<ValFn>(f, arity, vector_input);
+}
+
 
 // ========= Compiled Gradient (fast ndarray path) =========
 class GradFn {
@@ -544,15 +606,13 @@ public:
     bool vector_mode;
 
     std::string expr_str() const {
-        if (!g || !expr_root)
-            return std::string();
+        if (!g || !expr_root) return std::string();
         return g->getExpression(expr_root);
     }
 
     GradFn(py::function f, size_t arity, bool vector_input)
         : g(std::make_shared<ADGraph>()), vector_mode(vector_input) {
-        std::vector<py::object> expr_args;
-        expr_args.reserve(arity);
+        std::vector<py::object> expr_args; expr_args.reserve(arity);
         var_nodes.reserve(arity);
         for (size_t i = 0; i < arity; ++i) {
             auto vx = std::make_shared<Variable>("x" + std::to_string(i), 0.0);
@@ -563,18 +623,14 @@ public:
         py::object ret;
         if (vector_mode) {
             py::list l(arity);
-            for (size_t i = 0; i < arity; ++i)
-                l[i] = expr_args[i];
+            for (size_t i = 0; i < arity; ++i) l[i] = expr_args[i];
             ret = f(l);
         } else {
             py::tuple args(expr_args.size());
-            for (size_t i = 0; i < expr_args.size(); ++i)
-                args[i] = expr_args[i];
+            for (size_t i = 0; i < expr_args.size(); ++i) args[i] = expr_args[i];
             ret = f(*args);
         }
-        if (ret.is_none())
-            throw std::invalid_argument(
-                "compile_gradient: function returned None");
+        if (ret.is_none()) throw std::invalid_argument("compile_gradient: function returned None");
         auto expr = ret.cast<std::shared_ptr<Expression>>();
         g->adoptSubgraph(expr->node);
         expr_root = expr->node;
@@ -583,70 +639,68 @@ public:
     // FAST path: __call__(x: ndarray) -> ndarray
     Arr1D call_numpy(Arr1D x_in) {
         auto x = as_span_1d(x_in);
-        if (x.size() != var_nodes.size())
-            throw std::invalid_argument("GradFn: wrong input length");
-        for (size_t i = 0; i < x.size(); ++i)
-            var_nodes[i]->value = x[i];
+        if (x.size() != var_nodes.size()) throw std::invalid_argument("GradFn: wrong input length");
+        for (size_t i = 0; i < x.size(); ++i) var_nodes[i]->value = x[i];
 
         {
             py::gil_scoped_release nogil;
             g->resetGradients();
             g->computeForwardPass();
-            expr_root->gradient = 1.0;
+            set_epoch_value(expr_root->gradient, expr_root->grad_epoch, g->cur_grad_epoch_, 1.0);
             g->initiateBackwardPass(expr_root);
         }
-        Arr1D out(x_in.request().size);
+        Arr1D out((ssize_t)x.size());
         auto om = out.mutable_unchecked<1>();
-        for (ssize_t i = 0; i < static_cast<ssize_t>(x.size()); ++i)
-            om(i) = var_nodes[i]->gradient;
+        for (ssize_t i = 0; i < (ssize_t)x.size(); ++i) om(i) = var_nodes[(size_t)i]->gradient;
         return out;
+    }
+
+    // Optional: fast value(x: ndarray) -> double
+    double value_numpy(Arr1D x_in) {
+        auto x = as_span_1d(x_in);
+        if (x.size() != var_nodes.size()) throw std::invalid_argument("GradFn.value: wrong input length");
+        for (size_t i = 0; i < x.size(); ++i) var_nodes[i]->value = x[i];
+        double fval;
+        {
+            py::gil_scoped_release nogil;
+            g->resetForwardPass();
+            g->computeForwardPass();
+            fval = expr_root->value;
+        }
+        return fval;
     }
 
     // Backwards compatibility: list/tuple
     py::list operator()(py::object x) {
-        if (!is_sequence(x))
-            throw std::invalid_argument(
-                "GradFn: expected a list/tuple of numbers");
+        if (!is_sequence(x)) throw std::invalid_argument("GradFn: expected a list/tuple of numbers");
         py::sequence seq = x.cast<py::sequence>();
-        if ((size_t)seq.size() != var_nodes.size())
-            throw std::invalid_argument("GradFn: wrong length");
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = py::cast<double>(seq[i]);
+        if ((size_t)seq.size() != var_nodes.size()) throw std::invalid_argument("GradFn: wrong length");
+        for (size_t i = 0; i < var_nodes.size(); ++i) var_nodes[i]->value = py::cast<double>(seq[i]);
         {
             py::gil_scoped_release nogil;
             g->resetGradients();
             g->computeForwardPass();
-            expr_root->gradient = 1.0;
+            set_epoch_value(expr_root->gradient, expr_root->grad_epoch, g->cur_grad_epoch_, 1.0);
             g->initiateBackwardPass(expr_root);
         }
         py::list out(var_nodes.size());
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            out[i] = py::float_(var_nodes[i]->gradient);
+        for (size_t i = 0; i < var_nodes.size(); ++i) out[i] = py::float_(var_nodes[i]->gradient);
         return out;
     }
 };
 
 static py::object gradfn_call_positional(GradFn &self, py::args xs) {
-    if (self.vector_mode)
-        throw std::invalid_argument(
-            "GradFn expects a single array/list; use f([x0,...])");
-    if (xs.size() != self.var_nodes.size())
-        throw std::invalid_argument("GradFn: wrong number of positional args");
+    if (self.vector_mode) throw std::invalid_argument("GradFn expects a single array/list; use f([x0,...])");
+    if (xs.size() != self.var_nodes.size()) throw std::invalid_argument("GradFn: wrong number of positional args");
     py::list v(xs.size());
-    for (size_t i = 0; i < xs.size(); ++i)
-        v[i] = py::float_(py::cast<double>(xs[i]));
+    for (size_t i = 0; i < xs.size(); ++i) v[i] = py::float_(py::cast<double>(xs[i]));
     return self(v);
 }
-
-static std::shared_ptr<GradFn> py_compile_gradient(py::function f, size_t arity,
-                                                   bool vector_input) {
+static std::shared_ptr<GradFn> py_compile_gradient(py::function f, size_t arity, bool vector_input) {
     return std::make_shared<GradFn>(f, arity, vector_input);
 }
-static std::shared_ptr<GradFn> py_gradient_from_example(py::function f,
-                                                        py::handle example) {
-    if (!(is_sequence(example)))
-        throw std::invalid_argument(
-            "gradient_from_example: pass a list/tuple example");
+static std::shared_ptr<GradFn> py_gradient_from_example(py::function f, py::handle example) {
+    if (!(is_sequence(example))) throw std::invalid_argument("gradient_from_example: pass a list/tuple example");
     py::sequence seq = example.cast<py::sequence>();
     return std::make_shared<GradFn>(f, (size_t)seq.size(), true);
 }
@@ -659,16 +713,17 @@ public:
     std::vector<ADNodePtr> var_nodes;
     bool vector_mode;
 
+    // scratch seed to avoid per-call allocs
+    std::vector<double> seed;
+
     std::string expr_str() const {
-        if (!g || !expr_root)
-            return std::string();
+        if (!g || !expr_root) return std::string();
         return g->getExpression(expr_root);
     }
 
     HessFn(py::function f, size_t arity, bool vector_input)
-        : g(std::make_shared<ADGraph>()), vector_mode(vector_input) {
-        std::vector<py::object> expr_args;
-        expr_args.reserve(arity);
+        : g(std::make_shared<ADGraph>()), vector_mode(vector_input), seed(arity, 0.0) {
+        std::vector<py::object> expr_args; expr_args.reserve(arity);
         var_nodes.reserve(arity);
         for (size_t i = 0; i < arity; ++i) {
             auto vx = std::make_shared<Variable>("x" + std::to_string(i), 0.0);
@@ -679,22 +734,17 @@ public:
         py::object ret;
         if (vector_mode) {
             py::list l(arity);
-            for (size_t i = 0; i < arity; ++i)
-                l[i] = expr_args[i];
+            for (size_t i = 0; i < arity; ++i) l[i] = expr_args[i];
             ret = f(l);
         } else {
             py::tuple args(expr_args.size());
-            for (size_t i = 0; i < expr_args.size(); ++i)
-                args[i] = expr_args[i];
+            for (size_t i = 0; i < expr_args.size(); ++i) args[i] = expr_args[i];
             ret = f(*args);
         }
-        if (ret.is_none())
-            throw std::invalid_argument(
-                "compile_hessian: function returned None");
+        if (ret.is_none()) throw std::invalid_argument("compile_hessian: function returned None");
         auto expr = ret.cast<std::shared_ptr<Expression>>();
         g->adoptSubgraph(expr->node);
         expr_root = expr->node;
-
         g->initializeNodeVariables();
     }
 
@@ -702,45 +752,36 @@ public:
         if (!py::isinstance<py::sequence>(x) || py::isinstance<py::str>(x))
             throw std::invalid_argument("HessFn: expected a list/tuple");
         py::sequence sx = x.cast<py::sequence>();
-        if ((size_t)sx.size() != var_nodes.size())
-            throw std::invalid_argument("HessFn: wrong input length");
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = py::cast<double>(sx[i]);
+        if ((size_t)sx.size() != var_nodes.size()) throw std::invalid_argument("HessFn: wrong input length");
+        for (size_t i = 0; i < var_nodes.size(); ++i) var_nodes[i]->value = py::cast<double>(sx[i]);
     }
     void set_inputs_arr(const Arr1D &x_in) {
         auto x = as_span_1d(x_in);
-        if (x.size() != var_nodes.size())
-            throw std::invalid_argument("HessFn: wrong input length");
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = x[i];
+        if (x.size() != var_nodes.size()) throw std::invalid_argument("HessFn: wrong input length");
+        for (size_t i = 0; i < var_nodes.size(); ++i) var_nodes[i]->value = x[i];
     }
 
     std::vector<double> hvp_once(const std::vector<double> &v) {
         const size_t n = var_nodes.size();
-        if (v.size() != n)
-            throw std::invalid_argument("HessFn.hvp_once: v wrong length");
+        if (v.size() != n) throw std::invalid_argument("HessFn.hvp_once: v wrong length");
 
         {
             py::gil_scoped_release nogil;
             g->resetTangents();
             for (size_t i = 0; i < n; ++i) {
                 auto &nd = var_nodes[i];
-                set_epoch_value(nd->dot, nd->dot_epoch, g->cur_dot_epoch_,
-                                v[i]);
+                set_epoch_value(nd->dot, nd->dot_epoch, g->cur_dot_epoch_, v[i]);
             }
             g->resetForwardPass();
             g->computeForwardPassWithDot();
             g->resetGradients();
             g->resetGradDot();
-            set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
-                            g->cur_grad_epoch_, 1.0);
-            set_epoch_value(expr_root->grad_dot, expr_root->gdot_epoch,
-                            g->cur_gdot_epoch_, 0.0);
+            set_epoch_value(expr_root->gradient, expr_root->grad_epoch, g->cur_grad_epoch_, 1.0);
+            set_epoch_value(expr_root->grad_dot, expr_root->gdot_epoch, g->cur_gdot_epoch_, 0.0);
             g->initiateBackwardPassHVP();
         }
         std::vector<double> Hv(n, 0.0);
-        for (size_t i = 0; i < n; ++i)
-            Hv[i] = var_nodes[i]->grad_dot;
+        for (size_t i = 0; i < n; ++i) Hv[i] = var_nodes[i]->grad_dot;
         return Hv;
     }
 
@@ -750,13 +791,18 @@ public:
         const size_t n = var_nodes.size();
         Arr2D H({(ssize_t)n, (ssize_t)n});
         auto Hm = H.mutable_unchecked<2>();
-        std::vector<double> e(n, 0.0), col;
+
+        {
+            py::gil_scoped_release nogil;
+            g->resetForwardPass();
+            g->computeForwardPass();
+        }
+
         for (size_t j = 0; j < n; ++j) {
-            std::fill(e.begin(), e.end(), 0.0);
-            e[j] = 1.0;
-            col = hvp_once(e);
-            for (size_t i = 0; i < n; ++i)
-                Hm((ssize_t)i, (ssize_t)j) = col[i];
+            std::fill(seed.begin(), seed.end(), 0.0);
+            seed[j] = 1.0;
+            auto col = hvp_once(seed);
+            for (size_t i = 0; i < n; ++i) Hm((ssize_t)i, (ssize_t)j) = col[i];
         }
         return H;
     }
@@ -765,19 +811,24 @@ public:
     py::list operator()(py::object x) {
         set_inputs_seq(x);
         const size_t n = var_nodes.size();
+
+        {
+            py::gil_scoped_release nogil;
+            g->resetForwardPass();
+            g->computeForwardPass();
+        }
+
         std::vector<std::vector<double>> Hm(n, std::vector<double>(n, 0.0));
         for (size_t j = 0; j < n; ++j) {
-            std::vector<double> ej(n, 0.0);
-            ej[j] = 1.0;
-            auto col = hvp_once(ej);
-            for (size_t i = 0; i < n; ++i)
-                Hm[i][j] = col[i];
+            std::fill(seed.begin(), seed.end(), 0.0);
+            seed[j] = 1.0;
+            auto col = hvp_once(seed);
+            for (size_t i = 0; i < n; ++i) Hm[i][j] = col[i];
         }
         py::list mat(n);
         for (size_t i = 0; i < n; ++i) {
             py::list row(n);
-            for (size_t j = 0; j < n; ++j)
-                row[j] = py::float_(Hm[i][j]);
+            for (size_t j = 0; j < n; ++j) row[j] = py::float_(Hm[i][j]);
             mat[i] = std::move(row);
         }
         return mat;
@@ -787,14 +838,12 @@ public:
     Arr1D hvp_numpy(Arr1D x_in, Arr1D v_in) {
         set_inputs_arr(x_in);
         auto v = as_span_1d(v_in);
-        if (v.size() != var_nodes.size())
-            throw std::invalid_argument("HessFn.hvp: wrong vector length");
+        if (v.size() != var_nodes.size()) throw std::invalid_argument("HessFn.hvp: wrong vector length");
         std::vector<double> vv(v.begin(), v.end());
         auto Hv = hvp_once(vv);
         Arr1D out(v_in.request().size);
         auto om = out.mutable_unchecked<1>();
-        for (ssize_t i = 0; i < static_cast<ssize_t>(v.size()); ++i)
-            om(i) = Hv[i];
+        for (ssize_t i = 0; i < (ssize_t)v.size(); ++i) om(i) = Hv[i];
         return out;
     }
 
@@ -802,53 +851,39 @@ public:
     py::list hvp_seq(py::object x, py::object v) {
         set_inputs_seq(x);
         if (!py::isinstance<py::sequence>(v) || py::isinstance<py::str>(v))
-            throw std::invalid_argument(
-                "HessFn.hvp: expected list/tuple for v");
+            throw std::invalid_argument("HessFn.hvp: expected list/tuple for v");
         py::sequence sv = v.cast<py::sequence>();
         const size_t n = var_nodes.size();
-        if ((size_t)sv.size() != n)
-            throw std::invalid_argument("HessFn.hvp: wrong vector length");
+        if ((size_t)sv.size() != n) throw std::invalid_argument("HessFn.hvp: wrong vector length");
         std::vector<double> vv(n, 0.0);
-        for (size_t i = 0; i < n; ++i)
-            vv[i] = py::cast<double>(sv[i]);
+        for (size_t i = 0; i < n; ++i) vv[i] = py::cast<double>(sv[i]);
         auto Hv = hvp_once(vv);
         py::list out(n);
-        for (size_t i = 0; i < n; ++i)
-            out[i] = py::float_(Hv[i]);
+        for (size_t i = 0; i < n; ++i) out[i] = py::float_(Hv[i]);
         return out;
     }
 };
 
 static py::object hessfn_call_positional(HessFn &self, py::args xs) {
-    if (self.vector_mode)
-        throw std::invalid_argument(
-            "HessFn expects a single array/list; use f([x0,...])");
+    if (self.vector_mode) throw std::invalid_argument("HessFn expects a single array/list; use f([x0,...])");
     const size_t n = self.var_nodes.size();
-    if (xs.size() != n)
-        throw std::invalid_argument("HessFn: wrong number of positional args");
+    if (xs.size() != n) throw std::invalid_argument("HessFn: wrong number of positional args");
     py::list v(n);
-    for (size_t i = 0; i < n; ++i)
-        v[i] = py::float_(py::cast<double>(xs[i]));
+    for (size_t i = 0; i < n; ++i) v[i] = py::float_(py::cast<double>(xs[i]));
     return self(v);
 }
-
-static std::shared_ptr<HessFn> py_compile_hessian(py::function f, size_t arity,
-                                                  bool vector_input) {
+static std::shared_ptr<HessFn> py_compile_hessian(py::function f, size_t arity, bool vector_input) {
     return std::make_shared<HessFn>(f, arity, vector_input);
 }
-static std::shared_ptr<HessFn> py_hessian_from_example(py::function f,
-                                                       py::handle example) {
-    if (!is_sequence(example))
-        throw std::invalid_argument(
-            "hessian_from_example: pass a list/tuple example");
+static std::shared_ptr<HessFn> py_hessian_from_example(py::function f, py::handle example) {
+    if (!is_sequence(example)) throw std::invalid_argument("hessian_from_example: pass a list/tuple example");
     py::sequence seq = example.cast<py::sequence>();
     return std::make_shared<HessFn>(f, (size_t)seq.size(), true);
 }
 
 // ========= Module =========
 PYBIND11_MODULE(ad, m) {
-    m.doc() =
-        "ad optimization and autodiff module (pybind11, NumPy fast paths)";
+    m.doc() = "ad optimization and autodiff module (pybind11, NumPy fast paths)";
 
     // Variable
     py::class_<Variable, std::shared_ptr<Variable>>(m, "Variable")
@@ -858,8 +893,7 @@ PYBIND11_MODULE(ad, m) {
              py::arg("ub") = std::numeric_limits<double>::infinity())
         .def_property_readonly("name", &Variable::getName)
         .def_property("value", &Variable::getValue, &Variable::setValue)
-        .def_property("gradient", &Variable::getGradient,
-                      &Variable::setGradient)
+        .def_property("gradient", &Variable::getGradient, &Variable::setGradient)
         .def("getName", &Variable::getName)
         .def("getValue", &Variable::getValue)
         .def("setValue", &Variable::setValue)
@@ -880,43 +914,29 @@ PYBIND11_MODULE(ad, m) {
     py::class_<Expression, std::shared_ptr<Expression>>(m, "Expression")
         .def("computeGradient", &Expression::computeGradient)
         .def("computeHessian", &Expression::computeHessian)
-        .def("evaluate",
-             (double (Expression::*)() const) & Expression::evaluate)
+        .def("evaluate", (double (Expression::*)() const) & Expression::evaluate)
         .def("__str__", [](Expression &e) { return e.toString(); })
-        .def("__add__",
-             [](const Expression &a, const Expression &b) { return a + b; })
-        .def("__sub__",
-             [](const Expression &a, const Expression &b) { return a - b; })
-        .def("__mul__",
-             [](const Expression &a, const Expression &b) { return a * b; })
-        .def("__truediv__",
-             [](const Expression &a, const Expression &b) { return a / b; })
+        .def("__add__", [](const Expression &a, const Expression &b) { return a + b; })
+        .def("__sub__", [](const Expression &a, const Expression &b) { return a - b; })
+        .def("__mul__", [](const Expression &a, const Expression &b) { return a * b; })
+        .def("__truediv__", [](const Expression &a, const Expression &b) { return a / b; })
         .def("__add__", [](const Expression &a, double s) { return a + s; })
         .def("__sub__", [](const Expression &a, double s) { return a - s; })
         .def("__mul__", [](const Expression &a, double s) { return a * s; })
         .def("__truediv__", [](const Expression &a, double s) { return a / s; })
         .def("__radd__", [](const Expression &a, double s) { return a + s; })
-        .def("__rsub__",
-             [](const Expression &a, double s) {
-                 auto lhs = make_expr_from_number(s, a.graph);
-                 return (*lhs) - a;
-             })
+        .def("__rsub__", [](const Expression &a, double s) {
+            auto lhs = make_expr_from_number(s, a.graph);
+            return (*lhs) - a;
+        })
         .def("__rmul__", [](const Expression &a, double s) { return a * s; })
-        .def("__rtruediv__",
-             [](const Expression &a, double s) { return s / a; })
+        .def("__rtruediv__", [](const Expression &a, double s) { return s / a; })
         .def("__neg__", [](const Expression &a) { return -a; })
-        .def("__pow__", [](const std::shared_ptr<Expression> &a,
-                           double p) { return expr_pow_any(py::cast(a), p); })
-        .def("__pow__",
-             [](const std::shared_ptr<Expression> &,
-                const std::shared_ptr<Expression> &) {
-                 throw std::invalid_argument(
-                     "Expression ** Expression not supported; exponent must be "
-                     "scalar.");
-             })
-        .def("__rpow__", [](const std::shared_ptr<Expression> &a, double s) {
-            return scalar_pow_expr(s, a);
-        });
+        .def("__pow__", [](const std::shared_ptr<Expression> &a, double p) { return expr_pow_any(py::cast(a), p); })
+        .def("__pow__", [](const std::shared_ptr<Expression> &, const std::shared_ptr<Expression> &) {
+            throw std::invalid_argument("Expression ** Expression not supported; exponent must be scalar.");
+        })
+        .def("__rpow__", [](const std::shared_ptr<Expression> &a, double s) { return scalar_pow_expr(s, a); });
 
     // Immediate helpers
     m.def("val", &py_value, "Evaluate f(*xs) or f([xs])");
@@ -924,48 +944,51 @@ PYBIND11_MODULE(ad, m) {
     m.def("val", &py_value_numpy, py::arg("f"), py::arg("x"),
           "Evaluate f(x: ndarray) fast path");
 
-    // --- existing immediate list/tuple/variadic API (kept for compatibility)
-    m.def(
-        "grad",
-        [](py::function f, py::args xs) {
-            return py_gradient(f, xs); // your existing function
-        },
-        "Return gradient of f as a list of floats in input order.");
+    // Existing immediate list/tuple/variadic API (compat)
+    m.def("grad", [](py::function f, py::args xs) { return py_gradient(f, xs); },
+          "Return gradient of f as a list of floats in input order.");
 
-    // NEW: fast NumPy overload
+    // NEW: fast ndarray overloads
+    m.def("valgrad", &py_value_grad_numpy, py::arg("f"), py::arg("x"),
+          "Return (f(x), grad f(x)) fast path for ndarray.");
     m.def("hess", &py_hessian_numpy, py::arg("f"), py::arg("x"),
           "Return Hessian at x (ndarray) as an ndarray[n,n].");
-    // --- fast NumPy overload
     m.def("grad", &py_gradient_numpy, py::arg("f"), py::arg("x"),
           "Return gradient at x (ndarray[float64]) as an ndarray.");
 
     // Unary math
-    m.def(
-        "sin", [](py::object x) { return unary_dispatch(x, Operator::Sin); },
-        "sin(x)");
-    m.def(
-        "cos", [](py::object x) { return unary_dispatch(x, Operator::Cos); },
-        "cos(x)");
-    m.def(
-        "tan", [](py::object x) { return unary_dispatch(x, Operator::Tan); },
-        "tan(x)");
-    m.def(
-        "exp", [](py::object x) { return unary_dispatch(x, Operator::Exp); },
-        "exp(x)");
-    m.def(
-        "log", [](py::object x) { return unary_dispatch(x, Operator::Log); },
-        "log(x)");
-
+    m.def("sin",  [](py::object x) { return unary_dispatch(x, Operator::Sin);  }, "sin(x)");
+    m.def("cos",  [](py::object x) { return unary_dispatch(x, Operator::Cos);  }, "cos(x)");
+    m.def("tan",  [](py::object x) { return unary_dispatch(x, Operator::Tan);  }, "tan(x)");
+    m.def("exp",  [](py::object x) { return unary_dispatch(x, Operator::Exp);  }, "exp(x)");
+    m.def("log",  [](py::object x) { return unary_dispatch(x, Operator::Log);  }, "log(x)");
+    m.def("tanh", [](py::object x) { return unary_dispatch(x, Operator::Tanh); }, "tanh(x)");
+    m.def("silu", [](py::object x) { return unary_dispatch(x, Operator::Silu); }, "silu(x) = x * sigmoid(x)");
+    m.def("relu", [](py::object x) { return unary_dispatch(x, Operator::Relu); }, "relu(x) = max(0,x)");
+    m.def("softmax", [](py::object x) { return unary_dispatch(x, Operator::Softmax); }, "softmax(x) = log(1+exp(x))");
+    m.def("gelu", [](py::object x) { return unary_dispatch(x, Operator::Gelu); }, "gelu(x) = x * Phi(x) (Gaussian CDF)");
 
     // max / pow
-    m.def(
-        "max",
-        [](py::object a, py::object b) { return binary_max_dispatch(a, b); },
-        "max(a,b) with subgradient 0.5/0.5 at ties");
-    m.def(
-        "pow", [](py::object x, double p) { return expr_pow_any(x, p); },
-        "pow(x,p) builds exp(p*log(x)) symbolically");
+    m.def("max", [](py::object a, py::object b) { return binary_max_dispatch(a, b); },
+          "max(a,b) with subgradient 0.5/0.5 at ties");
+    m.def("pow", [](py::object x, double p) { return expr_pow_any(x, p); },
+          "pow(x,p) builds exp(p*log(x)) symbolically");
 
+          py::class_<ValFn, std::shared_ptr<ValFn>>(m, "ValFn")
+    .def("__call__", &ValFn::operator(), py::arg("x"),
+         "Evaluate f(x) (ndarray) -> float")
+    .def("expr_str", &ValFn::expr_str)
+    .def("call_seq", &ValFn::call_seq, py::arg("x_list"),
+         "Evaluate f(x) (list/tuple) -> float")
+    .def("__repr__", [](const ValFn &self){
+        return "<ValFn expr=" + self.expr_str() + ">";
+    });
+
+m.def("sym_val", &py_compile_value, py::arg("f"), py::arg("arity"),
+      py::arg("vector_input") = true,
+      "Compile a value function once; returns ValFn.");
+
+      
     // Compiled gradient & hessian
     py::class_<GradFn, std::shared_ptr<GradFn>>(m, "GradFn")
         .def("__call__", &GradFn::call_numpy, py::arg("x"),
@@ -975,6 +998,8 @@ PYBIND11_MODULE(ad, m) {
         .def("__call__", &gradfn_call_positional,
              "Call as g(x0, x1, ...) (compat)")
         .def("expr_str", &GradFn::expr_str)
+        .def("value", &GradFn::value_numpy, py::arg("x"),
+             "Evaluate f(x) (ndarray) -> float")
         .def("__repr__", [](const GradFn &self) {
             return "<GradFn expr=" + self.expr_str() + ">";
         });
@@ -998,13 +1023,11 @@ PYBIND11_MODULE(ad, m) {
     m.def("sym_grad", &py_compile_gradient, py::arg("f"), py::arg("arity"),
           py::arg("vector_input") = true,
           "Compile a gradient function once; returns GradFn.");
-    m.def("gradient_from_example", &py_gradient_from_example, py::arg("f"),
-          py::arg("example"),
+    m.def("gradient_from_example", &py_gradient_from_example, py::arg("f"), py::arg("example"),
           "Compile a gradient using a list/tuple example to infer arity.");
     m.def("sym_hess", &py_compile_hessian, py::arg("f"), py::arg("arity"),
           py::arg("vector_input") = true,
           "Compile a Hessian function once; returns HessFn.");
-    m.def("hessian_from_example", &py_hessian_from_example, py::arg("f"),
-          py::arg("example"),
+    m.def("hessian_from_example", &py_hessian_from_example, py::arg("f"), py::arg("example"),
           "Compile a Hessian using a list/tuple example to infer arity.");
 }

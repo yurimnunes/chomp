@@ -67,7 +67,7 @@ class TRConfig:
     max_crit_shrinks: int = 1  # at most this many back-to-back shrinks
 
     # -------- NEW: TR geometry --------
-    norm_type: str = "ellip"       # {"2", "ellip"}
+    norm_type: str = "2"       # {"2", "ellip"}
     metric_shift: float = 1e-8 # small ridge to make M ≻ 0 when built from H
     tau_ftb: float = 0.995  # fraction-to-boundary safety factor for box feasibility
     history_length: int = 10  # for adaptive strategies
@@ -617,7 +617,8 @@ def low_rank_cholesky_update(L: np.ndarray, U: np.ndarray) -> np.ndarray:
                 L_new[j + 1 :, j] = (L_new[j + 1 :, j] + s * u[j + 1 :]) / c
                 u[j + 1 :] = c * u[j + 1 :] - s * L_new[j + 1 :, j]
     return L_new
-# ---------------------------- Main TR Manager ---------------------------- #
+
+
 # ---------------------------- Main TR Manager (clean) ---------------------------- #
 class TrustRegionManager:
     """
@@ -649,14 +650,44 @@ class TrustRegionManager:
         # Box context (set by solve())
         self._box_ctx: Optional[tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]] = None
 
+        # NEW: box enforcement mode ("alpha" or "projection")
+        self._box_mode: str = "alpha"
+
     # ------------------------- Generic small helpers ------------------------- #
-    def _alpha_max_box(self, x: np.ndarray, s: np.ndarray,
-                       lb: Optional[np.ndarray], ub: Optional[np.ndarray],
-                       tau: Optional[float] = None) -> float:
+    def _as_array_or_none(self, v: Optional[np.ndarray], n: int) -> Optional[np.ndarray]:
+        if v is None:
+            return None
+        a = np.asarray(v, dtype=float).reshape(-1)
+        if a.size != n:
+            raise ValueError(f"lb/ub must have shape ({n},), got {a.shape}")
+        return a
+
+    def _sanitize_box(
+        self,
+        x: Optional[np.ndarray],
+        lb: Optional[np.ndarray],
+        ub: Optional[np.ndarray],
+        n: int,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+        lb = self._as_array_or_none(lb, n)
+        ub = self._as_array_or_none(ub, n)
+        if lb is not None and ub is not None and np.any(lb > ub):
+            raise ValueError("Found lb > ub on some components.")
+        if (lb is not None or ub is not None) and x is None:
+            raise ValueError("Box bounds provided but current iterate x is None.")
+        return x, lb, ub
+
+    def _alpha_max_box(
+        self, x: np.ndarray, s: np.ndarray,
+        lb: Optional[np.ndarray], ub: Optional[np.ndarray],
+        tau: Optional[float] = None
+    ) -> float:
         """Largest alpha in (0,1] so x + alpha*s respects [lb, ub]."""
         if (lb is None and ub is None) or s.size == 0:
             return 1.0
-        tau = self.cfg.tau_ftb if tau is None else float(tau)
+        tau_cfg = self.cfg.tau_ftb if tau is None else float(tau)
+        # keep strict interior
+        tau_cfg = float(np.clip(tau_cfg, 0.0, 0.999999))
         amax = 1.0
         if lb is not None:
             neg = s < 0
@@ -666,15 +697,24 @@ class TrustRegionManager:
             pos = s > 0
             if np.any(pos):
                 amax = min(amax, np.min((ub[pos] - x[pos]) / s[pos]))
-        return float(np.clip(tau * max(0.0, amax), 0.0, 1.0))
+        amax = max(0.0, float(amax))
+        return float(np.clip(tau_cfg * amax, 0.0, 1.0))
 
-    def _enforce_box_on_step(self, x: np.ndarray, p: np.ndarray,
-                             lb: Optional[np.ndarray], ub: Optional[np.ndarray],
-                             tau: Optional[float] = None) -> np.ndarray:
+    def _enforce_box_on_step(
+        self, x: np.ndarray, p: np.ndarray,
+        lb: Optional[np.ndarray], ub: Optional[np.ndarray],
+        tau: Optional[float] = None
+    ) -> np.ndarray:
         if p.size == 0 or (lb is None and ub is None):
             return p
-        a = self._alpha_max_box(x, p, lb, ub, tau)
-        return a * p
+        if self._box_mode == "projection":
+            # project the trial point; robust when x may be infeasible
+            lo = lb if lb is not None else -np.inf
+            hi = ub if ub is not None else +np.inf
+            x_trial = np.clip(x + p, lo, hi)
+            return x_trial - x
+        # default: fraction-to-boundary scaling
+        return self._alpha_max_box(x, p, lb, ub, tau) * p
 
     def _maybe_enforce_box(self, p: np.ndarray) -> np.ndarray:
         if self._box_ctx is None:
@@ -702,10 +742,9 @@ class TrustRegionManager:
         p = self._clip_to_radius(p, self.delta)
         return self._maybe_enforce_box(p)
 
-    # ------------------------- Metric controls (unchanged behavior) ------------------------- #
+    # ------------------------- Metric controls ------------------------- #
     def update_metric(self, M_new: np.ndarray) -> None:
         if self.M is not None and self._L is not None:
-            # Low-rank-ish try; fallback to full set_metric
             U = M_new - self.M
             try:
                 self._L = low_rank_cholesky_update(self._L, U)
@@ -1051,7 +1090,7 @@ class TrustRegionManager:
         info["active_constraints"] = active_idx
         return p, info, lam, nu
 
-    # ------------------------- Active-set loop (kept; light tidy) ------------------------- #
+    # ------------------------- Active-set loop ------------------------- #
     def _active_set_loop(
         self,
         H: MatLike, g: Vec,
@@ -1080,8 +1119,8 @@ class TrustRegionManager:
             b_aug = np.concatenate([b_eq, b_ineq[idx]]) if b_eq.size > 0 else b_ineq[idx]
             p, info_eq, _, _ = self._solve_with_equality_constraints(H, g, A_aug, b_aug)
             p = self._maybe_enforce_box(p)
-            info.update(info_eq)
             it += 1
+            info.update(info_eq)
         info.update(
             {
                 "active_set_size": len(active),
@@ -1096,7 +1135,7 @@ class TrustRegionManager:
         )
         return p, sorted(active), info
 
-    # ------------------------- Update logic (de-duplicated) ------------------------- #
+    # ------------------------- Update logic ------------------------- #
     def _adaptive_zeta(self, constraint_violation: float, history_len: int) -> float:
         base_zeta = self.cfg.zeta
         if constraint_violation < self.cfg.constraint_tol:
@@ -1142,8 +1181,9 @@ class TrustRegionManager:
 
         # Feasibility weighting
         if self.cfg.feasibility_emphasis:
-            feas_weight = 1.0 if constraint_violation < self.cfg.constraint_tol else max(0.1, 1.0 - constraint_violation / max(1.0, constraint_violation))
-            rho = feas_weight * rho + (1 - feas_weight) * (1.0 if constraint_violation < self.cfg.constraint_tol else -1.0)
+            feas_ok = constraint_violation < self.cfg.constraint_tol
+            feas_weight = 1.0 if feas_ok else max(0.1, 1.0 - constraint_violation / max(1.0, constraint_violation))
+            rho = feas_weight * rho + (1 - feas_weight) * (1.0 if feas_ok else -1.0)
 
         # Dynamic thresholds
         eta1, eta2 = self._dynamic_eta(constraint_violation, len(self._rho_history))
@@ -1179,7 +1219,7 @@ class TrustRegionManager:
         if len(self._f_history) > self.cfg.non_monotone_window:
             self._f_history.pop(0)
 
-    # ------------------------- Boundary intersection & Cauchy (unchanged logic) ------------------------- #
+    # ------------------------- Boundary intersection & Cauchy ------------------------- #
     def _boundary_intersection_metric(self, p: Vec, d: Vec, Delta: float) -> float:
         L = self._metric_factor()
         if L is None:
@@ -1223,7 +1263,7 @@ class TrustRegionManager:
             sol = la.lstsq(K, rhs, cond=self.cfg.rcond)[0]
         return sol[:n], sol[n:]
 
-    # ------------------------- Multiplier recovery (kept) ------------------------- #
+    # ------------------------- Multiplier recovery ------------------------- #
     def _recover_multipliers(
         self, H_op: spla.LinearOperator, g: Vec, p: Vec, sigma: float,
         A_eq: Optional[np.ndarray], A_ineq: Optional[np.ndarray],
@@ -1270,13 +1310,15 @@ class TrustRegionManager:
         *, x: Optional[np.ndarray] = None, lb: Optional[np.ndarray] = None, ub: Optional[np.ndarray] = None,
     ) -> Tuple[Vec, Dict[str, Any], Vec, Vec]:
 
+        n = g.size
+        # sanitize boxes and enforce that x is provided if lb/ub are used
+        x, lb, ub = self._sanitize_box(x, lb, ub, n)
         self._box_ctx = (x, lb, ub) if x is not None else None
 
         # Normalize empties
         if A_eq is not None and (A_eq.size == 0 or A_eq.shape[0] == 0): A_eq, b_eq = None, None
         if A_ineq is not None and (A_ineq.size == 0 or A_ineq.shape[0] == 0): A_ineq, b_ineq = None, None
 
-        n = g.size
         if g.ndim != 1:
             raise ValueError("g must be 1D")
         if H is None:
@@ -1304,9 +1346,18 @@ class TrustRegionManager:
             p, info = self._solve_unconstrained(H, g)
             lam, nu = np.array([]), np.array([])
 
+        # If starting point is outside the box, optionally pull p toward feasibility
+        if self._box_ctx is not None:
+            x0, lb0, ub0 = self._box_ctx
+            lo = lb0 if lb0 is not None else -np.inf
+            hi = ub0 if ub0 is not None else +np.inf
+            if (lb0 is not None and np.any(x0 < lb0)) or (ub0 is not None and np.any(x0 > ub0)):
+                p = np.clip(x0 + p, lo, hi) - x0  # one-shot projection of trial point
+
         # Global box enforcement & consistent info
         if x is not None:
             p = self._maybe_enforce_box(p)
+
         H_op = make_operator(H, g.size)
         info["step_norm"] = self._tr_norm(p)
         info["model_reduction"] = self._model_reduction(H, g, p)

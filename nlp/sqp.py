@@ -111,6 +111,22 @@ class SQPStepper:
         - Predicted reduction reflects the ACTUAL step s = α p (+ q if SOC).
         - Actual reduction uses f(x + s). TR update uses (pred_red, act_red, ||s||, θ_new).
         """
+
+        # --- Bounds & initial x projection (robustness for infeasible x0) ---
+        lb = getattr(model, "lb", None)
+        ub = getattr(model, "ub", None)
+        lb = None if lb is None else np.asarray(lb, dtype=float).reshape(-1)
+        ub = None if ub is None else np.asarray(ub, dtype=float).reshape(-1)
+        if (lb is not None and lb.size != x.size) or (ub is not None and ub.size != x.size):
+            raise ValueError("model.lb/ub must be shape-compatible with x")
+
+        if lb is not None or ub is not None:
+            lo = lb if lb is not None else -np.inf
+            hi = ub if ub is not None else +np.inf
+            x_proj = np.clip(x, lo, hi)
+            if not np.allclose(x_proj, x):
+                x = x_proj  # project x0 once into the box
+
         # --- Evaluate model at current point ---
         data0 = model.eval_all(x)
         f0: float = float(data0["f"])
@@ -143,7 +159,7 @@ class SQPStepper:
         else:
             cE_shift, cI_shift = cE, cI
 
-        # --- Solve TR subproblem ---
+        # --- Solve TR subproblem (now box-aware via x/lb/ub) ---
         p, tr_info, lam_new, nu_new = self.tr.solve(
             Hd,
             g0,
@@ -151,6 +167,9 @@ class SQPStepper:
             cI_shift,
             JE,
             cE_shift,
+            x=x,
+            lb=lb,
+            ub=ub,
         )
 
         # Guard: TR failed or returned non-finite step
@@ -162,6 +181,10 @@ class SQPStepper:
                 trR = self.tr.delta if self.tr else self.cfg.tr_delta0
                 pr, meta = self.restoration.try_restore(model, x, trR)
                 if meta.get("ok", False) and pr is not None and np.all(np.isfinite(pr)):
+                    # Cap restoration step to box
+                    if lb is not None or ub is not None:
+                        amax_pr = self.tr._alpha_max_box(x, pr, lb, ub)
+                        pr = amax_pr * pr
                     x2 = x + pr
                     d2 = model.eval_all(x2)
                     k2 = model.kkt_residuals(x2, lam, nu)
@@ -185,8 +208,11 @@ class SQPStepper:
         alpha, ls_iters, _ = (1.0, 0, None)
         if self.ls:
             alpha, ls_iters, _ = self.ls.search_sqp(model, x, p)
-            amax = self.tr._alpha_max_box(x, p, model.lb, model.ub)  # safe cap
-            alpha = min(alpha, amax)
+            # Note: p is already box-feasible at α=1; scaling keeps feasibility.
+            # Still cap defensively in case a custom TR was used upstream.
+            if lb is not None or ub is not None:
+                amax = self.tr._alpha_max_box(x, p, lb, ub)
+                alpha = min(alpha, amax)
             if alpha <= 1e-12:
                 info = self._pack_info(
                     0.0, False, False, f0, theta0, kkt0, ls_iters, 0.0, 0.0
@@ -199,6 +225,9 @@ class SQPStepper:
                         and pr is not None
                         and np.all(np.isfinite(pr))
                     ):
+                        if lb is not None or ub is not None:
+                            amax_pr = self.tr._alpha_max_box(x, pr, lb, ub)
+                            pr = amax_pr * pr
                         x2 = x + pr
                         d2 = model.eval_all(x2)
                         k2 = model.kkt_residuals(x2, lam, nu)
@@ -229,10 +258,8 @@ class SQPStepper:
         s = alpha * p
         x_trial = x + s
 
-        # FIX: compute violation at the line-searched trial point (before SOC)
-        theta_lin = model.constraint_violation(
-            x_trial
-        )  # predicted feasibility after line search
+        # violation after line search (before SOC)
+        theta_lin = model.constraint_violation(x_trial)
 
         pred_red = pred_red_lin  # will update if SOC is used
         if self.cfg.use_soc and alpha < 1.0:
@@ -250,13 +277,12 @@ class SQPStepper:
                 theta0=theta0,
                 f0=f0,
                 pred_df=pred_red,
-                pred_dtheta=(
-                    theta0 - theta_lin
-                ),  # FIX: was theta_new (undefined); use pre-SOC theta
+                pred_dtheta=(theta0 - theta_lin),
             )
             q = self.tr.clip_correction_to_radius(s, dx_corr)  # ensure ‖s+q‖ ≤ Δ
-            amax_q = self.tr._alpha_max_box(x + s, q, model.lb, model.ub)
-            q *= amax_q
+            if lb is not None or ub is not None:
+                amax_q = self.tr._alpha_max_box(x + s, q, lb, ub)
+                q *= amax_q
 
             # exact quadratic increment for predicted reduction with s+q
             Hs = Hd @ s
@@ -265,7 +291,6 @@ class SQPStepper:
 
             s = s + q
             x_trial = x + s
-            # Optional: you could recompute theta_lin here if you want to log "pre-acceptance" feasibility
 
         # --- Actual reduction & feasibility at trial point ---
         step_norm = (
@@ -276,7 +301,7 @@ class SQPStepper:
         d_trial = model.eval_all(x_trial)
         f_new = float(d_trial["f"])
         act_red = f0 - f_new
-        theta_new = model.constraint_violation(x_trial)  # now defined for later use
+        theta_new = model.constraint_violation(x_trial)
 
         if self.tr:
             self.tr.set_f_current(f_new)  # New: provide f_new for history
@@ -322,6 +347,9 @@ class SQPStepper:
                 trR = self.tr.delta if self.tr else self.cfg.tr_delta0
                 pr, meta = self.restoration.try_restore(model, x, trR)
                 if meta.get("ok", False) and pr is not None and np.all(np.isfinite(pr)):
+                    if lb is not None or ub is not None:
+                        amax_pr = self.tr._alpha_max_box(x, pr, lb, ub)
+                        pr = amax_pr * pr
                     x2 = x + pr
                     d2 = model.eval_all(x2)
                     k2 = model.kkt_residuals(x2, lam, nu)
@@ -364,20 +392,6 @@ class SQPStepper:
             and kkt["eq"] / scale <= self.cfg.tol_feas
             and (kkt["comp"] / scale <= self.cfg.tol_comp or kkt["ineq"] <= 1e-10)
         )
-
-    # def _is_kkt(self, kkt: Dict[str, float]) -> bool:
-    #     """Check KKT conditions with relaxed complementarity for inactive constraints."""
-    #     stat_tol = getattr(self.cfg, "tol_stat", 1e-4)
-    #     feas_tol = getattr(self.cfg, "tol_feas", 1e-4)
-    #     comp_tol = getattr(self.cfg, "tol_comp", 1e-4)
-    #     # Relax complementarity if constraints are inactive (θ ≈ 0)
-    #     comp_check = kkt["comp"] <= comp_tol or kkt["ineq"] <= 1e-10
-    #     return (
-    #         kkt["stat"] <= stat_tol
-    #         and kkt["ineq"] <= feas_tol
-    #         and kkt["eq"] <= feas_tol
-    #         and comp_check
-    #     )
 
     def _pack_info(
         self,

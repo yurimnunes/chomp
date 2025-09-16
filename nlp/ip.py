@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -15,17 +16,22 @@ from .blocks.filter import Filter, Funnel
 from .blocks.reg import Regularizer, make_psd_advanced
 from .ip_aux import *
 from .ip_cg import *
+
+# imports at top of sqp_ip.py
+from .ip_kernels import (
+    _div,
+    _safe_pos_div,
+    k_alpha_fraction_to_boundary,
+    k_build_sigmas,
+    k_cap_bound_duals_sigma_box,
+    k_compute_complementarity,
+    k_dz_bounds_from_dx,
+    k_max_step_ftb,
+)
 from .ip_kkt import *
 from .ip_kkt import _csr
 
 EPS_DIV = 1e-16
-
-# ------------------ tiny numerics ------------------
-def _div(a: np.ndarray, b: np.ndarray, eps: float = EPS_DIV) -> np.ndarray:
-    return a / np.maximum(b, eps)
-
-def _safe_pos_div(num: np.ndarray, den: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-    return num / np.maximum(den, eps)
 
 def _diag(v: np.ndarray):
     v = np.asarray(v).ravel()
@@ -41,14 +47,13 @@ def _as_array_or_zeros(v, m: int) -> np.ndarray:
 
 # ------------------ defaults ------------------
 _CFG_DEFAULTS: Dict[str, object] = dict(
-    ip_match_ref_form=False,
     ip_exact_hessian=True,
     ip_hess_reg0=1e-4,
     ip_eq_reg=1e-4,
     # shifted barrier
     ip_use_shifted_barrier=True,
-    ip_shift_tau=0.1,
-    ip_shift_bounds=0.1,
+    ip_shift_tau=0.9,
+    ip_shift_bounds=1e-3,
     ip_shift_adaptive=True,
     # barrier & PC
     ip_mu_init=1e-2,
@@ -89,12 +94,12 @@ _CFG_DEFAULTS: Dict[str, object] = dict(
     ip_dx_max=1e3,
     # conservative μ when infeasible
     ip_theta_clip=1e-2,
-    ip_enable_higher_order=True,
+    ip_enable_higher_order=False,
     ip_ho_blend=0.3,
     ip_ho_rel_cap=0.5,
     # Gondzio MC
     ip_gondzio_mc=True,
-    ip_gondzio_iters=2,
+    ip_gondzio_iters=3,
     ip_gondzio_blend=0.4,
     ip_mc_alpha_thresh=0.8,
     ip_mc_dispersion=8.0,
@@ -111,6 +116,24 @@ def _get_bounds(model: Model, x: np.ndarray):
     hasU = np.isfinite(ub)
     return lb, ub, hasL, hasU
 
+
+def _compute_kkt_matrix(W, JI, Sigma_s_vec, mI):
+    """Helper to compute W + JI^T * Sigma_s * JI for comparison and storage."""
+    if sp.isspmatrix_csr(W) or sp.isspmatrix_csc(W):
+        W = W.tocsr(copy=True)
+    else:
+        W = sp.csr_matrix(W)
+    if mI > 0 and JI is not None and Sigma_s_vec.size:
+        JIw = JI * Sigma_s_vec[:, None]
+        W = W + (JI.T @ JIw)
+    return W
+
+def _matrix_difference_norm(A, B):
+    """Compute Frobenius norm of difference between two sparse matrices."""
+    if A is None or B is None:
+        return float('inf')
+    diff = A - B
+    return sp.linalg.norm(diff, 'fro')
 # ------------------ stepper ------------------
 class InteriorPointStepper:
     """
@@ -149,40 +172,6 @@ class InteriorPointStepper:
         self.cfg.ls_armijo_f = getattr(self.cfg, "ls_armijo_f", float(self.cfg.ip_armijo_coeff))
         self.cfg.ls_max_iter = getattr(self.cfg, "ls_max_iter", int(self.cfg.ip_ls_max))
         self.cfg.ls_min_alpha = getattr(self.cfg, "ls_min_alpha", float(self.cfg.ip_alpha_min))
-
-    # ---------- compact utilities (reduce branching/dup) ----------
-    @staticmethod
-    def _max_step_ftb(z: np.ndarray, dz: np.ndarray, tau: float) -> float:
-        if z.size == 0 or dz.size == 0:
-            return 1.0
-        neg = dz < 0
-        if not np.any(neg):
-            return 1.0
-        return float(min(1.0, tau * np.min(-z[neg] / np.minimum(dz[neg], -EPS_DIV))))
-
-    def _alpha_fraction_to_boundary(
-        self,
-        x, dx, s, ds, lam, dlam, lb, ub, hasL, hasU, tau_pri, tau_dual
-    ) -> float:
-        alphas_pri = [1.0]
-        alphas_dual = [1.0]
-        if s.size:
-            if np.any(ds < 0):
-                alphas_pri.append(float(np.min(-s[ds < 0] / np.minimum(ds[ds < 0], -EPS_DIV))))
-            if np.any(dlam < 0):
-                alphas_dual.append(float(np.min(-lam[dlam < 0] / np.minimum(dlam[dlam < 0], -EPS_DIV))))
-        if np.any(hasL):
-            sL = x - lb
-            mask = hasL & (dx < 0)
-            if np.any(mask):
-                alphas_pri.append(float(np.min(-sL[mask] / np.minimum(dx[mask], -EPS_DIV))))
-        if np.any(hasU):
-            sU = ub - x
-            mask = hasU & (-dx < 0)
-            if np.any(mask):
-                alphas_pri.append(float(np.min(-sU[mask] / np.minimum((-dx)[mask], -EPS_DIV))))
-        a = min(tau_pri * min(alphas_pri), tau_dual * min(alphas_dual))
-        return float(np.clip(a, 0.0, 1.0))
 
     def _adaptive_shift_slack(self, s: np.ndarray, cI: np.ndarray, it: int) -> float:
         if s.size == 0:
@@ -235,59 +224,22 @@ class InteriorPointStepper:
             zU0[hasU] = np.maximum(1e-8, mu / np.maximum(sU[hasU] + bshift, 1e-12))
         return s0, lam0, zL0, zU0
 
-    def _build_sigmas(
-        self, *, zL, zU, sL, sU, hasL, hasU, lmb, s, cI, tau_shift, bound_shift, use_shifted
-    ):
+    def _build_sigmas(self, *, zL, zU, sL, sU, hasL, hasU, lmb, s, cI, tau_shift, bound_shift, use_shifted):
         eps_abs = float(getattr(self.cfg, "sigma_eps_abs", 1e-8))
         cap_val = float(getattr(self.cfg, "sigma_cap", 1e8))
+        return k_build_sigmas(zL, zU, sL, sU, hasL, hasU, lmb, s, cI, tau_shift, bound_shift, use_shifted, eps_abs, cap_val)
 
-        Sigma_L = np.where(hasL, zL / np.maximum(sL + (bound_shift if use_shifted else 0.0), eps_abs), 0.0)
-        Sigma_U = np.where(hasU, zU / np.maximum(sU + (bound_shift if use_shifted else 0.0), eps_abs), 0.0)
-        Sigma_x_vec = np.clip(Sigma_L + Sigma_U, 0.0, cap_val)
-
-        if s.size > 0:
-            if use_shifted:
-                Sigma_s_vec = np.clip(lmb / np.maximum(s + tau_shift, eps_abs), 0.0, cap_val)
-            else:
-                s_floor = np.maximum(1e-8, np.minimum(1.0, np.abs(cI)))
-                s_safe = np.maximum(s, s_floor)
-                Sigma_s_vec = np.clip(lmb / np.maximum(s_safe, eps_abs), 0.0, cap_val)
-        else:
-            Sigma_s_vec = np.zeros(0)
-
-        return Sigma_x_vec, Sigma_s_vec
-
-    def _dz_bounds_from_dx(
-        self, *, dx, zL, zU, sL, sU, hasL, hasU, bound_shift, use_shifted, mu: float | None
-    ):
-        if use_shifted and bound_shift > 0:
-            denomL = sL + bound_shift
-            denomU = sU + bound_shift
-            if mu is None:
-                dzL = np.where(hasL, _div(-(zL * dx), denomL), 0.0)
-                dzU = np.where(hasU, _div( (zU * dx), denomU), 0.0)
-            else:
-                dzL = np.where(hasL, _div(mu - denomL * zL - zL * dx, denomL), 0.0)
-                dzU = np.where(hasU, _div(mu - denomU * zU + zU * dx, denomU), 0.0)
-        else:
-            if mu is None:
-                dzL = np.where(hasL, _div(-(zL * dx), sL), 0.0)
-                dzU = np.where(hasU, _div( (zU * dx), sU), 0.0)
-            else:
-                dzL = np.where(hasL, _div(mu - sL * zL - zL * dx, sL), 0.0)
-                dzU = np.where(hasU, _div(mu - sU * zU + zU * dx, sU), 0.0)
+    def _dz_bounds_from_dx(self, *, dx, zL, zU, sL, sU, hasL, hasU, bound_shift, use_shifted, mu: float|None):
+        use_mu = 0 if mu is None else 1
+        dzL, dzU = k_dz_bounds_from_dx(dx, zL, zU, sL, sU, hasL, hasU, bound_shift, use_shifted, 0.0 if mu is None else mu, use_mu)
         return dzL, dzU
 
     def _cap_bound_duals_sigma_box(
         self, *, zL_new, zU_new, sL_new, sU_new, hasL, hasU, use_shifted, bound_shift, mu, ksig: float = 1e10
     ):
-        if np.any(hasL):
-            sL_clip = np.maximum(sL_new + (bound_shift if use_shifted else 0.0), 1e-16)
-            zL_new = np.maximum(mu / (ksig * sL_clip), np.minimum(zL_new, ksig * mu / sL_clip))
-        if np.any(hasU):
-            sU_clip = np.maximum(sU_new + (bound_shift if use_shifted else 0.0), 1e-16)
-            zU_new = np.maximum(mu / (ksig * sU_clip), np.minimum(zU_new, ksig * mu / sU_clip))
+        k_cap_bound_duals_sigma_box(zL_new, zU_new, sL_new, sU_new, hasL, hasU, use_shifted, bound_shift, mu, float(ksig))
         return zL_new, zU_new
+
 
     # ---------- public KKT (unchanged signature/semantics) ----------
     def solve_KKT(
@@ -300,43 +252,64 @@ class InteriorPointStepper:
         reuse_symbolic: bool = True,
         refine_iters: int = 0,
         *,
-        method: str = "qdldl",  # "hykkt"|"lifted"|"qdldl"|"lldl"
+        method: str = "hykkt",  # "hykkt"|"lifted"|"qdldl"|"lldl"
         gamma: float = None,
         delta_c_lift: float = None,
-        cg_tol: float = 1e-10,
+        cg_tol: float = 1e-6,
         cg_maxit: int = 200,
         return_reusable: bool = False,
-    ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, KKTReusable]:
+        Sigma_s_vec=None,  # Added to pass Sigma_s_vec for KKT matrix computation
+        JI=None,           # Added to pass JI for KKT matrix computation
+        mI=0               # Added to pass mI for KKT matrix computation
+    ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, Optional['KKTReusable']]:
         n = Wmat.shape[0]
         mE = 0 if JE_mat is None else JE_mat.shape[0]
-        W = _csr(Wmat, (n, n))
-        G = None if JE_mat is None else _csr(JE_mat, (mE, n))
+        W = sp.csr_matrix(Wmat)
+        G = None if JE_mat is None else sp.csr_matrix(JE_mat)
         r1, r2 = rhs_x, (-rpE) if mE > 0 else None
-
         cache = getattr(self, "_kkt_cache", None)
         if cache is None:
-            cache = KKTCache(prev_dx=None, prev_dy=None,
-                             delta_w_last=float(getattr(self, "_delta_w_last", 0.0) or 0.0),
-                             strategy_state={})
+            cache = KKTCache(prev_dx=None, prev_dy=None, delta_w_last=0.0, strategy_state={})
             self._kkt_cache = cache
-
+        
+        # Compute current KKT matrix
+        current_kkt_matrix = _compute_kkt_matrix(W, JI, Sigma_s_vec, mI)
+        
+        # Check if we can reuse the previous factorization
+        reuse_factorization = False
+        if cache.prev_kkt_matrix is not None and method in ["qdldl", "lldl"]:
+            matrix_diff = _matrix_difference_norm(current_kkt_matrix, cache.prev_kkt_matrix)
+            if matrix_diff < cache.matrix_change_tol:
+                reuse_factorization = True
+        
         if mE == 0:
-            method = "ldl"  # no eqs → lift/LDL direct
-
+            method = "ldl"  # No equality constraints → LDL direct
         strategy = DEFAULT_KKT_REGISTRY.get(
             "hykkt" if method == "hykkt" else "lifted" if method == "lifted" else "ldl"
         )
-
-        dx, dy, reusable = strategy.factor_and_solve(
-            W, G, r1, r2, self.cfg, self.reg, cache,
-            refine_iters=refine_iters, use_ordering=use_ordering, cg_tol=cg_tol, cg_maxit=cg_maxit,
-            gamma=gamma, delta_c_lift=delta_c_lift, reuse_symbolic=reuse_symbolic, method=method,
-        )
-
+        
+        # Solve KKT system, reusing factorization if possible
+        if reuse_factorization and cache.prev_factorization is not None:
+            dx, dy = strategy.solve_with_factorization(
+                current_kkt_matrix, G, r1, r2, cache.prev_factorization,
+                refine_iters=refine_iters, cg_tol=cg_tol, cg_maxit=cg_maxit
+            )
+            reusable = cache.prev_factorization
+        else:
+            dx, dy, reusable = strategy.factor_and_solve(
+                W, G, r1, r2, self.cfg, self.reg, cache,
+                refine_iters=refine_iters, use_ordering=use_ordering,
+                cg_tol=cg_tol, cg_maxit=cg_maxit,
+                gamma=gamma, delta_c_lift=delta_c_lift,
+                reuse_symbolic=reuse_symbolic, method=method
+            )
+            # Store the new KKT matrix and factorization
+            cache.prev_kkt_matrix = current_kkt_matrix
+            cache.prev_factorization = reusable if method in ["qdldl", "lldl"] else None
+        
         self._delta_w_last = cache.delta_w_last
         self._prev_step = (dx, dy)
         return (dx, dy, reusable) if return_reusable else (dx, dy)
-
     # ---------- error & μ update ----------
     def _compute_error(self, model: Model, x, lam, nu, zL, zU, mu: float = 0.0, *, s=None, mI=None) -> float:
         data = model.eval_all(x, components=["f", "g", "cI", "JI", "cE", "JE"])
@@ -388,12 +361,9 @@ class InteriorPointStepper:
         ))
 
 
-    def compute_complementarity(self, s: np.ndarray, lam: np.ndarray, mu: float, tau_shift: float, use_shifted: bool) -> float:
-        if len(s) == 0 or len(lam) == 0:
-            return 0.0
-        comp = (s + tau_shift) * lam - mu if use_shifted else s * lam - mu
-        return float(np.mean(np.abs(comp))) if comp.size else 0.0
-    
+    def compute_complementarity(self, s, lam, mu, tau_shift, use_shifted):
+        return float(k_compute_complementarity(s, lam, mu, tau_shift, 1 if use_shifted else 0))
+
     def update_mu(
         self, mu: float, s: np.ndarray, lam: np.ndarray, theta: float, kkt: Dict,
         accepted: bool, cond_H: float, sigma: float, mu_aff: float, use_shifted: bool, tau_shift: float,
@@ -495,7 +465,7 @@ class InteriorPointStepper:
             else:
                 dzU_try = dzU
 
-            alpha_chk = self._alpha_fraction_to_boundary(
+            alpha_chk = k_alpha_fraction_to_boundary(
                 x, dx_try, s, ds_try, lmb, dlam_try, lb, ub, hasL, hasU,
                 float(getattr(self.cfg, "ip_tau_pri", getattr(self.cfg, "ip_tau", 0.995))),
                 float(getattr(self.cfg, "ip_tau_dual", getattr(self.cfg, "ip_tau", 0.995))),
@@ -583,14 +553,14 @@ class InteriorPointStepper:
 
         alpha_aff = 1.0
         if mI > 0:
-            alpha_aff = min(alpha_aff, self._max_step_ftb(s, ds_aff, tau_pri))
-            alpha_aff = min(alpha_aff, self._max_step_ftb(lmb, dlam_aff, tau_dual))
+            alpha_aff = min(alpha_aff, k_max_step_ftb(s, ds_aff, tau_pri))
+            alpha_aff = min(alpha_aff, k_max_step_ftb(lmb, dlam_aff, tau_dual))
         if np.any(hasL):
-            alpha_aff = min(alpha_aff, self._max_step_ftb(sL[hasL], dx_aff[hasL], tau_pri))
-            alpha_aff = min(alpha_aff, self._max_step_ftb(zL[hasL], dzL_aff[hasL], tau_dual))
+            alpha_aff = min(alpha_aff, k_max_step_ftb(sL[hasL], dx_aff[hasL], tau_pri))
+            alpha_aff = min(alpha_aff, k_max_step_ftb(zL[hasL], dzL_aff[hasL], tau_dual))
         if np.any(hasU):
-            alpha_aff = min(alpha_aff, self._max_step_ftb(sU[hasU], (-dx_aff)[hasU], tau_pri))
-            alpha_aff = min(alpha_aff, self._max_step_ftb(zU[hasU], dzU_aff[hasU], tau_dual))
+            alpha_aff = min(alpha_aff, k_max_step_ftb(sU[hasU], (-dx_aff)[hasU], tau_pri))
+            alpha_aff = min(alpha_aff, k_max_step_ftb(zU[hasU], dzU_aff[hasU], tau_dual))
 
         mu_min = float(self.cfg.ip_mu_min)
         parts = []
@@ -619,184 +589,205 @@ class InteriorPointStepper:
                     dzL_aff=dzL_aff, dzU_aff=dzU_aff, alpha_aff=alpha_aff, mu_aff=mu_aff, sigma=sigma)
 
     # ---------- one IP iteration ----------
-    def step(
-        self,
-        model: Model,
-        x: np.ndarray,
-        lam: np.ndarray,
-        nu: np.ndarray,
-        it: int,
-        ip_state: Optional[IPState] = None,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
-        # --- state & eval
-        st = ip_state if (ip_state and ip_state.initialized) else IPState.from_model(model, x, self.cfg)
+    def step(self, model: Model, x: np.ndarray, lam: np.ndarray, nu: np.ndarray, it: int,
+            ip_state: Optional[IPState] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
+        cfg = self.cfg
+        # --- state
+        st = ip_state if (ip_state and ip_state.initialized) else IPState.from_model(model, x, cfg)
         n, mI, mE = model.n, st.mI, st.mE
-        s, lmb, nuv, zL, zU, mu = st.s.copy(), st.lam.copy(), st.nu.copy(), st.zL.copy(), st.zU.copy(), float(st.mu)
+        s   = st.s.copy(); lmb = st.lam.copy(); nuv = st.nu.copy()
+        zL  = st.zL.copy(); zU  = st.zU.copy(); mu  = float(st.mu)
 
-        use_shifted = bool(getattr(self.cfg, "ip_use_shifted_barrier", False))
-        tau_shift = float(st.tau_shift) if use_shifted else 0.0
-        data = model.eval_all(x, components=["f","g","cI","JI","cE","JE"])
-        f, g = float(data["f"]), np.asarray(data["g"], float)
-        cI = np.zeros(mI) if mI == 0 else np.asarray(data["cI"], float)
-        cE = np.zeros(mE) if mE == 0 else np.asarray(data["cE"], float)
-        JI, JE = (data["JI"] if mI > 0 else None), (data["JE"] if mE > 0 else None)
+        use_shifted = bool(getattr(cfg, "ip_use_shifted_barrier", False))
+        tau_shift   = float(st.tau_shift) if use_shifted else 0.0
+        shift_adapt = bool(getattr(cfg, "ip_shift_adaptive", False))
+
+        # --- eval (request only what we need)
+        d0   = model.eval_all(x, components=("f","g","cI","JI","cE","JE"))
+        f    = float(d0["f"])
+        g    = np.asarray(d0["g"], float)
+        cI   = np.asarray(d0["cI"], float) if mI > 0 else None
+        cE   = np.asarray(d0["cE"], float) if mE > 0 else None
+        JI   = d0["JI"] if mI > 0 else None
+        JE   = d0["JE"] if mE > 0 else None
         theta = model.constraint_violation(x)
 
         self.mI, self.mE, self.s = mI, mE, s
 
-        # adaptive shifts
-        if use_shifted and getattr(self.cfg, "ip_shift_adaptive", False):
-            tau_shift = self._adaptive_shift_slack(s, cI, it); st.tau_shift = tau_shift
+        # --- bounds & shifts
         lb, ub, hasL, hasU = _get_bounds(model, x)
-        bound_shift = float(getattr(self.cfg, "ip_shift_bounds", 0.0)) if use_shifted else 0.0
-        if use_shifted and getattr(self.cfg, "ip_shift_adaptive", False):
+        if use_shifted and shift_adapt:
+            tau_shift = self._adaptive_shift_slack(s, (cI if cI is not None else np.zeros(0)), it); st.tau_shift = tau_shift
+        bound_shift = float(getattr(cfg, "ip_shift_bounds", 0.0)) if use_shifted else 0.0
+        if use_shifted and shift_adapt:
             bound_shift = self._adaptive_shift_bounds(x, lb, ub, hasL, hasU, it)
 
-        # interior check
+        # --- interior check
         bad = False
         if mI > 0:
             bad |= (not np.all(np.isfinite(s))) or np.any(s <= 0) or (not np.all(np.isfinite(lmb))) or np.any(lmb <= 0)
         bad |= (not np.all(np.isfinite(zL))) or np.any(zL < 0) or (not np.all(np.isfinite(zU))) or np.any(zU < 0)
         if bad:
-            s, lmb, zL, zU = self._safe_reinit_slacks_duals(cI, JI, x, lb, ub, hasL, hasU, mu, tau_shift)
+            s, lmb, zL, zU = self._safe_reinit_slacks_duals(
+                (cI if cI is not None else np.zeros(0)), JI, x, lb, ub, hasL, hasU, mu, tau_shift
+            )
 
-        # Hessian (exact or managed) + regularize
-        H = (model.lagrangian_hessian(x, lmb, nuv) if self.cfg.ip_exact_hessian else self.hess.get_hessian(model, x, lmb, nuv))
+        # --- Hessian + PSD regularization
+        H = model.lagrangian_hessian(x, lmb, nuv) if cfg.ip_exact_hessian else self.hess.get_hessian(model, x, lmb, nuv)
         H, _ = make_psd_advanced(H, self.reg, it)
 
-        # residuals
-        r_d = g + (JI.T @ lmb if JI is not None else 0) + (JE.T @ nuv if JE is not None else 0) - zL + zU
-        r_pE = cE
-        r_pI = cI + s if mI > 0 else np.zeros(0)
+        # --- residuals (branch on presence to avoid zeros allocs)
+        r_d = g + ((JI.T @ lmb) if JI is not None else 0) + ((JE.T @ nuv) if JE is not None else 0) - zL + zU
+        r_pE = (cE if mE > 0 else None)
+        r_pI = (cI + s) if mI > 0 else None
 
-        # quick exit
-        err_0 = self._compute_error(model, x, lmb, nuv, zL, zU, 0.0, s=s, mI=mI)
-        tol = float(getattr(self.cfg, "tol", 1e-8))
+        # --- quick exit
+        err_0 = self._compute_error(model, x, lmb, nuv, zL, zU, 0.0, s=(s if mI > 0 else None), mI=(mI if mI > 0 else None))
+        tol = float(getattr(cfg, "tol", 1e-8))
         if err_0 <= tol:
             info = dict(mode="ip", step_norm=0.0, accepted=True, converged=True, f=f, theta=theta,
-                        stat=safe_inf_norm(r_d), ineq=safe_inf_norm(np.maximum(0, cI)) if mI > 0 else 0.0,
-                        eq=safe_inf_norm(cE) if mE > 0 else 0.0, comp=0.0, ls_iters=0, alpha=0.0,
+                        stat=safe_inf_norm(r_d), ineq=(safe_inf_norm(np.maximum(0, cI)) if mI > 0 else 0.0),
+                        eq=(safe_inf_norm(cE) if mE > 0 else 0.0), comp=0.0, ls_iters=0, alpha=0.0,
                         rho=0.0, tr_radius=(self.tr.radius if self.tr else 0.0), mu=mu)
             return x, lmb, nuv, info
 
-        # robust Σ
+        # --- Σ terms (precompute sL/sU once)
         sL = np.where(hasL, np.maximum(1e-12, x - lb), 1.0)
         sU = np.where(hasU, np.maximum(1e-12, ub - x), 1.0)
         Sigma_x_vec, Sigma_s_vec = self._build_sigmas(
             zL=zL, zU=zU, sL=sL, sU=sU, hasL=hasL, hasU=hasU,
-            lmb=lmb, s=s, cI=cI, tau_shift=tau_shift, bound_shift=bound_shift, use_shifted=use_shifted
+            lmb=lmb, s=(s if mI > 0 else np.zeros(0)), cI=(cI if mI > 0 else np.zeros(0)),
+            tau_shift=tau_shift, bound_shift=bound_shift, use_shifted=use_shifted
         )
 
-        W = H + _diag(Sigma_x_vec) + (JI.T @ _diag(Sigma_s_vec) @ JI if mI > 0 else 0)
+        # --- form W efficiently
+        # Add diagonal in-place when possible
+        if sp.isspmatrix_csr(H) or sp.isspmatrix_csc(H):
+            H = H.tocsr(copy=True)
+            dH = H.diagonal()
+            H.setdiag(dH + Sigma_x_vec)
+            W = H
+        else:
+            W = H + _diag(Sigma_x_vec)
+
+        if mI > 0 and JI is not None and Sigma_s_vec.size:
+            # JIw = JI * Sigma_s along rows, so JIw = diag(Sigma_s) @ JI
+            JIw = JI * Sigma_s_vec[:, None]
+            W = W + (JI.T @ JIw)
+
         rhs_x = -r_d
 
-        # predictor
+        # --- Mehrotra affine predictor
         aff = self._mehrotra_affine_predictor(
-            W=W, r_d=r_d, JE=JE, r_pE=r_pE, JI=JI, r_pI=r_pI,
-            s=s, lmb=lmb, zL=zL, zU=zU, sL=sL, sU=sU, hasL=hasL, hasU=hasU,
-            use_shifted=use_shifted, tau_shift=tau_shift, bound_shift=bound_shift, mu=mu, theta=theta,
+            W=W, r_d=r_d, JE=JE, r_pE=(r_pE if r_pE is not None else np.zeros(0)),
+            JI=JI, r_pI=(r_pI if r_pI is not None else np.zeros(0)),
+            s=(s if mI > 0 else np.zeros(0)), lmb=lmb, zL=zL, zU=zU, sL=sL, sU=sU,
+            hasL=hasL, hasU=hasU, use_shifted=use_shifted, tau_shift=tau_shift,
+            bound_shift=bound_shift, mu=mu, theta=theta
         )
         alpha_aff, mu_aff, sigma = aff["alpha_aff"], aff["mu_aff"], aff["sigma"]
 
-        # μ pre-corrector update (conservative)
-        comp = self.compute_complementarity(s, lmb, mu, tau_shift, use_shifted)
+        # --- μ pre-corrector (conservative)
+        comp = self.compute_complementarity((s if mI > 0 else np.zeros(0)), (lmb if mI > 0 else np.zeros(0)), mu, tau_shift, use_shifted)
         if comp * max(1, mI) > 10.0 * mu:
             mu = min(comp * max(1, mI), 10.0)
-        mu = max(float(self.cfg.ip_mu_min), sigma * mu_aff)
+        mu = max(float(cfg.ip_mu_min), sigma * mu_aff)
 
-        # corrector RHS (centrality + bounds)
-        if mI > 0:
+        # --- corrector RHS (centrality + bounds) with precomputed denoms
+        if mI > 0 and JI is not None and Sigma_s_vec.size:
             rc_s = (mu - (s + tau_shift) * lmb) if use_shifted else (mu - s * lmb)
-            rhs_x += JI.T @ (_diag(Sigma_s_vec) @ (rc_s / np.maximum(lmb, 1e-12)))
-        if np.any(hasL):
-            rc_L = mu - ((sL + bound_shift) if (use_shifted and bound_shift > 0) else sL) * zL
-            denom = (sL + bound_shift) if (use_shifted and bound_shift > 0) else sL
-            rhs_x += np.where(hasL, rc_L / np.maximum(denom, 1e-12), 0.0)
-        if np.any(hasU):
-            rc_U = mu - ((sU + bound_shift) if (use_shifted and bound_shift > 0) else sU) * zU
-            denom = (sU + bound_shift) if (use_shifted and bound_shift > 0) else sU
-            rhs_x -= np.where(hasU, rc_U / np.maximum(denom, 1e-12), 0.0)
+            rhs_x = rhs_x + JI.T @ (_diag(Sigma_s_vec) @ (rc_s / np.maximum(lmb, 1e-12)))
 
-        # corrector solve (+ reusable for MC)
+        if hasL.any():
+            denomL = sL + (bound_shift if (use_shifted and bound_shift > 0) else 0.0)
+            rc_L = mu - denomL * zL
+            rhs_x = rhs_x + np.where(hasL, rc_L / np.maximum(denomL, 1e-12), 0.0)
+
+        if hasU.any():
+            denomU = sU + (bound_shift if (use_shifted and bound_shift > 0) else 0.0)
+            rc_U = mu - denomU * zU
+            rhs_x = rhs_x - np.where(hasU, rc_U / np.maximum(denomU, 1e-12), 0.0)
+
+        # --- corrector solve (reuse enabled)
         dx, dnu, reusable = self.solve_KKT(
-            W, rhs_x, JE, r_pE, method=getattr(self.cfg, "ip_kkt_method", "hykkt"),
-            cg_tol=1e-8, cg_maxit=200, return_reusable=True
+            W, rhs_x, JE, (cE if cE is not None else None),
+            method=getattr(cfg, "ip_kkt_method", "qdldl"),
+            cg_tol=1e-8, cg_maxit=200, return_reusable=True,
+            Sigma_s_vec=Sigma_s_vec, JI=JI, mI=mI
         )
         if dx is None:
-            dx, dnu = self.solve_KKT(W, rhs_x, JE, r_pE, method="qdldl")
+            dx, dnu = self.solve_KKT(W, rhs_x, JE, (cE if cE is not None else None), method="qdldl", Sigma_s_vec=Sigma_s_vec, JI=JI, mI=mI)
             reusable = None
 
-        # recover ds, dλ, dzL, dzU
-        ds = (-(r_pI + (JI @ dx if (mI > 0 and JI is not None) else 0))) if mI > 0 else np.zeros(0)
+        # --- recover ds, dλ, dz
+        ds = (-(r_pI + (JI @ dx if (mI > 0 and JI is not None) else 0))) if mI > 0 else None
         if mI > 0:
-            denom = (s + tau_shift) if use_shifted else s
-            dlam  = _div(mu - denom * lmb - lmb * ds, denom)
+            denom_s = (s + tau_shift) if use_shifted else s
+            dlam = _div(mu - denom_s * lmb - (lmb * ds), denom_s)
         else:
-            dlam = np.zeros(0)
+            dlam = None
 
         dzL, dzU = self._dz_bounds_from_dx(
             dx=dx, zL=zL, zU=zU, sL=sL, sU=sU, hasL=hasL, hasU=hasU,
             bound_shift=bound_shift, use_shifted=use_shifted, mu=mu
         )
 
-        # Gondzio MC
-        if bool(getattr(self.cfg, "ip_gondzio_mc", False)) and (mI + int(np.sum(hasL)) + int(np.sum(hasU)) > 0):
+        # --- Gondzio MC (optional)
+        if bool(getattr(cfg, "ip_gondzio_mc", False)) and (mI + int(hasL.sum()) + int(hasU.sum()) > 0):
             dx, dnu, ds, dlam, dzL, dzU = self._gondzio_multicorrector(
-                x=x, s=s, lmb=lmb, zL=zL, zU=zU, lb=lb, ub=ub, hasL=hasL, hasU=hasU,
-                JI=JI, JE=JE, W=W, Sigma_s_vec=Sigma_s_vec, r_pE=r_pE, reusable=reusable,
-                dx=dx, dnu=dnu, ds=ds, dlam=dlam, dzL=dzL, dzU=dzU, mu=mu,
-                mu_aff=mu_aff, sigma=sigma, alpha_aff=alpha_aff, tau_shift=tau_shift, bound_shift=bound_shift, use_shifted=use_shifted,
+                x=x, s=(s if mI > 0 else np.zeros(0)), lmb=lmb, zL=zL, zU=zU,
+                lb=lb, ub=ub, hasL=hasL, hasU=hasU, JI=JI, JE=JE, W=W, Sigma_s_vec=Sigma_s_vec,
+                r_pE=(cE if cE is not None else np.zeros(0)), reusable=reusable,
+                dx=dx, dnu=dnu, ds=(ds if ds is not None else np.zeros(0)),
+                dlam=(dlam if dlam is not None else np.zeros(0)),
+                dzL=dzL, dzU=dzU, mu=mu, mu_aff=mu_aff, sigma=sigma, alpha_aff=alpha_aff,
+                tau_shift=tau_shift, bound_shift=bound_shift, use_shifted=use_shifted,
             )
 
-        # Higher-order correction
-        if getattr(self.cfg, "ip_enable_higher_order", False) and dx.size:
-            dx, dnu, ds, dlam, dzL, dzU = self._higher_order_correction(
-                dx=dx, dnu=dnu, ds=ds, dlam=dlam, dzL=dzL, dzU=dzU, JI=JI, JE=JE, W=W,
-                r_pE=r_pE, s=s, lmb=lmb, zL=zL, zU=zU, sL=sL, sU=sU, hasL=hasL, hasU=hasU,
-                mu=mu, tau_shift=tau_shift, bound_shift=bound_shift, use_shifted=use_shifted,
-            )
-
-        # tiny trust-region on dx
+        # --- tiny trust region on dx (+ scale companions)
         dx_norm = float(np.linalg.norm(dx))
-        dx_cap = float(self.cfg.ip_dx_max)
+        dx_cap  = float(cfg.ip_dx_max)
         if dx_norm > dx_cap and dx_norm > 0:
             sc = dx_cap / dx_norm
             dx *= sc; dzL *= sc; dzU *= sc
             if mI > 0: ds *= sc; dlam *= sc
 
-        # fraction-to-boundary + line search
-        alpha_ftb = self._alpha_fraction_to_boundary(
-            x, dx, s, ds, lmb, dlam, lb, ub, hasL, hasU,
-            float(getattr(self.cfg, "ip_tau_pri", getattr(self.cfg, "ip_tau", 0.995))),
-            float(getattr(self.cfg, "ip_tau_dual", getattr(self.cfg, "ip_tau", 0.995))),
+        # --- fraction-to-boundary + LS
+        alpha_ftb = k_alpha_fraction_to_boundary(
+            x, dx, (s if mI > 0 else np.zeros(0)), (ds if mI > 0 else np.zeros(0)),
+            lmb, (dlam if mI > 0 else np.zeros(0)), lb, ub, hasL, hasU,
+            float(getattr(cfg, "ip_tau_pri", getattr(cfg, "ip_tau", 0.995))),
+            float(getattr(cfg, "ip_tau_dual", getattr(cfg, "ip_tau", 0.995))),
         )
-        alpha_max = min(alpha_ftb, float(self.cfg.ip_alpha_max))
+        alpha_max = min(alpha_ftb, float(cfg.ip_alpha_max))
 
         try:
             alpha, ls_iters, needs_restoration = self.ls.search_ip(
-                model=model, x=x, dx=dx, ds=ds, s=s, mu=mu,
+                model=model, x=x, dx=dx, ds=(ds if mI > 0 else np.zeros(0)),
+                s=(s if mI > 0 else np.zeros(0)), mu=mu,
                 d_phi=float(g @ dx), theta0=theta, alpha_max=alpha_max,
             )
         except Exception:
             alpha, ls_iters, needs_restoration = min(1.0, alpha_max), 0, False
 
-        # early restoration branch (unchanged behavior — compact)
-        if (alpha <= float(self.cfg.ls_min_alpha)) and needs_restoration:
+        # --- early restoration
+        if (alpha <= float(cfg.ls_min_alpha)) and needs_restoration:
             try:
                 x_new = self._feasibility_restoration(model, x, mu, self.filter)
-                data_new = model.eval_all(x_new, ["f","g","cI","cE"])
-                lmb_new = np.maximum(1e-8, lmb) if mI > 0 else lmb
-                nu_new  = np.zeros(mE) if mE > 0 else nuv
-                zL_new  = np.where(hasL, np.maximum(1e-8, zL), 0.0)
-                zU_new  = np.where(hasU, np.maximum(1e-8, zU), 0.0)
+                dN    = model.eval_all(x_new, ("f","g","cI","cE"))
+                lmb_n = np.maximum(1e-8, lmb) if mI > 0 else lmb
+                nu_n  = np.zeros(mE) if mE > 0 else nuv
+                zL_n  = np.where(hasL, np.maximum(1e-8, zL), 0.0)
+                zU_n  = np.where(hasU, np.maximum(1e-8, zU), 0.0)
                 info = dict(mode="ip", step_norm=float(np.linalg.norm(x_new - x)), accepted=True, converged=False,
-                            f=float(data_new["f"]), theta=float(model.constraint_violation(x_new)),
+                            f=float(dN["f"]), theta=float(model.constraint_violation(x_new)),
                             stat=0.0, ineq=0.0, eq=0.0, comp=0.0, ls_iters=ls_iters, alpha=0.0,
                             rho=0.0, tr_radius=(self.tr.radius if self.tr else 0.0), mu=mu)
-                st.s, st.lam, st.nu, st.zL, st.zU = s, lmb_new, nu_new, zL_new, zU_new
-                return x_new, lmb_new, nu_new, info
+                st.s, st.lam, st.nu, st.zL, st.zU = s, lmb_n, nu_n, zL_n, zU_n
+                return x_new, lmb_n, nu_n, info
             except ValueError:
-                s, lmb, zL, zU = self._safe_reinit_slacks_duals(cI, JI, x, lb, ub, hasL, hasU, mu=max(mu, 1e-2), tau_shift=tau_shift)
+                s, lmb, zL, zU = self._safe_reinit_slacks_duals((cI if cI is not None else np.zeros(0)),
+                    JI, x, lb, ub, hasL, hasU, mu=max(mu, 1e-2), tau_shift=tau_shift)
                 dxf = -g / max(1.0, np.linalg.norm(g))
                 alpha = min(alpha_max, 1e-2)
                 x_new = x + alpha * dxf
@@ -807,11 +798,11 @@ class InteriorPointStepper:
                 st.s, st.lam, st.nu, st.zL, st.zU = s, lmb, nuv, zL, zU
                 return x_new, lmb, nuv, info
 
-        # accept step (+ σ-box cap on bound duals)
+        # --- accept step (+ σ-box cap)
         x_new  = x   + alpha * dx
-        s_new  = s   + alpha * ds if mI > 0 else s
-        lmb_new= lmb + alpha * dlam if mI > 0 else lmb
-        nu_new = nuv + alpha * dnu if mE > 0 else nuv
+        s_new  = (s + alpha * ds) if mI > 0 else s
+        lmb_new= (lmb + alpha * dlam) if mI > 0 else lmb
+        nu_new = (nuv + alpha * dnu) if mE > 0 else nuv
         zL_new = zL  + alpha * dzL
         zU_new = zU  + alpha * dzU
 
@@ -822,41 +813,51 @@ class InteriorPointStepper:
             hasL=hasL, hasU=hasU, use_shifted=use_shifted, bound_shift=bound_shift, mu=mu, ksig=1e10,
         )
 
-        # report (re-evaluate)
-        data_new = model.eval_all(x_new, ["f","g","cI","JI","cE","JE"])
-        f_new, g_new = float(data_new["f"]), np.asarray(data_new["g"], float)
-        cI_new = np.asarray(data_new["cI"], float) if mI > 0 else np.zeros(0)
-        cE_new = np.asarray(data_new["cE"], float) if mE > 0 else np.zeros(0)
-        JI_new, JE_new = (data_new["JI"] if mI > 0 else None), (data_new["JE"] if mE > 0 else None)
+        # --- report (re-evaluate; keep correctness over micro-opts)
+        dN = model.eval_all(x_new, ("f","g","cI","JI","cE","JE"))
+        f_new, g_new = float(dN["f"]), np.asarray(dN["g"], float)
+        cI_new = np.asarray(dN["cI"], float) if mI > 0 else None
+        cE_new = np.asarray(dN["cE"], float) if mE > 0 else None
+        JI_new = dN["JI"] if mI > 0 else None
+        JE_new = dN["JE"] if mE > 0 else None
         theta_new = model.constraint_violation(x_new)
 
-        r_d_new = g_new + (JI_new.T @ lmb_new if (mI > 0 and JI_new is not None) else 0) + (JE_new.T @ nu_new if (mE > 0 and JE_new is not None) else 0) - zL_new + zU_new
+        r_d_new = g_new + ((JI_new.T @ lmb_new) if (mI > 0 and JI_new is not None) else 0) \
+                        + ((JE_new.T @ nu_new) if (mE > 0 and JE_new is not None) else 0) - zL_new + zU_new
 
         if use_shifted:
-            r_comp_L_new = np.where(hasL, (sL_new + bound_shift) * zL_new - mu, 0.0) if np.any(hasL) else 0.0
-            r_comp_U_new = np.where(hasU, (sU_new + bound_shift) * zU_new - mu, 0.0) if np.any(hasU) else 0.0
-            r_comp_s_new = ((s_new + tau_shift) * lmb_new - mu) if mI > 0 else np.zeros(0)
+            r_comp_L_new = (sL_new + bound_shift) * zL_new - mu if hasL.any() else 0.0
+            r_comp_U_new = (sU_new + bound_shift) * zU_new - mu if hasU.any() else 0.0
+            r_comp_s_new = ((s_new + tau_shift) * lmb_new - mu) if mI > 0 else None
         else:
-            r_comp_L_new = np.where(hasL, sL_new * zL_new - mu, 0.0) if np.any(hasL) else 0.0
-            r_comp_U_new = np.where(hasU, sU_new * zU_new - mu, 0.0) if np.any(hasU) else 0.0
-            r_comp_s_new = (s_new * lmb_new - mu) if mI > 0 else np.zeros(0)
+            r_comp_L_new = (sL_new * zL_new - mu) if hasL.any() else 0.0
+            r_comp_U_new = (sU_new * zU_new - mu) if hasU.any() else 0.0
+            r_comp_s_new = (s_new * lmb_new - mu) if mI > 0 else None
 
         kkt_new = dict(
             stat=np.linalg.norm(r_d_new, np.inf),
-            ineq=np.linalg.norm(np.maximum(0, cI_new), np.inf) if mI > 0 else 0.0,
-            eq=np.linalg.norm(cE_new, np.inf) if mE > 0 else 0.0,
+            ineq=(np.linalg.norm(np.maximum(0, cI_new), np.inf) if mI > 0 else 0.0),
+            eq=(np.linalg.norm(cE_new, np.inf) if mE > 0 else 0.0),
             comp=max(
-                (np.linalg.norm(r_comp_L_new, np.inf) if np.any(hasL) else 0.0),
-                (np.linalg.norm(r_comp_U_new, np.inf) if np.any(hasU) else 0.0),
-            ) + (np.linalg.norm(r_comp_s_new, np.inf) if r_comp_s_new.size else 0.0),
+                (np.linalg.norm(r_comp_L_new, np.inf) if hasL.any() else 0.0),
+                (np.linalg.norm(r_comp_U_new, np.inf) if hasU.any() else 0.0),
+            ) + (np.linalg.norm(r_comp_s_new, np.inf) if (mI > 0 and r_comp_s_new is not None) else 0.0),
         )
 
         converged = (kkt_new["stat"] <= tol and kkt_new["ineq"] <= tol and kkt_new["eq"] <= tol and kkt_new["comp"] <= tol and mu <= tol / 10)
-        cond_H = np.linalg.cond(H) if H is not None and H.shape[0] < 500 else np.nan
 
-        mu = self.update_mu(mu=mu, s=s_new, lam=lmb_new, theta=theta_new, kkt=kkt_new,
-                            accepted=True, cond_H=cond_H, sigma=sigma, mu_aff=mu_aff,
-                            use_shifted=use_shifted, tau_shift=tau_shift)
+        # Avoid costly dense cond unless explicitly requested
+        if bool(getattr(cfg, "ip_debug_condH", False)):
+            try:
+                cond_H = np.linalg.cond(H.toarray() if hasattr(H, "toarray") else H)
+            except Exception:
+                cond_H = np.nan
+        else:
+            cond_H = np.nan
+
+        mu = self.update_mu(mu=mu, s=(s_new if mI > 0 else np.zeros(0)), lam=(lmb_new if mI > 0 else np.zeros(0)),
+                            theta=theta_new, kkt=kkt_new, accepted=True, cond_H=cond_H, sigma=sigma,
+                            mu_aff=mu_aff, use_shifted=use_shifted, tau_shift=tau_shift)
 
         info = dict(
             mode="ip", step_norm=float(np.linalg.norm(x_new - x)), accepted=True, converged=converged,
@@ -865,7 +866,6 @@ class InteriorPointStepper:
             mu=mu, shifted_barrier=use_shifted, tau_shift=tau_shift, bound_shift=bound_shift,
         )
 
-        # persist
         st.s, st.lam, st.nu, st.zL, st.zU, st.mu = s_new, lmb_new, nu_new, zL_new, zU_new, mu
         st.tau_shift = tau_shift
         return x_new, lmb_new, nu_new, info

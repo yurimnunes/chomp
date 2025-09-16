@@ -104,7 +104,7 @@ class NLPSolver:
         )
         mI = len(c_ineq) if c_ineq else 0
         mE = len(c_eq) if c_eq else 0
-        self.dfo_stepper = L1DFOStepper(self.model, self.cfg, x0=self.x, var_lb=lb, var_ub=ub)
+        #self.dfo_stepper = L1DFOStepper(self.model, self.cfg, x0=self.x, var_lb=lb, var_ub=ub)
 
         _ensure_cfg_fields(self.cfg)  # add missing fields if needed
 
@@ -147,9 +147,7 @@ class NLPSolver:
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
-    def solve(
-        self, max_iter: int = 200, tol: float = 1e-8, verbose: bool = True
-    ) -> Tuple[np.ndarray, List[Dict]]:
+    def solve(self, max_iter: int = 200, tol: float = 1e-8, verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
         hist: List[Dict] = []
         for k in range(max_iter):
             if self.mode == "ip":
@@ -157,61 +155,53 @@ class NLPSolver:
             elif self.mode == "sqp":
                 info = self._sqp_step(k)
             elif self.mode == "dfo":
-                x_out, _, _, info = self.dfo_stepper.step(
-                    self.model, self.x, it=k
-                )
-                # Update streaks / stats
+                x_out, _, _, info = self.dfo_stepper.step(self.model, self.x, it=k)
                 self._update_streaks(info)
-
-                if info["converged"]:
-                    if verbose:
-                        print(f"✓ Converged at iteration {k}")
+                if info["accepted"]:
+                    if self.cfg.use_watchdog: self._watchdog_update(x_out)
                     self.x = x_out
-                    if self.mode != "dfo":
-                        self.lam, self.nu = lam_out, nu_out
+                if info["converged"]:
+                    if verbose: print(f"✓ Converged at iteration {k}")
                     hist.append(info)
                     break
-
-                if info["accepted"]:
-                    if self.cfg.use_watchdog:
-                        self._watchdog_update(x_out)
-                    self.x = x_out
-                    if self.mode != "dfo":
-                        self.lam, self.nu = lam_out, nu_out
             else:
-                # should not happen; fallback to SQP
                 info = self._sqp_step(k)
 
-            # track iteration info
-            hist.append(info)
+            hist.append(info)  # <-- you had this commented out
+
             if verbose:
                 self._print_iteration(k, info)
 
-            # Global KKT terminate (works for any mode)
-            kkt = {}
-            kkt["stat"] = info.get("stat", None)
-            kkt["eq"] = info.get("eq", None)
-            kkt["ineq"] = info.get("ineq", None)
-            kkt["comp"] = info.get("comp", None)
-            if kkt is None:
+            # Global KKT terminate
+            if all(k in info for k in ("stat","ineq","eq","comp")):
+                kkt = {k: info[k] for k in ("stat","ineq","eq","comp")}
+            else:
                 kkt = self.model.kkt_residuals(self.x, self.lam, self.nu)
-            if (
-                kkt["stat"] <= self.cfg.tol_stat
-                and kkt["ineq"] <= self.cfg.tol_feas
-                and kkt["eq"] <= self.cfg.tol_feas
-                and kkt["comp"] <= self.cfg.tol_comp
-            ):
-                if verbose:
-                    print(f"✓ Converged at iteration {k}")
+
+            if (kkt["stat"] <= self.cfg.tol_stat and
+                kkt["ineq"] <= self.cfg.tol_feas and
+                kkt["eq"]   <= self.cfg.tol_feas and
+                kkt["comp"] <= self.cfg.tol_comp):
+                if verbose: print(f"✓ Converged at iteration {k}")
                 break
 
-            # Auto-mode switch decision
+            # Auto-mode switch (lazy-create steppers)
             if self.cfg.mode == "auto":
                 switched = self._maybe_switch_mode(k, info, kkt)
-                if switched and verbose:
-                    # annotate the last info dict with the switch
-                    hist[-1] = {**hist[-1], "switched_to": self.mode}
-
+                if switched:
+                    if self.mode == "ip" and self.ip_stepper is None:
+                        self.ip_state = IPState.from_model(self.model, self.x, self.cfg)
+                        self.ip_stepper = InteriorPointStepper(
+                            self.cfg, self.hess, funnel=self.funnel, ls=self.ls,
+                            regularizer=self.regularizer, soc=None
+                        )
+                    elif self.mode == "sqp" and self.sqp_stepper is None:
+                        self.sqp_stepper = SQPStepper(
+                            self.cfg, self.hess, self.tr, self.ls, self.qp, self.soc,
+                            self.regularizer, self.rest
+                        )
+                    if verbose:
+                        hist[-1] = {**hist[-1], "switched_to": self.mode}
         return self.x, hist
 
     # -------------------------------------------------------------------------
@@ -222,7 +212,7 @@ class NLPSolver:
             self.model, self.x, self.lam, self.nu, it, ip_state=self.ip_state
         )
         # Update streaks / stats
-        self._update_streaks(info)
+        #self._update_streaks(info)
 
         if info["accepted"]:
             self.x = x_out
@@ -392,14 +382,6 @@ class NLPSolver:
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
-    def _is_kkt(self, kkt: Dict[str, float]) -> bool:
-        return (
-            kkt["stat"] <= self.cfg.tol_stat
-            and kkt["ineq"] <= self.cfg.tol_feas
-            and kkt["eq"] <= self.cfg.tol_feas
-            and kkt["comp"] <= self.cfg.tol_comp
-        )
-
     def _print_iteration(self, k: int, info: Dict):
         import math
         import sys

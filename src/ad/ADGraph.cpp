@@ -270,39 +270,39 @@ std::string ADGraph::getExpression(const ADNodePtr &node) {
                    expr(node->inputs[1]) + ")";
         }
     }
-    // case Operator::Tanh:
-    // case Operator::Silu:
-    // case Operator::Gelu: // NEW
-    // {
-    //     // unary
-    //     if (validate_unary_inputs(node->inputs, op_name(node->type))) {
-    //         return std::string(op_name(node->type)) + "(" +
-    //                expr(node->inputs[0]) + ")";
-    //     }
-    //     return std::string(op_name(node->type)) + "(?)";
-    // }
-    // case Operator::Relu: {
-    //     // unary
-    //     if (validate_unary_inputs(node->inputs, op_name(node->type))) {
-    //         return std::string(op_name(node->type)) + "(" +
-    //                expr(node->inputs[0]) + ")";
-    //     }
-    //     return std::string(op_name(node->type)) + "(?)";
-    // }
-    // case Operator::Softmax: { // NEW
-    //     if (!validate_nary_inputs(node->inputs, op_name(node->type), 1))
-    //         return std::string(op_name(node->type)) + "(?)";
-    //     // Render as softmax(x0 | x0, x1, ..., xN)
-    //     std::string out = std::string(op_name(node->type)) + "(" +
-    //                       expr(node->inputs[0]) + " | ";
-    //     for (size_t i = 0; i < node->inputs.size(); ++i) {
-    //         if (i)
-    //             out += ", ";
-    //         out += expr(node->inputs[i]);
-    //     }
-    //     out += ")";
-    //     return out;
-    // }
+    case Operator::Tanh:
+    case Operator::Silu:
+    case Operator::Gelu: // NEW
+    {
+        // unary
+        if (validate_unary_inputs(node->inputs, op_name(node->type))) {
+            return std::string(op_name(node->type)) + "(" +
+                   expr(node->inputs[0]) + ")";
+        }
+        return std::string(op_name(node->type)) + "(?)";
+    }
+    case Operator::Relu: {
+        // unary
+        if (validate_unary_inputs(node->inputs, op_name(node->type))) {
+            return std::string(op_name(node->type)) + "(" +
+                   expr(node->inputs[0]) + ")";
+        }
+        return std::string(op_name(node->type)) + "(?)";
+    }
+    case Operator::Softmax: { // NEW
+        if (!validate_nary_inputs(node->inputs, op_name(node->type), 1))
+            return std::string(op_name(node->type)) + "(?)";
+        // Render as softmax(x0 | x0, x1, ..., xN)
+        std::string out = std::string(op_name(node->type)) + "(" +
+                          expr(node->inputs[0]) + " | ";
+        for (size_t i = 0; i < node->inputs.size(); ++i) {
+            if (i)
+                out += ", ";
+            out += expr(node->inputs[i]);
+        }
+        out += ")";
+        return out;
+    }
 
     default:
         return "Unsupported_Operator(" + std::string(op_name(node->type)) + ")";

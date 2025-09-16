@@ -532,13 +532,11 @@ def _as_diag_sqrt(dscale: Optional[np.ndarray]) -> Tuple[Optional[np.ndarray], O
     ds[~np.isfinite(ds)] = 1.0
     ds[ds <= 0] = 1.0
     return np.sqrt(ds), 1.0 / np.sqrt(ds)
-
-# ---------- main class ----------
 class Regularizer:
     """
     SOTA regularizer for Hessians with:
       - Symmetry enforcement
-      - Optional RCM permutation (improves bandwidth/conditioning)
+      - Optional RCM permutation (bandwidth/conditioning)
       - Symmetric Ruiz equilibration
       - Inertia via LDLᵀ (qdldl) when available (optional)
       - Cached shift-invert, ILU, Block-Jacobi, SSOR, and MINI-AMG preconditioners
@@ -547,11 +545,10 @@ class Regularizer:
       - Fallback Tikhonov/SVD regularization
 
     Public API:
-      regularize(H, iteration=0, model_quality=None, constraint_count=0, grad_norm=None, tr_radius=None)
-        -> (H_reg, RegInfo)
+      regularize(H, iteration=0, model_quality=None, constraint_count=0, grad_norm=None, tr_radius=None, precond_only=None)
+        -> (H_reg, RegInfo) OR (H, RegInfo, M) if precond_only=True
     """
 
- 
     def __init__(self, cfg):
         # config getter supporting dict or object
         def _cfg(name, default):
@@ -573,17 +570,22 @@ class Regularizer:
         self.k_eigs = int(_cfg("k_eigs", 16))  # small spectrum sample
 
         # permutation + scaling
-        self.use_rcm = bool(_cfg("reg_use_rcm", True))         # RCM instead of AMD (no AMD in SciPy)
+        self.use_rcm = bool(_cfg("reg_use_rcm", False))         # RCM instead of AMD (no AMD in SciPy)
         self.use_ruiz = bool(_cfg("reg_use_ruiz", True))
         self.ruiz_iters = int(_cfg("reg_ruiz_iters", 3))
 
-        # preconditioning strategy
+        # preconditioning strategy (defaults upgraded)
         self.use_preconditioning = bool(_cfg("use_preconditioning", True))
-        # auto|none|jacobi|bjacobi|ssor|ilu|shift_invert|amg
-        self.precond_type = str(_cfg("precond_type", "auto"))
+        self.precond_type = str(_cfg("precond_type", "auto"))  # auto|none|jacobi|bjacobi|ssor|ilu|shift_invert|amg
         self.ilu_drop_tol = float(_cfg("ilu_drop_tol", 1e-3))
         self.ilu_fill_factor = float(_cfg("ilu_fill_factor", 10))
         self.shift_invert_mode = str(_cfg("shift_invert_mode", "buckling"))
+
+        # pragmatic preconditioning gates
+        self.precond_small_n = int(_cfg("precond_small_n", 350))          # below this, setup rarely pays
+        self.precond_cond_gate = float(_cfg("precond_cond_gate", 5e3))    # suspected cond threshold to enable PC
+        self.precond_density_gate = float(_cfg("precond_density_gate", 0.02))
+        self.precond_fail_backoff = int(_cfg("precond_fail_backoff", 2))  # disable for a few calls after failure
 
         # block-jacobi
         self.bjacobi_block_size = int(_cfg("bjacobi_block_size", 64))
@@ -605,75 +607,9 @@ class Regularizer:
         self.sigma_history: list[float] = []
         self.cond_history: list[float] = []
 
-    # ---------- build & wrap preconditioner ----------
-    def _build_preconditioner_operator(self, H: csr_matrix, precond_type: str) -> LinearOperator:
-        if precond_type == "none":
-            return LinearOperator(H.shape, matvec=lambda x: x)
-        if precond_type == "jacobi":
-            return self._jacobi_operator(H)
-        if precond_type == "bjacobi":
-            return self._bjacobi_operator(H)
-        if precond_type == "ssor":
-            return self._ssor_operator(H)
-        if precond_type == "ilu":
-            return self._ilu_operator(H)
-        if precond_type == "amg":
-            return self._amg_operator(H)
-        if precond_type == "shift_invert":
-            # Build an implicit (H - σI)^{-1} with σ from current setting (0 by default)
-            sigma = 0.0
-            fac = self._factorize_shift(H, sigma)
-            def mv(x):
-                if callable(fac): return fac(x)
-                return spsolve(H - sigma * sp.eye(H.shape[0], format="csr"), x)
-            return LinearOperator(H.shape, matvec=mv)
-        # Fallback: identity
-        return LinearOperator(H.shape, matvec=lambda x: x)
-
-    def _wrap_precond_to_original(
-        self,
-        M_inner: LinearOperator,
-        *,
-        perm: Optional[np.ndarray],
-        dscale: Optional[np.ndarray],
-        shape: Tuple[int, int],
-    ) -> LinearOperator:
-        """
-        Given a preconditioner M_inner built for H' = D^{-1/2} P H P^T D^{-1/2},
-        return M that approximates H^{-1} in ORIGINAL coordinates:
-            M ≈ H^{-1}
-        For a vector x in original coords:
-            y = M x = P^T D^{-1/2}  M_inner( D^{1/2} P x )
-        """
-        n, m = shape
-        if perm is None and dscale is None:
-            return M_inner
-
-        # Prepare permutations and scalings
-        if perm is not None:
-            perm = np.asarray(perm, dtype=int)
-            iperm = np.empty_like(perm)
-            iperm[perm] = np.arange(len(perm))
-        else:
-            iperm = None
-
-        ds_sqrt, ds_isqrt = _as_diag_sqrt(dscale)
-
-        def matvec(x: np.ndarray) -> np.ndarray:
-            v = x
-            if perm is not None:
-                v = v[perm]
-            if ds_sqrt is not None:
-                v = ds_sqrt * v
-            v = M_inner.matvec(v)
-            if ds_isqrt is not None:
-                v = ds_isqrt * v
-            if iperm is not None:
-                v = v[iperm]
-            return v
-
-        return LinearOperator(shape, matvec=matvec)
-
+        # runtime counters
+        self._precond_fail_streak = 0
+        self._last_precond: Optional[LinearOperator] = None
 
     # ---------- public API ----------
     def regularize(
@@ -685,7 +621,7 @@ class Regularizer:
         grad_norm: Optional[float] = None,
         tr_radius: Optional[float] = None,
         *,
-        precond_only: Optional[bool] = None,   # <--- NEW
+        precond_only: Optional[bool] = None,
     ) -> Tuple[ArrayLike, RegInfo] | Tuple[ArrayLike, RegInfo, LinearOperator]:
         n = H.shape[0]
         if H.shape[0] != H.shape[1]:
@@ -694,12 +630,12 @@ class Regularizer:
         was_sparse = _is_sparse(H)
         H = _sym(H) if not was_sparse else _sym(H).asformat("csr")
 
-        # Keep track to be able to build an original-coordinate preconditioner
+        # Keep transforms to build original-coordinate preconditioner later
         orig_n = n
         perm = None
         dscale = None
 
-        # Optional RCM permutation (symmetric bandwidth reduction)
+        # Optional RCM permutation
         if was_sparse and self.use_rcm and n >= 200:
             try:
                 perm = sp.csgraph.reverse_cuthill_mckee(H, symmetric_mode=True)
@@ -715,21 +651,17 @@ class Regularizer:
         analysis = self._analyze(H, n)
 
         # --- PRECOND-ONLY SHORT PATH ---
-        use_precond_only = bool(precond_only)
-        if use_precond_only:
-            # Select and build the preconditioner in the (possibly permuted & scaled) coordinates
+        if bool(precond_only):
             ptype = analysis.get("precond_type", "none")
             M_inner = self._build_preconditioner_operator(H, ptype)
-
-            # Wrap back to ORIGINAL coordinates (undo Ruiz + permutation transparently)
             M = self._wrap_precond_to_original(M_inner, perm=perm, dscale=dscale, shape=(orig_n, orig_n))
 
-            # Post "analysis" of the unchanged H (for bookkeeping)
+            # Post analysis for bookkeeping
             post = self._post_analyze(_safe_sparse_or_dense(_sym(_safe_dense(H) if not was_sparse else H)), n)
 
             info = RegInfo(
                 mode="PRECOND_ONLY",
-                sigma=self.sigma,  # whatever current sigma is; unused in this mode
+                sigma=self.sigma,
                 cond_before=analysis["cond_num"],
                 cond_after=post["cond_num"],
                 min_eig_before=analysis["min_eig"],
@@ -743,8 +675,7 @@ class Regularizer:
             info.nnz_before = nnz_before
             info.nnz_after = _nnz(H)
 
-            # Return ORIGINAL H (unchanged in caller's coordinates), info, and M
-            # If we permuted/scaled, undo that for H here:
+            # Undo scaling/permutation for returned H
             H_out = H
             if was_sparse and dscale is not None:
                 invd = 1.0 / dscale
@@ -754,6 +685,7 @@ class Regularizer:
                 iperm[perm] = np.arange(len(perm))
                 H_out = H_out[iperm][:, iperm]
 
+            self._last_precond = M
             return H_out, info, M
         # --- END PRECOND-ONLY ---
 
@@ -763,7 +695,16 @@ class Regularizer:
         # Decide mode
         mode = self.mode
         if mode == "AUTO":
-            if analysis["min_eig"] < -1e-10 or analysis["cond_num"] > self.target_cond:
+            lmin = analysis["min_eig"]
+            cond = analysis["cond_num"]
+            inertia = analysis.get("inertia", (np.nan, np.nan, np.nan))
+            npos, nneg, nzero = inertia if all(isinstance(x, (int, np.integer)) for x in inertia) else (np.nan, np.nan, np.nan)
+
+            if isinstance(nneg, (int, np.integer)) and nneg > 0 and constraint_count > 0:
+                mode = "INERTIA_FIX"
+            elif (abs(lmin) < 1e-10 and cond > self.target_cond) or cond > 100 * self.target_cond:
+                mode = "SPECTRAL"
+            elif lmin < -1e-10 or cond > self.target_cond:
                 mode = "EIGEN_MOD"
             else:
                 mode = "TIKHONOV"
@@ -843,52 +784,197 @@ class Regularizer:
         density = nnz / max(1, n * n)
         avg_deg = nnz / max(1, n)
         diag = H.diagonal()
-        diag_nz_ratio = float(np.mean(np.abs(diag) > 1e-14))
-        weak_diag = float(np.mean(np.abs(diag) < 1e-10))
-        # quick band proxy: mean |i-j| of nonzeros (sampled)
-        sample = min(nnz, 20000)
-        if sample > 0:
-            rows, cols = H.nonzero()
-            idx = np.random.RandomState(0).choice(len(rows), size=sample, replace=False)
-            band_mean = float(np.mean(np.abs(rows[idx] - cols[idx])))
+        diag_abs = np.abs(diag)
+        diag_nz_ratio = float(np.mean(diag_abs > 1e-14))
+        weak_diag = float(np.mean(diag_abs < 1e-8))
+
+        rows, cols = H.nonzero()
+        if len(rows) > 0:
+            take = min(len(rows), 20000)
+            sel = np.random.RandomState(0).choice(len(rows), size=take, replace=False)
+            band_mean = float(np.mean(np.abs(rows[sel] - cols[sel])))
         else:
             band_mean = 0.0
 
-        # SPD hint from inertia (if available)
         npos, nneg, nzero = inertia_hint if all(isinstance(x, (int, np.integer)) for x in inertia_hint) else (0, 0, 0)
         spd_hint = (nneg == 0 and (nzero == 0 or nzero < max(1, 0.01 * n)))
 
-        # Heuristics:
-        # 1) Very sparse & large & (SPD-ish): AMG
-        if (n >= 1500 and density < 0.01 and avg_deg < 20 and spd_hint):
+        # Decision tree
+        if n >= 1500 and density < 0.01 and avg_deg < 20 and spd_hint and diag_nz_ratio > 0.90:
             return "amg"
-
-        # 2) Very sparse but SPD unknown / indefinite: shift-invert helps eigen edges; ILU often strong
         if density < 0.01:
-            # if diagonal is weak, ILU can be better than simple point smoothers
-            return "ilu" if weak_diag > 0.05 else "shift_invert"
-
-        # 3) Sparse to moderate density: ILU tends to be a robust default
+            return "ilu" if (weak_diag > 0.05 or not spd_hint) else "shift_invert"
         if density < 0.10:
             return "ilu"
-
-        # 4) Moderately banded (low band_mean) and diagonally present: SSOR can help
-        if band_mean < 0.1 * n and diag_nz_ratio > 0.95:
+        if band_mean < 0.12 * n and diag_nz_ratio > 0.95:
             return "ssor"
 
-        # 5) Blocky structures (heuristic): if many short dense windows along diagonal -> Block-Jacobi
-        #    We detect via average local density in windows of size b
         b = min(self.bjacobi_block_size, n)
-        # crude local density proxy: nnz / (#blocks * b^2)
         num_blocks = int(np.ceil(n / b))
-        approx_block_density = nnz / max(1, num_blocks * (b * b))
-        if approx_block_density > 0.2 and density < 0.35:
+        approx_blk_density = nnz / max(1, num_blocks * (b * b))
+        if approx_blk_density > 0.20 and density < 0.35:
             return "bjacobi"
 
-        # 6) Fallbacks
         if density < 0.35:
             return "bjacobi"
         return "jacobi"
+
+    # ---------- gating: when to use preconditioner at all ----------
+    def _should_use_precond(self, H: csr_matrix, analysis: Dict) -> bool:
+        n = H.shape[0]
+        nnz = H.nnz
+        density = nnz / max(1, n * n)
+
+        if not self.use_preconditioning or self.precond_type == "none":
+            return False
+        if n <= self.precond_small_n:
+            return False
+        if self._precond_fail_streak > 0:
+            return False
+        cond = float(analysis.get("cond_num", np.inf))
+        if cond >= self.precond_cond_gate:
+            return True
+        return density <= self.precond_density_gate
+
+    # ---------- build & wrap preconditioner ----------
+    def _build_preconditioner_operator(self, H: csr_matrix, precond_type: str) -> LinearOperator:
+        if precond_type == "none":
+            return LinearOperator(H.shape, matvec=lambda x: x)
+        if precond_type == "jacobi":
+            return self._jacobi_operator(H)
+        if precond_type == "bjacobi":
+            return self._bjacobi_operator(H)
+        if precond_type == "ssor":
+            return self._ssor_operator(H)
+        if precond_type == "ilu":
+            return self._ilu_operator(H)
+        if precond_type == "amg":
+            return self._amg_operator(H)
+        if precond_type == "shift_invert":
+            sigma = 0.0
+            fac = self._factorize_shift(H, sigma)
+            def mv(x):
+                if callable(fac): 
+                    return fac(x)
+                return spsolve(H - sigma * sp.eye(H.shape[0], format="csr"), x)
+            return LinearOperator(H.shape, matvec=mv)
+        return LinearOperator(H.shape, matvec=lambda x: x)
+
+    def _wrap_precond_to_original(
+        self,
+        M_inner: LinearOperator,
+        *,
+        perm: Optional[np.ndarray],
+        dscale: Optional[np.ndarray],
+        shape: Tuple[int, int],
+    ) -> LinearOperator:
+        """
+        For H' = D^{-1/2} P H P^T D^{-1/2}, wrap M_inner ≈ (H')^{-1} back to original coords:
+            M ≈ H^{-1},  y = P^T D^{-1/2}  M_inner( D^{1/2} P x )
+        """
+        n, m = shape
+        if perm is None and dscale is None:
+            return M_inner
+
+        if perm is not None:
+            perm = np.asarray(perm, dtype=int)
+            iperm = np.empty_like(perm)
+            iperm[perm] = np.arange(len(perm))
+        else:
+            iperm = None
+
+        ds_sqrt, ds_isqrt = _as_diag_sqrt(dscale)
+
+        def matvec(x: np.ndarray) -> np.ndarray:
+            v = x
+            if perm is not None:
+                v = v[perm]
+            if ds_sqrt is not None:
+                v = ds_sqrt * v
+            v = M_inner.matvec(v)
+            if ds_isqrt is not None:
+                v = ds_isqrt * v
+            if iperm is not None:
+                v = v[iperm]
+            return v
+
+        return LinearOperator(shape, matvec=matvec)
+
+    # ---------- eigen edge helpers & extents ----------
+    def _eig_edge(
+        self,
+        H: csr_matrix,
+        which: str,
+        sigma: Optional[float] = None,
+        mode: str = "buckling",
+        M: Optional[LinearOperator] = None,
+    ) -> float:
+        if sigma is None:
+            vals = eigsh(
+                H, k=1, which=which, M=M,
+                return_eigenvectors=False, tol=self.iter_tol, maxiter=self.max_iter
+            )
+            return float(vals[0])
+
+        fac = self._factorize_shift(H, sigma)
+        if fac is None:
+            vals = eigsh(
+                H, k=1, which=which, sigma=sigma, mode=mode, M=M,
+                return_eigenvectors=False, tol=self.iter_tol, maxiter=self.max_iter
+            )
+            return float(vals[0])
+
+        def op(x):
+            return fac(x) if callable(fac) else spsolve(H - sigma * sp.eye(H.shape[0], format="csr"), x)
+
+        OPinv = LinearOperator(shape=H.shape, matvec=op)
+        vals = eigsh(
+            H, k=1, which=which, OPinv=OPinv, sigma=sigma, mode=mode, M=M,
+            return_eigenvectors=False, tol=self.iter_tol, maxiter=self.max_iter
+        )
+        return float(vals[0])
+
+    def _extents_sparse(self, H: csr_matrix, precond_type: str) -> Tuple[float, float, float]:
+        setup_t0 = time.time()
+        M = None
+        try:
+            if precond_type == "shift_invert":
+                lmin_hint = None
+                try:
+                    lmin_hint = float(eigsh(H, k=1, which="SA", return_eigenvectors=False, tol=1e-2, maxiter=200))
+                except Exception:
+                    pass
+                sigma = 0.0 if (lmin_hint is None or lmin_hint > 0) else (0.5 * lmin_hint)
+                lmin = self._eig_edge(H, which="SM", sigma=sigma, mode=self.shift_invert_mode)
+                lmax = self._eig_edge(H, which="LA")
+            else:
+                analysis_light = {"cond_num": np.inf}
+                if self._should_use_precond(H, analysis_light):
+                    if precond_type == "jacobi":
+                        M = self._jacobi_operator(H)
+                    elif precond_type == "bjacobi":
+                        M = self._bjacobi_operator(H)
+                    elif precond_type == "ssor":
+                        M = self._ssor_operator(H)
+                    elif precond_type == "ilu":
+                        M = self._ilu_operator(H)
+                    elif precond_type == "amg":
+                        M = self._amg_operator(H)
+                lmin = self._eig_edge(H, which="SA", M=M)
+                lmax = self._eig_edge(H, which="LA", M=M)
+
+            setup_time = time.time() - setup_t0
+            self._last_precond = M
+            return float(lmin), float(lmax), float(setup_time)
+        except Exception as e:
+            logging.debug(f"_extents_sparse fallback due to {e}")
+            try:
+                lmin = float(eigsh(H, k=1, which="SA", return_eigenvectors=False))
+                lmax = float(eigsh(H, k=1, which="LA", return_eigenvectors=False))
+                return lmin, lmax, time.time() - setup_t0
+            except Exception:
+                diag = H.diagonal()
+                return float(np.min(diag)), float(np.max(diag)), time.time() - setup_t0
 
     # ---------- preconditioners ----------
     def _jacobi_operator(self, H: csr_matrix) -> LinearOperator:
@@ -953,7 +1039,7 @@ class Regularizer:
             z = np.zeros_like(y)
             yprime = invD * y
             for i in range(Hc.shape[0] - 1, -1, -1):
-                s = yprime[i] - omega * U[i, i + 1 :].toarray().ravel().dot(z[i + 1 :])
+                s = yprime[i] - omega * U[i, i + 1:].toarray().ravel().dot(z[i + 1:])
                 z[i] = s / (D[i])
             return z
 
@@ -966,14 +1052,19 @@ class Regularizer:
             try:
                 ilu = spilu(H.tocsc(), drop_tol=self.ilu_drop_tol, fill_factor=self.ilu_fill_factor)
                 self._ilu_cache[key] = ilu
+                self._precond_fail_streak = 0
             except Exception as e:
-                warnings.warn(f"ILU failed: {e}; using identity preconditioner.")
-                return LinearOperator(H.shape, matvec=lambda x: x)
+                warnings.warn(f"ILU failed: {e}; falling back to SSOR/Jacobi.")
+                self._precond_fail_streak = min(self.precond_fail_backoff, self._precond_fail_streak + 1)
+                try:
+                    return self._ssor_operator(H)
+                except Exception:
+                    return self._jacobi_operator(H)
         return LinearOperator(H.shape, matvec=lambda x: ilu.solve(x))
 
     def _amg_operator(self, H: csr_matrix) -> LinearOperator:
         try:
-            amg = self._MiniAMG(
+            amg = _MiniAMG(
                 H,
                 theta=0.08,
                 jacobi_omega=0.7,
@@ -982,10 +1073,15 @@ class Regularizer:
                 max_levels=10,
                 min_coarse=40,
             )
+            self._precond_fail_streak = 0
+            return LinearOperator(H.shape, matvec=lambda x: amg.solve(x))
         except Exception as e:
-            warnings.warn(f"AMG setup failed: {e}; using identity preconditioner.")
-            return LinearOperator(H.shape, matvec=lambda x: x)
-        return LinearOperator(H.shape, matvec=lambda x: amg.solve(x))
+            warnings.warn(f"AMG failed: {e}; falling back to ILU/SSOR.")
+            self._precond_fail_streak = min(self.precond_fail_backoff, self._precond_fail_streak + 1)
+            try:
+                return self._ilu_operator(H)
+            except Exception:
+                return self._ssor_operator(H)
 
     def _factorize_shift(self, H: csr_matrix, sigma: float):
         key = (_perm_signature(H), float(sigma))
@@ -999,76 +1095,6 @@ class Regularizer:
             fac = None
         self._factor_cache[key] = fac
         return fac
-
-    # ---------- eigen edge helpers ----------
-    def _eig_edge(
-        self,
-        H: csr_matrix,
-        which: str,
-        sigma: Optional[float] = None,
-        mode: str = "buckling",
-        M: Optional[LinearOperator] = None,
-    ) -> float:
-        if sigma is None:
-            vals = eigsh(
-                H, k=1, which=which, M=M,
-                return_eigenvectors=False, tol=self.iter_tol, maxiter=self.max_iter
-            )
-            return float(vals[0])
-
-        fac = self._factorize_shift(H, sigma)
-        if fac is None:
-            vals = eigsh(
-                H, k=1, which=which, sigma=sigma, mode=mode, M=M,
-                return_eigenvectors=False, tol=self.iter_tol, maxiter=self.max_iter
-            )
-            return float(vals[0])
-
-        def op(x):
-            return fac(x) if callable(fac) else spsolve(H - sigma * sp.eye(H.shape[0], format="csr"), x)
-
-        OPinv = LinearOperator(shape=H.shape, matvec=op)
-        vals = eigsh(
-            H, k=1, which=which, OPinv=OPinv, sigma=sigma, mode=mode, M=M,
-            return_eigenvectors=False, tol=self.iter_tol, maxiter=self.max_iter
-        )
-        return float(vals[0])
-
-    def _extents_sparse(self, H: csr_matrix, precond_type: str) -> Tuple[float, float, float]:
-        setup_t0 = time.time()
-        M = None
-
-        try:
-            if precond_type == "shift_invert":
-                lmin = self._eig_edge(H, which="SM", sigma=0.0, mode=self.shift_invert_mode)
-                lmax = self._eig_edge(H, which="LA")
-            else:
-                if precond_type == "jacobi":
-                    M = self._jacobi_operator(H)
-                elif precond_type == "bjacobi":
-                    M = self._bjacobi_operator(H)
-                elif precond_type == "ssor":
-                    M = self._ssor_operator(H)
-                elif precond_type == "ilu":
-                    M = self._ilu_operator(H)
-                elif precond_type == "amg":
-                    M = self._amg_operator(H)
-                # else: M=None
-
-                lmin = self._eig_edge(H, which="SA", M=M)
-                lmax = self._eig_edge(H, which="LA", M=M)
-
-            setup_time = time.time() - setup_t0
-            return float(lmin), float(lmax), float(setup_time)
-        except Exception as e:
-            logging.debug(f"_extents_sparse fallback due to {e}")
-            try:
-                lmin = float(eigsh(H, k=1, which="SA", return_eigenvectors=False))
-                lmax = float(eigsh(H, k=1, which="LA", return_eigenvectors=False))
-                return lmin, lmax, time.time() - setup_t0
-            except Exception:
-                diag = H.diagonal() if sp.issparse(H) else np.diag(H)
-                return float(np.min(diag)), float(np.max(diag)), time.time() - setup_t0
 
     # ---------- strategies ----------
     def _eigen_bump(self, H: ArrayLike, analysis: Dict) -> Tuple[ArrayLike, RegInfo]:
@@ -1235,6 +1261,9 @@ class Regularizer:
         }
 
     # ---------- utilities ----------
+    def get_last_preconditioner(self) -> Optional[LinearOperator]:
+        return self._last_precond
+
     def get_statistics(self) -> Dict:
         return {
             "current_sigma": self.sigma,
@@ -1252,6 +1281,8 @@ class Regularizer:
         self._ilu_cache.clear()
         self._bjacobi_cache.clear()
         self._factor_cache.clear()
+        self._last_precond = None
+        self._precond_fail_streak = 0
         self.sigma = float(getattr(self.cfg, "reg_sigma", 1e-8))
 
 # ---------- convenience API ----------
