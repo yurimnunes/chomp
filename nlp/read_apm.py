@@ -89,7 +89,17 @@ class APMParser:
         if line.startswith('!'):
             if 'best known objective' in line.lower():
                 best_value_str = line.split('=')[-1].strip()
-                model_info['best'] = float(best_value_str)
+                try:
+                    # VERIFICA SE É UMA FRAÇÃO
+                    if '/' in best_value_str:
+                        num, den = best_value_str.split('/')
+                        model_info['best'] = float(num) / float(den)
+                    else:
+                        # Se não for, tenta a conversão float normal
+                        model_info['best'] = float(best_value_str)
+                except (ValueError, ZeroDivisionError) as e:
+                    print(f"Aviso: Não foi possível converter o 'best objective' ('{best_value_str}'). Erro: {e}")
+                    model_info['best'] = None
             return
         
         if '=' in line and line.lstrip().startswith('obj'):
@@ -167,20 +177,21 @@ class APMModel:
         return f"<APMModel name='{self.data['name']}'>"
 
 if __name__ == '__main__':
-    apm_file_content = """
-    Model hs24_com_igualdade
-      Variables
-        x[1] = 1
-        x[2] = 1
-      End Variables
+    import sys, os
+    # No bloco if __name__ == "__main__":
+    apm_filename = os.path.join('Data_Instances', 'hs006.apm')
 
-      Equations
-        x[1] + x[2] >= 3 
-        x[1] * x[2] = 4
-      End Equations
-    End Model
-    """
+    # 2. Ler o conteúdo do arquivo
+    try:
+        with open(apm_filename, 'r', encoding='utf-8') as f:
+            apm_file_content = f.read()
+        print(f"Arquivo '{apm_filename}' lido com sucesso.")
+    except FileNotFoundError:
+        print(f"ERRO: O arquivo '{apm_filename}' não foi encontrado.")
+        print("Por favor, crie o arquivo no mesmo diretório do script.")
+        sys.exit(1) # Encerra o script se o arquivo não existir
 
+    print(apm_file_content)
     model = APMModel(apm_file_content)
 
     print(f"Modelo carregado: {model}")
