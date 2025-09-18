@@ -97,124 +97,114 @@ class APMParser:
         else:
             model_info['equations'].append(line)
 
+# ... (APMParser e o início da APMModel permanecem os mesmos) ...
+
 class APMModel:
     """
     Representa um modelo de otimização APM completo, com dados analisados,
     uma função objetivo executável e uma lista de funções de restrição.
     """
     def __init__(self, apm_content: str):
-        """
-        Inicializa o modelo, analisando o conteúdo e criando as funções.
-        """
+        # ... (sem alterações) ...
         parser = APMParser()
         self.data = parser.parse(apm_content)
         self.objective_function = self._create_objective_function()
-        
-        # NOVO: Chama o método para criar as funções de restrição
-        self.constraints = self._create_constraint_functions()
+        self.constraints, self.constraint_map = self._create_constraint_functions()
 
     def _create_objective_function(self):
-        """Cria uma função Python a partir da string da função objetivo."""
-        if not self.data['obj']:
-            return None
+        # ... (sem alterações) ...
+        if not self.data['obj']: return None
         expression_string = self.data['obj'].replace('^', '**')
         try:
-            obj_func = lambda x: eval(expression_string, {"x": x})
-            return obj_func
+            return lambda x: eval(expression_string, {"x": x})
         except Exception as e:
             print(f"Erro ao criar a função objetivo: {e}")
             return None
 
     def _create_constraint_functions(self):
-        """
-        Cria uma lista de funções de restrição a partir das equações,
-        padronizadas para o formato g(x) <= 0.
-        """
         constraint_functions = []
+        constraint_map = []
         
-        # Regex para encontrar a expressão, o operador (>= ou <=) e o valor
-        pattern = re.compile(r'(.*)\s*(>=|<=)\s*(.*)')
+        # Regex ATUALIZADO para ser "não-ganancioso" (.+?) e mais robusto
+        pattern = re.compile(r'(.+?)\s*(>=|<=|=)\s*(.+)')
 
-        for eq_string in self.data['equations']:
-            match = pattern.search(eq_string)
+        for i, eq_string in enumerate(self.data['equations']):
+            # ETAPA 1: Limpar comentários e espaços extras da linha
+            cleaned_eq = eq_string.split('!', 1)[0].strip()
+
+            if not cleaned_eq: continue # Pula a linha se ela for só um comentário
+
+            match = pattern.fullmatch(cleaned_eq) # Usar fullmatch para garantir que a linha inteira corresponde
             
             if not match:
-                print(f"Aviso: A restrição '{eq_string}' não possui '>=' ou '<=' e será ignorada.")
+                print(f"Aviso: A restrição '{cleaned_eq}' está malformada e será ignorada.")
                 continue
 
-            # Separa em lado esquerdo (LHS), operador, e lado direito (RHS)
-            lhs = match.group(1).strip()
-            op = match.group(2).strip()
-            rhs = match.group(3).strip()
-
-            # Constrói a nova expressão no formato g(x) <= 0
+            lhs, op, rhs = match.group(1).strip(), match.group(2).strip(), match.group(3).strip()
+            
+            g_x_expressions = []
             if op == '>=':
-                # A >= B  --->  B - A <= 0
-                g_x_string = f"({rhs}) - ({lhs})"
+                g_x_expressions.append(f"({rhs}) - ({lhs})")
             elif op == '<=':
-                # A <= B  --->  A - B <= 0
-                g_x_string = f"({lhs}) - ({rhs})"
+                g_x_expressions.append(f"({lhs}) - ({rhs})")
+            elif op == '=':
+                g_x_expressions.append(f"({lhs}) - ({rhs})")
+                g_x_expressions.append(f"({rhs}) - ({lhs})")
             
-            # Converte a sintaxe para Python (^ -> **)
-            py_expression = g_x_string.replace('^', '**')
-            
-            try:
-                # IMPORTANTE: Usar 'expr=py_expression' para capturar o valor
-                # da string da expressão em cada iteração do loop.
-                func = lambda x, expr=py_expression: eval(expr, {"x": x})
-                constraint_functions.append(func)
-            except Exception as e:
-                print(f"Erro ao criar função para a restrição '{eq_string}': {e}")
+            for expr in g_x_expressions:
+                py_expression = expr.replace('^', '**')
+                try:
+                    func = lambda x, captured_expr=py_expression: eval(captured_expr, {"x": x})
+                    constraint_functions.append(func)
+                    constraint_map.append(i)
+                except Exception as e:
+                    print(f"Erro ao criar função para a restrição '{cleaned_eq}': {e}")
         
-        return constraint_functions
+        return constraint_functions, constraint_map
 
     def __repr__(self):
-        """Representação do objeto para facilitar a visualização."""
+        # ... (sem alterações) ...
         return f"<APMModel name='{self.data['name']}'>"
 
 if __name__ == '__main__':
     apm_file_content = """
-    Model hs23
+    Model hs24_com_igualdade
       Variables
-        x[1] = 3, <=50, >=-50
-        x[2] = 1, <=50, >=-50
-        obj
+        x[1] = 1
+        x[2] = 1
       End Variables
 
       Equations
-        x[1] + x[2] >= 1
-        x[1]^2 + x[2]^2 >= 1
-        9*x[1]^2 + x[2]^2 >= 9
-        x[1]^2 - x[2] >= 0
-        x[2]^2 - x[1] >= 0    
-
-        ! best known objective = 2
-        obj = x[1]^2 + x[2]^2
+        x[1] + x[2] >= 3 
+        x[1] * x[2] = 4
       End Equations
     End Model
     """
 
-    # 1. Criar a instância do modelo
     model = APMModel(apm_file_content)
 
     print(f"Modelo carregado: {model}")
-    print(f"Encontradas {len(model.constraints)} funções de restrição.")
-    print("-" * 40)
+    # Note que teremos 3 funções de restrição para 2 linhas de equações
+    print(f"Encontradas {len(model.constraints)} funções de restrição a partir de {len(model.data['equations'])} equações.")
+    print("-" * 50)
 
-    # 2. Ponto de teste
-    # O ponto (1, 1) viola a segunda restrição (9*1+1 >= 9 -> 10 >= 9) mas satisfaz a primeira (1+1 >= 1)
-    # O ponto (3, 1) satisfaz todas as restrições >=
-    ponto_teste = {1: 3.0, 2: 1.0}
-    print(f"Avaliando restrições para o ponto x = {ponto_teste}:\n")
+    # Pontos de teste
+    ponto_1 = {1: 2.0, 2: 2.0} # Satisfaz ambas: 2+2>=3 (4>=3) e 2*2=4
+    ponto_2 = {1: 1.0, 2: 4.0} # Satisfaz a igualdade (1*4=4) mas viola a desigualdade (1+4>=3 -> 5>=3, ok) - opa, satisfaz as duas também
+    ponto_3 = {1: 1.0, 2: 1.0} # Viola ambas: 1+1>=3 (2>=3) é falso, e 1*1=4 é falso
 
-    # 3. Iterar e testar cada função de restrição
-    # Se g(x) <= 0, a restrição é satisfeita (válida).
-    # Se g(x) > 0, a restrição é violada (inválida).
-    for i, constraint_func in enumerate(model.constraints):
-        original_eq = model.data['equations'][i]
-        result = constraint_func(ponto_teste)
+    pontos_de_teste = {"Ponto Válido (2,2)": ponto_1, "Ponto Válido (1,4)": ponto_2, "Ponto Inválido (1,1)": ponto_3}
+
+    for nome, ponto in pontos_de_teste.items():
+        print(f"\n--- Avaliando restrições para o {nome}: x = {ponto} ---")
         
-        status = "Satisfeita (Válida)" if result <= 0 else "Violada (Inválida)"
-        
-        print(f"Restrição Original: '{original_eq}'")
-        print(f"Resultado g(x): {result:.4f}  --> Status: {status}\n")
+        for i, constraint_func in enumerate(model.constraints):
+            # Usamos o mapa para encontrar a equação original
+            original_eq_index = model.constraint_map[i]
+            original_eq = model.data['equations'][original_eq_index]
+            
+            result = constraint_func(ponto)
+            status = "Satisfeita (<= 0)" if result <= 1e-9 else "Violada (> 0)" # Usando tolerância
+            
+            print(f"Eq. Original: '{original_eq}'")
+            print(f"  -> Resultado da função g_{i+1}(x): {result:.4f}  ({status})")
