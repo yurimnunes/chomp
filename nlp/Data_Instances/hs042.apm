@@ -1,0 +1,14 @@
+Model hs42
+  Variables
+    x[1:4] = 1, >=0
+    obj
+  End Variables
+
+  Equations
+    x[1] = 2
+    x[3]^2 + x[4]^2 = 2
+
+    ! best known objective = 28 - 10*sqrt(2)
+    obj = (x[1]-1)^2 + (x[2]-2)^2 + (x[3]-3)^2 + (x[4]-4)^2
+  End Equations
+End Model

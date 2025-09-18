@@ -1,0 +1,15 @@
+Model hs29
+  Variables
+    x[1] = 1
+    x[2] = 1
+    x[3] = 1
+    obj
+  End Variables
+
+  Equations
+    x[1]^2 + 2*x[2]^2 + 4*x[3]^2 <= 48
+
+    ! best known objective = -16*sqrt(2)
+    obj = -x[1]*x[2]*x[3]
+  End Equations
+End Model
