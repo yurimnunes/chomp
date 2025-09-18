@@ -97,8 +97,54 @@ class APMParser:
         else:
             model_info['equations'].append(line)
 
+class APMModel:
+    """
+    Representa um modelo de otimização APM completo, com dados
+    analisados e uma função objetivo executável.
+    """
+    def __init__(self, apm_content: str):
+        """
+        Inicializa o modelo, analisando o conteúdo do arquivo .apm
+        e criando a função objetivo.
 
-# --- Exemplo de Uso ---
+        Args:
+            apm_content: Uma string contendo o modelo APM.
+        """
+        parser = APMParser()
+        self.data = parser.parse(apm_content)
+        self.objective_function = self._create_objective_function()
+
+    def _create_objective_function(self):
+        """
+        Cria uma função Python a partir da string da função objetivo.
+        
+        A função gerada espera um dicionário como entrada para a variável 'x',
+        com chaves sendo os índices (ex: x[1], x[2]).
+        """
+        if not self.data['obj']:
+            return None
+
+        # 1. Traduzir a sintaxe de .apm para Python (ex: ^ para **)
+        # Adicionamos espaços para garantir que não substituímos algo indesejado
+        expression_string = self.data['obj'].replace('^', '**')
+
+        # 2. Criar a função dinamicamente usando lambda e eval
+        # A função lambda receberá um dicionário 'x'
+        # eval() irá calcular a expressão usando esse dicionário 'x'
+        try:
+            # O dicionário {"x": x} mapeia a variável 'x' na string para 
+            # o argumento 'x' passado para a lambda.
+            obj_func = lambda x: eval(expression_string, {"x": x})
+            return obj_func
+        except Exception as e:
+            print(f"Erro ao criar a função objetivo: {e}")
+            return None
+
+    def __repr__(self):
+        """Representação do objeto para facilitar a visualização."""
+        return f"<APMModel name='{self.data['name']}'>"
+
+
 if __name__ == '__main__':
     apm_file_content = """
     Model hs23
@@ -121,8 +167,33 @@ if __name__ == '__main__':
     End Model
     """
 
-    parser = APMParser()
-    modelo_hs23 = parser.parse(apm_file_content)
+    # 1. Criar uma instância do modelo.
+    # A análise e a criação da função acontecem automaticamente.
+    model = APMModel(apm_file_content)
 
-    print("--- Resultado do Parser (Corrigido) ---")
-    pprint(modelo_hs23)
+    print(f"Modelo carregado: {model}")
+    print("-" * 30)
+
+    # 2. Acessar a função objetivo gerada
+    obj_func = model.objective_function
+    
+    if obj_func:
+        print("Função objetivo criada com sucesso!")
+        
+        # 3. Testar a função com alguns valores
+        # O formato de entrada deve ser um dicionário onde as chaves são os índices
+        # da variável 'x' (1, 2, etc.)
+        ponto_teste_1 = {1: 3, 2: 1} # O ponto inicial do arquivo
+        resultado_1 = obj_func(ponto_teste_1)
+        print(f"Calculando f(x={ponto_teste_1}): {resultado_1}")
+
+        ponto_teste_2 = {1: 1.0, 2: 1.0}
+        resultado_2 = obj_func(ponto_teste_2)
+        print(f"Calculando f(x={ponto_teste_2}): {resultado_2}") # Deve ser 2.0
+        
+        # Comparando com o valor ótimo conhecido
+        print(f"O valor ótimo conhecido é: {model.data['best']}")
+
+    print("-" * 30)
+    print("Dados completos do modelo:")
+    pprint(model.data)
