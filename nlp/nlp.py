@@ -60,6 +60,7 @@ class NLPSolver:
 
         # Model & shared managers
         self.model = Model(f, c_ineq, c_eq, self.n, lb, ub)
+        print(f"Model has {self.n} vars, {len(c_ineq) if c_ineq else 0} ineq, {len(c_eq) if c_eq else 0} eq")
         self.hess = HessianManager(self.n, self.cfg)
         self.rest = RestorationManager(self.cfg)
         self.regularizer = Regularizer(self.cfg)
@@ -81,9 +82,9 @@ class NLPSolver:
             self.cfg,
             self.hess,
             TrustRegionManager(self.cfg),
-            LineSearcher(self.cfg, Filter(self.cfg), None),
+            None,
             self.qp,
-            SOCCorrector(self.cfg),
+            None,
             self.regularizer,
             self.rest,
         )

@@ -641,41 +641,87 @@ template <> struct OpTraits<Operator::Multiply> {
         }
     }
     static inline void hvp_backward(ADNode &n, ADGraph &g) {
-        if (!_nary_ok(n))
-            return;
-        const size_t m = n.inputs.size();
-        auto &vals = tls_vals();
-        auto &dots = tls_dots();
-        vals.resize(m);
-        dots.resize(m);
-        for (size_t i = 0; i < m; ++i) {
-            vals[i] = n.inputs[i]->value;
-            dots[i] = n.inputs[i]->dot;
-        }
-        auto &pre = tls_pre();
-        auto &suf = tls_suf();
-        build_prefix_suffix(vals, pre, suf);
-        for (size_t i = 0; i < m; ++i) {
-            const double P_wo_i = pre[i] * suf[i + 1];
-            double sum_term = 0.0;
-            for (size_t k = 0; k < m; ++k) {
-                if (k == i)
-                    continue;
-                const size_t a = (i < k ? i : k), b = (i < k ? k : i);
-                const double left = pre[a], mid = (pre[b] / pre[a + 1]),
-                             right = suf[b + 1];
-                sum_term += dots[k] * (left * mid * right);
-            }
-            auto &gacc =
-                ensure_epoch_zero(n.inputs[i]->gradient,
-                                  n.inputs[i]->grad_epoch, g.cur_grad_epoch_);
-            auto &gdacc =
-                ensure_epoch_zero(n.inputs[i]->grad_dot,
-                                  n.inputs[i]->gdot_epoch, g.cur_gdot_epoch_);
-            gacc += n.gradient * P_wo_i;
-            gdacc += n.grad_dot * P_wo_i + n.gradient * sum_term;
-        }
+    if (!_nary_ok(n)) return;
+
+    const size_t m = n.inputs.size();
+
+    // --- Fast, robust specialization for binary multiply: z = a * b
+    if (m == 2) {
+        auto* a = n.inputs[0].get();
+        auto* b = n.inputs[1].get();
+
+        const double aval  = a->value,  bval  = b->value;
+        const double adot  = a->dot,    bdot  = b->dot;
+        const double ybar  = n.gradient;
+        const double ybdot = n.grad_dot;
+
+        auto &ga   = ensure_epoch_zero(a->gradient, a->grad_epoch, g.cur_grad_epoch_);
+        auto &gb   = ensure_epoch_zero(b->gradient, b->grad_epoch, g.cur_grad_epoch_);
+        auto &gda  = ensure_epoch_zero(a->grad_dot, a->gdot_epoch, g.cur_gdot_epoch_);
+        auto &gdb  = ensure_epoch_zero(b->grad_dot, b->gdot_epoch, g.cur_gdot_epoch_);
+
+        // First order: ∂z/∂a = b, ∂z/∂b = a
+        ga  += ybar * bval;
+        gb  += ybar * aval;
+
+        // Second order column (HVP):
+        // (H·v)_a = ybdot*b + ybar*bdot
+        // (H·v)_b = ybdot*a + ybar*adot
+        gda += ybdot * bval + ybar * bdot;
+        gdb += ybdot * aval + ybar * adot;
+        return;
     }
+
+    // --- General n-ary case (m >= 3)
+    auto &vals = tls_vals();
+    auto &dots = tls_dots();
+    vals.resize(m);
+    dots.resize(m);
+    for (size_t i = 0; i < m; ++i) {
+        vals[i] = n.inputs[i]->value;
+        dots[i] = n.inputs[i]->dot;
+    }
+
+    auto &pre = tls_pre();
+    auto &suf = tls_suf();
+    build_prefix_suffix(vals, pre, suf);
+
+    for (size_t i = 0; i < m; ++i) {
+        const double P_wo_i = pre[i] * suf[i + 1];
+
+        // sum_{k != i} v_k * ∏_{ℓ ≠ i,k} vals[ℓ]
+        double sum_term = 0.0;
+        for (size_t k = 0; k < m; ++k) {
+            if (k == i) continue;
+
+            // We want product of the "between" segment [a+1 .. b-1] without division
+            const size_t a = (i < k ? i : k);
+            const size_t b = (i < k ? k : i);
+
+            double mid_prod = 1.0;
+            // If the segment is short, this loop is tiny; avoids 0/0 when pre[b]==pre[a+1]==0
+            for (size_t t = a + 1; t < b; ++t) {
+                mid_prod *= vals[t];
+                if (mid_prod == 0.0) break; // early-out
+            }
+
+            // left * mid * right = ∏_{ℓ < a} vals[ℓ]  *  ∏_{a<ℓ<b} vals[ℓ]  *  ∏_{ℓ > b} vals[ℓ]
+            const double left  = pre[a];
+            const double right = suf[b + 1];
+
+            sum_term += dots[k] * (left * mid_prod * right);
+        }
+
+        auto &gacc  = ensure_epoch_zero(n.inputs[i]->gradient,  n.inputs[i]->grad_epoch,  g.cur_grad_epoch_);
+        auto &gdacc = ensure_epoch_zero(n.inputs[i]->grad_dot,  n.inputs[i]->gdot_epoch,  g.cur_gdot_epoch_);
+
+        // First order
+        gacc  += n.gradient  * P_wo_i;
+        // Second order column (HVP)
+        gdacc += n.grad_dot  * P_wo_i + n.gradient * sum_term;
+    }
+}
+
 };
 
 // =====================================================================

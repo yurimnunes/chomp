@@ -1,6 +1,7 @@
 # --- kkt_core.py (put this near your linear algebra helpers) ---
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 
@@ -8,9 +9,20 @@ from typing import Any, Callable, Dict, Optional, Protocol, Tuple
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from numba import njit
 
 from .blocks.reg import Regularizer, make_preconditioner_only, make_psd_advanced
 from .ip_cg import *
+
+# Expect these base classes in your codebase:
+# from .base import KKTStrategy, KKTReusable
+
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except Exception:
+    _HAS_NUMBA = False
+
 
 try:
     import qdldl_cpp as qd
@@ -58,42 +70,6 @@ def _upper_csc(K: sp.spmatrix) -> sp.csc_matrix:
     # assert sp.tril(Kup, -1).nnz == 0
 
     return Kup
-
-
-def _normest_rowsum_inf(A: sp.spmatrix) -> float:
-    A = _csr(A)
-    return float(np.max(np.abs(A).sum(axis=1))) if A.shape[0] else 1.0
-
-
-def _cg_matfree(matvec, b, x0=None, tol=1e-10, maxit=200, M=None):
-    n = b.size
-    x = np.zeros(n) if x0 is None else x0.copy()
-    r = b - matvec(x)
-    z = r if M is None else M(r)
-    p = z.copy()
-    rz_old = float(r @ z)
-    nrm0 = float(np.linalg.norm(r))
-    stop = max(tol * nrm0, 0.0)
-    if nrm0 <= stop:
-        return x, 0
-    for it in range(1, maxit + 1):
-        Ap = matvec(p)
-        pAp = float(p @ Ap)
-        if pAp <= 0.0:
-            break
-        alpha = rz_old / pAp
-        x += alpha * p
-        r -= alpha * Ap
-        nr = float(np.linalg.norm(r))
-        if nr <= stop:
-            return x, it
-        z = r if M is None else M(r)
-        rz_new = float(r @ z)
-        beta = rz_new / rz_old
-        rz_old = rz_new
-        p = z + beta * p
-    return x, it
-
 
 # ---------------------- Reusable handle interface ----------------------
 class KKTReusable(Protocol):
@@ -152,77 +128,301 @@ except Exception:
         def _wrap(f): return f
         return _wrap
 
-@njit(cache=True, fastmath=True)
-def _csr_matvec_numba(indptr, indices, data, x):
-    n = indptr.size - 1
-    y = np.zeros(n, dtype=np.float64)
-    for i in range(n):
-        acc = 0.0
-        row_start = indptr[i]
-        row_end = indptr[i + 1]
-        for k in range(row_start, row_end):
-            acc += data[k] * x[indices[k]]
-        y[i] = acc
-    return y
+# ======================= HYKKT Strategy (Numba-enabled, fixed preconds) ==================
 
-@njit(cache=True, fastmath=True)
-def _csr_t_matvec_numba(indptr, indices, data, x, ncols):
-    # y = (A^T) @ x, A is CSR with shape (nrows, ncols)
-    y = np.zeros(ncols, dtype=np.float64)
-    nrows = indptr.size - 1
-    for i in range(nrows):
-        xi = x[i]
-        row_start = indptr[i]
-        row_end = indptr[i + 1]
-        for k in range(row_start, row_end):
-            j = indices[k]
-            y[j] += data[k] * xi
-    return y
+# ------------------------------------------------------------------------------
+# Utilities & Helpers
+# ------------------------------------------------------------------------------
 
-@njit(cache=True, fastmath=True)
-def _kgamma_mv_numba(W_indptr, W_indices, W_data,
-                     G_indptr, G_indices, G_data,
-                     x, delta, gamma, n):
-    # yW = W @ x
-    yW = _csr_matvec_numba(W_indptr, W_indices, W_data, x)
-    # yG = G @ x
-    yG = _csr_matvec_numba(G_indptr, G_indices, G_data, x)
-    # gty = G^T @ (G @ x)
-    gty = _csr_t_matvec_numba(G_indptr, G_indices, G_data, yG, n)
-    # combine: W x + delta x + gamma gty
-    return yW + delta * x + gamma * gty
+import math
+from typing import Any, Callable, Optional, Tuple
+
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except Exception:
+    _HAS_NUMBA = False
 
 
-# ======================= HYKKT Strategy (Numba-enabled) ==================
+# ------------------------------------------------------------------------------
+# Safe diagonal LinearOperator preconditioner
+# ------------------------------------------------------------------------------
+def _make_diag_prec(diag: Optional[np.ndarray], n: int) -> Optional[spla.LinearOperator]:
+    """
+    Safe diagonal LinearOperator preconditioner.
+    If diag is None -> return None.
+    """
+    if diag is None:
+        return None
+    d = np.asarray(diag, dtype=np.float64).reshape(-1)
+    if d.size != n:
+        raise ValueError(f"Preconditioner diagonal has size {d.size}, expected {n}")
+    def mv(z):
+        z = np.asarray(z, dtype=np.float64).reshape(-1)
+        return d * z
+    return spla.LinearOperator((n, n), matvec=mv, rmatvec=mv, dtype=np.float64)
+
+
+# ------------------------------------------------------------------------------
+# Pure-Python CG (works with Python callables / LinearOperator)
+# ------------------------------------------------------------------------------
+def _cg_matfree_py(matvec, b, x0=None, tol=1e-10, maxit=200, M=None):
+    """
+    Conjugate Gradient for matrix-free matvec (Python callables allowed).
+    M can be a LinearOperator or None.
+    """
+    b = np.asarray(b, dtype=np.float64)
+    n = b.size
+    x = np.zeros(n, dtype=np.float64) if x0 is None else np.array(x0, dtype=np.float64, copy=True)
+
+    r = b - matvec(x)
+    z = r if M is None else (M @ r)
+    p = z.copy()
+    rz_old = float(r @ z)
+    nrm0 = float(np.linalg.norm(r))
+    stop = max(tol * nrm0, 0.0)
+    if nrm0 <= stop:
+        return x, 0
+
+    for it in range(1, maxit + 1):
+        Ap = matvec(p)
+        pAp = float(p @ Ap)
+        if pAp <= 0.0:
+            break
+        alpha = rz_old / pAp
+        x += alpha * p
+        r -= alpha * Ap
+        if float(np.linalg.norm(r)) <= stop:
+            return x, it
+        z = r if M is None else (M @ r)
+        rz_new = float(r @ z)
+        beta = rz_new / rz_old
+        rz_old = rz_new
+        p = z + beta * p
+    return x, it
+
+
+# ------------------------------------------------------------------------------
+# Numba CSR kernels & CG for Kγ = W + δI + γ GᵀG (no Python callables in-loop)
+# ------------------------------------------------------------------------------
+if _HAS_NUMBA:
+    @njit(cache=True, fastmath=True)
+    def _csr_mv(indptr, indices, data, x, out):
+        out[:] = 0.0
+        n = indptr.size - 1
+        for i in range(n):
+            s = 0.0
+            rs = indptr[i]
+            re = indptr[i+1]
+            for k in range(rs, re):
+                s += data[k] * x[indices[k]]
+            out[i] = s
+
+    @njit(cache=True, fastmath=True)
+    def _kgamma_mv_into(W_indptr, W_indices, W_data,
+                        G_indptr, G_indices, G_data,
+                        x, delta, gamma, out):
+        # out = (W + δI + γ GᵀG) x
+        n = out.size
+        # out := W x
+        _csr_mv(W_indptr, W_indices, W_data, x, out)
+        # + δ x
+        if delta != 0.0:
+            for i in range(n):
+                out[i] += delta * x[i]
+        # tmp := G x
+        m = G_indptr.size - 1
+        tmp = np.empty(m, dtype=np.float64)
+        _csr_mv(G_indptr, G_indices, G_data, x, tmp)
+        # out += γ Gᵀ tmp
+        if gamma != 0.0:
+            for i in range(m):
+                ti = gamma * tmp[i]
+                rs = G_indptr[i]
+                re = G_indptr[i+1]
+                for k in range(rs, re):
+                    out[G_indices[k]] += G_data[k] * ti
+
+    # ---------- SSOR preconditioner (on W + diag) ----------
+    @njit(cache=True, fastmath=True)
+    def _ssor_apply_W_diag(W_indptr, W_indices, W_data,
+                           Kdiag, omega, sweeps,
+                           rhs, out):
+        """
+        out := M^{-1} rhs where M is SSOR(tilde K), tilde K ≈ W + diag(Kdiag).
+        Two GS sweeps per 'sweeps' (forward, then backward). In-place write to 'out'.
+        """
+        n = rhs.size
+        for i in range(n):
+            out[i] = 0.0
+
+        for _ in range(sweeps):
+            # forward
+            for i in range(n):
+                rs = W_indptr[i]; re = W_indptr[i+1]
+                sumLU = 0.0
+                for k in range(rs, re):
+                    j = W_indices[k]
+                    aij = W_data[k]
+                    if j != i:
+                        sumLU += aij * out[j]
+                out[i] = (1.0 - omega) * out[i] + omega * (rhs[i] - sumLU) / Kdiag[i]
+            # backward
+            for ii in range(n):
+                i = n - 1 - ii
+                rs = W_indptr[i]; re = W_indptr[i+1]
+                sumLU = 0.0
+                for k in range(rs, re):
+                    j = W_indices[k]
+                    aij = W_data[k]
+                    if j != i:
+                        sumLU += aij * out[j]
+                out[i] = (1.0 - omega) * out[i] + omega * (rhs[i] - sumLU) / Kdiag[i]
+
+    @njit(cache=True, fastmath=True)
+    def _cg_Kgamma_numba(W_indptr, W_indices, W_data,
+                         G_indptr, G_indices, G_data,
+                         b, x, tol, maxit,
+                         Minv_diag, use_prec,
+                         delta, gamma,
+                         use_ssor, ssor_omega, ssor_sweeps,
+                         Kdiag_full):
+        """
+        CG specialized for Kγ x = b with Kγ = W + δI + γ GᵀG (all CSR buffers).
+        - b, x are float64 arrays
+        - Minv_diag is diag(M^{-1}) for Jacobi; use_prec toggles it
+        - If use_ssor, apply SSOR on tilde K ≈ W + diag(Kdiag_full)
+        """
+        n = b.size
+        r  = np.empty(n, dtype=np.float64)
+        z  = np.empty(n, dtype=np.float64)
+        p  = np.empty(n, dtype=np.float64)
+        Ap = np.empty(n, dtype=np.float64)
+
+        # r := b - Kγ x
+        _kgamma_mv_into(W_indptr, W_indices, W_data,
+                        G_indptr, G_indices, G_data,
+                        x, delta, gamma, Ap)
+        for i in range(n):
+            r[i] = b[i] - Ap[i]
+
+        # z := M^{-1} r
+        if use_prec:
+            if use_ssor:
+                _ssor_apply_W_diag(W_indptr, W_indices, W_data, Kdiag_full, ssor_omega, ssor_sweeps, r, z)
+            else:
+                for i in range(n):
+                    z[i] = r[i] * Minv_diag[i]
+        else:
+            for i in range(n):
+                z[i] = r[i]
+
+        for i in range(n):
+            p[i] = z[i]
+
+        rz_old = 0.0
+        nrm0 = 0.0
+        for i in range(n):
+            rz_old += r[i] * z[i]
+            nrm0  += r[i] * r[i]
+        nrm0 = np.sqrt(nrm0)
+        stop = tol * nrm0
+        if nrm0 <= stop:
+            return 0
+
+        for it in range(1, maxit + 1):
+            _kgamma_mv_into(W_indptr, W_indices, W_data,
+                            G_indptr, G_indices, G_data,
+                            p, delta, gamma, Ap)
+            pAp = 0.0
+            for i in range(n):
+                pAp += p[i] * Ap[i]
+            if pAp <= 0.0:
+                return it - 1
+
+            alpha = rz_old / pAp
+            nr = 0.0
+            for i in range(n):
+                x[i]  = x[i]  + alpha * p[i]
+                r[i]  = r[i]  - alpha * Ap[i]
+                nr   += r[i]  * r[i]
+            nr = np.sqrt(nr)
+            if nr <= stop:
+                return it
+
+            if use_prec:
+                if use_ssor:
+                    _ssor_apply_W_diag(W_indptr, W_indices, W_data, Kdiag_full, ssor_omega, ssor_sweeps, r, z)
+                else:
+                    for i in range(n):
+                        z[i] = r[i] * Minv_diag[i]
+            else:
+                for i in range(n):
+                    z[i] = r[i]
+
+            rz_new = 0.0
+            for i in range(n):
+                rz_new += r[i] * z[i]
+            beta = rz_new / rz_old
+            rz_old = rz_new
+
+            for i in range(n):
+                p[i] = z[i] + beta * p[i]
+        return maxit
+
+
+# ------------------------------------------------------------------------------
+# Hutchinson diag(K^{-1}) via a matrix-free inner solve
+# ------------------------------------------------------------------------------
+def hutch_diag_Kinv_via_inner(inner_solve, n: int, probes: int = 8, clip: float = 1e-12, seed: int = 12345):
+    """
+    Estimate diag(K^{-1}) ≈ E[(K^{-1} z) ⊙ z], z in {±1}^n
+    Uses provided `inner_solve(rhs) -> x` (e.g., numba K-CG).
+    """
+    if probes <= 0:
+        return None
+    rng = np.random.default_rng(seed)
+    acc = np.zeros(n, dtype=float)
+    # Running variance (kept for potential future adaptive stopping)
+    mean = np.zeros(n, dtype=float)
+    m2   = np.zeros(n, dtype=float)
+    for t in range(1, probes + 1):
+        z = rng.integers(0, 2, size=n, dtype=np.int8).astype(float)
+        z[z == 0] = -1.0
+        v = inner_solve(z)
+        s = v * z
+        acc += s
+        # Welford update
+        delta = s - mean
+        mean += delta / t
+        m2   += delta * (s - mean)
+    d = acc / float(probes)
+    d[~np.isfinite(d)] = clip
+    return np.maximum(d, clip)
+
+
+# ------------------------------------------------------------------------------
+# HYKKT Strategy (expects KKTStrategy, KKTReusable to be defined elsewhere)
+# ------------------------------------------------------------------------------
 class HYKKTStrategy(KKTStrategy):
     """
     HYKKT Schur strategy (fast version):
       • CHOLMOD path with sticky exact Schur for small m
-      • Matrix-free CG path for K_gamma using Numba CSR kernels
+      • Matrix-free CG path for K_gamma using Numba CSR kernels + SSOR option
       • Improved Schur preconditioning via Hutchinson-refined Jacobi
       • Adaptive gamma control and inexact-Newton forcing for CG
       • Aggressive reuse of factorizations & preconditioners
-
-    Extra Tunables (kw in addition to previous):
-      - adaptive_gamma: bool (default True)
-      - target_cg: int (default: min(50, max(10, m//5)))   # desired Schur-CG iters
-      - gamma_bounds: (gmin, gmax) (default (1e-3, 1e6))
-      - gamma_increase: float (default 3.0)                # factor when CG is slow
-      - gamma_decrease: float (default 0.5)                # factor when CG is very fast
-      - mu: float or None (default None)                   # barrier/merit; enables forcing
-      - phase: str in {"early","mid","late"} or None       # coarse forcing hint
-      - hutch_probes: int (default 0 => disabled; try 8–16)
-      - hutch_clip: float (default 1e-12)                  # avoid tiny/neg diagonals
-      - sticky_schur: bool (default True)
-      - schur_reuse_tol: float (default 0.0)               # if >0, allow γ drift w/out rebuilding S
-      - save_cg_stats: bool (default False)                # export stats to cache
     """
     name = "hykkt"
 
     def __init__(self, cholmod_loader: Optional[Callable[[], Any]] = None):
         self._cholmod_loader = cholmod_loader
         # Cache
-        self._cache_key = None          # (pattern_key, delta, gamma)
+        self._cache_key = None
         self._cholK = None
         self._cholS = None
         self._S_explicit = None
@@ -254,41 +454,9 @@ class HYKKTStrategy(KKTStrategy):
         return np.array((G.multiply(G)).sum(axis=0)).ravel().astype(float)
 
     @staticmethod
-    def _matfree_Kgam_mv_python(W: sp.csr_matrix, G: sp.csr_matrix, x: np.ndarray, delta: float, gamma: float) -> np.ndarray:
-        return (W @ x) + delta * x + gamma * (G.T @ (G @ x))
-
-    @staticmethod
-    def _make_numba_K_mv(W: sp.csr_matrix, G: sp.csr_matrix, delta: float, gamma: float):
-        if _HAS_NUMBA:
-            W_csr = W.tocsr() if not sp.isspmatrix_csr(W) else W
-            G_csr = G.tocsr() if not sp.isspmatrix_csr(G) else G
-
-            W_indptr = np.asarray(W_csr.indptr, dtype=np.int64)
-            W_indices = np.asarray(W_csr.indices, dtype=np.int64)
-            W_data = np.asarray(W_csr.data, dtype=np.float64)
-
-            G_indptr = np.asarray(G_csr.indptr, dtype=np.int64)
-            G_indices = np.asarray(G_csr.indices, dtype=np.int64)
-            G_data = np.asarray(G_csr.data, dtype=np.float64)
-
-            n = W_csr.shape[0]
-
-            def mv(x: np.ndarray) -> np.ndarray:
-                x64 = np.asarray(x, dtype=np.float64)
-                return _kgamma_mv_numba(W_indptr, W_indices, W_data,
-                                        G_indptr, G_indices, G_data,
-                                        x64, float(delta), float(gamma), int(n))
-            return mv
-        else:
-            def mv(x: np.ndarray) -> np.ndarray:
-                return HYKKTStrategy._matfree_Kgam_mv_python(W, G, x, delta, gamma)
-            return mv
-
-    @staticmethod
     def _forcing_tol(base_tol: float, mu: Optional[float], phase: Optional[str]) -> float:
         # Inexact-Newton forcing (looser early, tighter late)
         if mu is not None:
-            # classic: eta ~ min(0.5, sqrt(mu)) scaled onto base_tol
             return max(base_tol, min(0.5, math.sqrt(max(mu, 0.0))) * base_tol)
         if phase == "early":
             return max(base_tol, 1e-2)
@@ -309,7 +477,7 @@ class HYKKTStrategy(KKTStrategy):
         if probes <= 0 or cholK is None:
             return None
         acc = np.zeros(n, dtype=float)
-        rng = np.random.default_rng(12345)  # deterministic; you may move to cache RNG
+        rng = np.random.default_rng(12345)
         for _ in range(probes):
             z = rng.integers(0, 2, size=n, dtype=np.int8).astype(float)
             z[z == 0] = -1.0
@@ -324,7 +492,6 @@ class HYKKTStrategy(KKTStrategy):
         if cg_iters is None:
             return gamma
         gmin, gmax = bounds
-        # If Schur-CG too slow, increase gamma; if extremely fast, decrease
         if cg_iters > max(10, target):
             gamma = min(gamma * inc, gmax)
         elif cg_iters < max(5, target // 2):
@@ -387,16 +554,14 @@ class HYKKTStrategy(KKTStrategy):
 
         # Try CHOLMOD
         cholmod = None
-        if cholmod_factor:
-            try:
-                cholmod = self._cholmod_loader() if self._cholmod_loader else __import__("sksparse.cholmod", fromlist=["cholmod"])
-            except Exception:
-                cholmod = None
+        # if cholmod_factor:
+        #     try:
+        #         cholmod = self._cholmod_loader() if self._cholmod_loader else __import__("sksparse.cholmod", fromlist=["cholmod"])
+        #     except Exception:
+        #         cholmod = None
 
         # --- PATH A: CHOLMOD factorization of K_gamma (+ optional exact Schur) ---
         if cholmod is not None:
-            need_refactor = (self._cholK is None) or (pattern_key != self._last_K_pattern) or (abs((self._last_delta or 0.0) - delta) > 0.0) or (not sticky_schur and (self._last_gamma is None or self._last_gamma != gamma))
-            # If sticky_schur is True, allow small γ drift without rebuilding Schur; rebuild K if γ changed
             if (self._cholK is None) or (K_key != self._cache_key):
                 # K = W + delta*I + gamma * (G^T @ G)
                 K = W.copy().tocsr()
@@ -411,7 +576,7 @@ class HYKKTStrategy(KKTStrategy):
                 self._last_K_pattern = pattern_key
                 self._last_delta = delta
                 self._last_gamma = gamma
-                # Reset Schur cache (we’ll decide below whether to rebuild)
+                # Reset Schur cache if not sticky
                 if not sticky_schur:
                     self._cholS = None
                     self._S_explicit = None
@@ -436,7 +601,6 @@ class HYKKTStrategy(KKTStrategy):
                 elif not sticky_schur:
                     need_S_build = True
                 elif sticky_schur and schur_reuse_tol > 0.0:
-                    # reuse S if gamma hasn't moved too much (heuristic)
                     g_rel = abs((gamma - (self._last_gamma or gamma)) / max(1.0, abs(gamma)))
                     need_S_build = (g_rel > schur_reuse_tol)
             if use_exact_S and need_S_build:
@@ -454,7 +618,6 @@ class HYKKTStrategy(KKTStrategy):
                 cg_iters = 0
             else:
                 # Schur CG with improved Jacobi precond
-                # Base diag approx from K-diag:
                 diagK = np.maximum(K_diag, 1e-12)
                 inv_diagK = 1.0 / diagK
 
@@ -463,28 +626,28 @@ class HYKKTStrategy(KKTStrategy):
                 if hutch_probes > 0:
                     diag_Kinv = self._hutch_diag_Kinv(cholK, n, hutch_probes, hutch_clip)
                 if diag_Kinv is None:
-                    diag_Kinv = inv_diagK  # fall back
+                    diag_Kinv = inv_diagK  # fallback
 
                 # diag( S ) ≈ (G.^2) @ diag(K^{-1})
                 Sdiag_hat = np.asarray((G.multiply(G)).dot(diag_Kinv), dtype=float).ravel()
                 Sinv_diag = 1.0 / np.maximum(Sdiag_hat, 1e-12) if jacobi_schur_prec else None
-                M = spla.LinearOperator((m, m), matvec=lambda z: Sinv_diag * z) if jacobi_schur_prec else None
+                M = _make_diag_prec(Sinv_diag, m) if jacobi_schur_prec else None
 
                 def S_mv(y: np.ndarray) -> np.ndarray:
                     return G @ cholK.solve_A(G.T @ y)
 
                 # Forcing strategy on Schur tolerance
                 schur_tol = self._forcing_tol(cg_tol, mu, phase)
-
                 x0 = cache.prev_dy if cache.prev_dy is not None else None
-                dy, cg_info = _cg_matfree(S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M)
-                cg_iters = int(getattr(cg_info, "iters", getattr(cg_info, "niter", 0)) or 0)
+
+                # Python CG here (cholK.solve_A is a Python method)
+                dy, cg_iters = _cg_matfree_py(S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M)
                 dx = cholK.solve_A(svec - (G.T @ dy))
 
             # Adaptive gamma update (for next call)
             if adaptive_gamma:
                 new_gamma = self._adapt_gamma(gamma, cg_iters, target_cg, gamma_bounds, gamma_increase, gamma_decrease)
-                self._last_gamma = new_gamma  # used as hint next time
+                self._last_gamma = new_gamma  # hint next time
 
             # Save stats and warm-starts
             if save_cg_stats:
@@ -513,58 +676,75 @@ class HYKKTStrategy(KKTStrategy):
                         svec_n = r1n + self.gamma * (self.G.T @ r2n)
                         rhs_s_n = (self.G @ self.cholK.solve_A(svec_n)) - r2n
                         def S_mv_n(y): return self.G @ self.cholK.solve_A(self.G.T @ y)
-                        M_n = None if self.Sinv_diag is None else spla.LinearOperator((self.G.shape[0], self.G.shape[0]), matvec=lambda z: self.Sinv_diag * z)
-                        dyn, _ = _cg_matfree(S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n)
+                        M_n = _make_diag_prec(self.Sinv_diag, self.G.shape[0]) if self.Sinv_diag is not None else None
+                        dyn, _ = _cg_matfree_py(S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n)
                         dxn = self.cholK.solve_A(svec_n - (self.G.T @ dyn))
                         return dxn, dyn
                 return dx, dy, _Reusable(cholK, G, gamma, Sinv_diag if jacobi_schur_prec else None)
 
         # --- PATH B: Matrix-free CG for K_gamma (Numba-accelerated) -----
-        # Jacobi preconditioner for K_gamma
-        diagW = np.array(W.diagonal(), dtype=float)
+        # Build Kγ diag and its inverse
+        diagW   = np.asarray(W.diagonal(), dtype=np.float64)
         diagGtG = self._diag_of_GtG(G)
-        Kdiag = np.maximum(diagW + delta + gamma * diagGtG, 1e-12)
+        Kdiag   = np.maximum(diagW + delta + gamma * diagGtG, 1e-12)
+        Minv_diag = 1.0 / Kdiag
+        use_prec  = True
 
-        # Optional ILU preconditioner (explicit K), cached on pattern
-        M_K = spla.LinearOperator((n, n), matvec=lambda z: z / Kdiag)
-        if use_ilu_prec:
-            ilu_key = (pattern_key, )
-            if self._ilu is None or self._ilu_key != ilu_key:
-                try:
-                    K_exp = (W + delta * sp.eye(n, format="csr") + gamma * (G.T @ G).tocsr()).tocsc()
-                    self._ilu = spla.spilu(K_exp, drop_tol=ilu_drop_tol, fill_factor=ilu_fill)
-                    self._ilu_key = ilu_key
-                except Exception:
-                    self._ilu = None
-                    self._ilu_key = None
-            if self._ilu is not None:
-                ilu = self._ilu
-                M_K = spla.LinearOperator((n, n), matvec=lambda z: ilu.solve(z))
+        # SSOR knobs
+        use_ssor    = bool(kw.get("kgamma_use_ssor", True))
+        ssor_omega  = float(kw.get("kgamma_ssor_omega", 1.4))  # 1.2–1.6 often good
+        ssor_sweeps = int(kw.get("kgamma_ssor_sweeps", 1))     # 1 sweep default
 
-        # Numba-powered K_gamma matvec
-        K_mv = self._make_numba_K_mv(W, G, delta, gamma)
+        # Prepare CSR arrays for Numba
+        W_csr = W.tocsr()
+        G_csr = G.tocsr()
+        W_indptr = W_csr.indptr.astype(np.int64); W_indices = W_csr.indices.astype(np.int64); W_data = W_csr.data.astype(np.float64)
+        G_indptr = G_csr.indptr.astype(np.int64); G_indices = G_csr.indices.astype(np.int64); G_data = G_csr.data.astype(np.float64)
 
-        # Forcing on inner K-solve tolerance (easier than 10x cg strategy)
-        inner_tol = self._forcing_tol(max(1e-2 * cg_tol, 1e-12), mu, phase)
+        # Forcing on inner K-solve tolerance
+        inner_tol   = self._forcing_tol(max(1e-2 * cg_tol, 1e-12), mu, phase)
         inner_maxit = max(10 * cg_maxit, 200)
 
         def inner_solve(q: np.ndarray) -> np.ndarray:
-            x, _ = _cg_matfree(K_mv, q, x0=None, tol=inner_tol, maxit=inner_maxit, M=M_K)
-            return x
+            q = np.asarray(q, dtype=np.float64)
+            x = np.zeros_like(q, dtype=np.float64)
+            if _HAS_NUMBA:
+                _ = _cg_Kgamma_numba(W_indptr, W_indices, W_data,
+                                     G_indptr, G_indices, G_data,
+                                     q, x,
+                                     float(inner_tol), int(inner_maxit),
+                                     Minv_diag, use_prec,
+                                     float(delta), float(gamma),
+                                     use_ssor, ssor_omega, ssor_sweeps,
+                                     Kdiag)
+                return x
+            else:
+                # Fallback to Python CG if Numba unavailable
+                def K_mv_py(v): return (W @ v) + delta * v + gamma * (G.T @ (G @ v))
+                M_K_py  = _make_diag_prec(Minv_diag, n)
+                x_py, _ = _cg_matfree_py(K_mv_py, q, x0=None, tol=inner_tol, maxit=inner_maxit, M=M_K_py)
+                return x_py
 
         # Schur operator & rhs
         svec = r1 + gamma * (G.T @ r2)
         rhs_s = (G @ inner_solve(svec)) - r2
 
-        # Cheap Jacobi preconditioner for Schur: diag(Ŝ) = (G.^2) @ (1/Kdiag)
-        M_S = None
+        # Jacobi preconditioner for Schur: diag(Ŝ) using Hutchinson-refined diag(K^{-1})
         if jacobi_schur_prec:
-            Sinv_diag = 1.0 / np.maximum(
-                np.asarray((G.multiply(G)).dot(1.0 / Kdiag), dtype=float).ravel(), 1e-12
+            diag_Kinv = hutch_diag_Kinv_via_inner(
+                inner_solve, n,
+                probes=max(0, hutch_probes),
+                clip=hutch_clip,
+                seed=kw.get("hutch_seed", 12345),
             )
-            M_S = spla.LinearOperator((m, m), matvec=lambda z: Sinv_diag * z)
+            if diag_Kinv is None:
+                diag_Kinv = 1.0 / Kdiag  # fallback
+            Sdiag_hat = np.asarray((G.multiply(G)).dot(diag_Kinv), dtype=float).ravel()
+            Sinv_diag = 1.0 / np.maximum(Sdiag_hat, 1e-12)
+            M_S = _make_diag_prec(Sinv_diag, m)
         else:
             Sinv_diag = None
+            M_S = None
 
         # Forcing on Schur tolerance
         schur_tol = self._forcing_tol(cg_tol, mu, phase)
@@ -573,11 +753,11 @@ class HYKKTStrategy(KKTStrategy):
         def S_mv(y: np.ndarray) -> np.ndarray:
             return G @ inner_solve(G.T @ y)
 
-        dy, cg_info = _cg_matfree(S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M_S)
-        cg_iters = int(getattr(cg_info, "iters", getattr(cg_info, "niter", 0)) or 0)
+        # Outer Schur CG in Python (kept as-is)
+        dy, cg_iters = _cg_matfree_py(S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M_S)
         dx = inner_solve(svec - (G.T @ dy))
 
-        # Adaptive gamma update (for next calls through CHOL path too)
+        # Adaptive gamma update (for next calls)
         if adaptive_gamma:
             new_gamma = self._adapt_gamma(gamma, cg_iters, target_cg, gamma_bounds, gamma_increase, gamma_decrease)
             self._last_gamma = new_gamma
@@ -595,8 +775,8 @@ class HYKKTStrategy(KKTStrategy):
                 svec_n = r1n + self.gamma * (self.G.T @ r2n)
                 rhs_s_n = (self.G @ self.inner_solve(svec_n)) - r2n
                 def S_mv_n(y): return self.G @ self.inner_solve(self.G.T @ y)
-                M_n = None if self.Sinv_diag is None else spla.LinearOperator((self.G.shape[0], self.G.shape[0]), matvec=lambda z: self.Sinv_diag * z)
-                dyn, _ = _cg_matfree(S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n)
+                M_n = _make_diag_prec(self.Sinv_diag, self.G.shape[0]) if self.Sinv_diag is not None else None
+                dyn, _ = _cg_matfree_py(S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n)
                 dxn = self.inner_solve(svec_n - (self.G.T @ dyn))
                 return dxn, dyn
 

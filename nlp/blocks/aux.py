@@ -79,11 +79,8 @@ class SQPConfig:
     use_funnel: bool = False
     use_watchdog: bool = False
     use_nonmonotone_ls: bool = False
-    use_active_set_prediction: bool = False
     hessian_mode: str = "exact"  # {"exact","bfgs","lbfgs","hybrid","gn"}
     
-    tr_delta0: float = 0.1
-
     # ---------------- Tolerances ----------------
     tol_feas: float = 1e-5
     tol_stat: float = 1e-5
@@ -144,6 +141,48 @@ class SQPConfig:
     funnel_min_tau: float = 1e-8
     funnel_max_history: int = 100
 
+    delta0: float = 1.0  # initial TR radius
+    delta_min: float = 1e-12
+    delta_max: float = 1e6
+    eta1: float = 0.1  # accept threshold
+    eta2: float = 0.9  # expand threshold
+    gamma1: float = 0.5  # shrink factor
+    gamma2: float = 2.0  # expand factor
+    # Byrd-Omojokun split
+    zeta: float = 0.8  # fraction of radius for normal step
+    # Solver tolerances
+    cg_tol: float = 1e-12
+    cg_tol_rel: float = 0.1  # relative tolerance factor
+    cg_maxiter: int = 200
+    neg_curv_tol: float = 1e-14
+    constraint_tol: float = 1e-10
+    max_active_set_iter: int = 100  # max iterations for active-set loop
+    # Adaptive features
+    adaptive_zeta: bool = True
+    curvature_aware: bool = True
+    feasibility_emphasis: bool = True
+    # Numerical stability
+    rcond: float = 1e-12
+    reg_floor: float = 1e-10
+    reg_max: float = 1e6
+    # Caching / preconditioning
+    cache_nullspace: bool = True
+    use_prec: bool = True
+    prec_kind: str = "auto_jacobi"  # options: "auto_jacobi", "none"
+    # Criticality step & safeguard
+    criticality_enabled: bool = True
+    kappa_g: float = 1e-2  # projected-grad threshold factor
+    theta_crit: float = 0.5  # radius shrink factor on criticality
+    max_crit_shrinks: int = 1  # at most this many back-to-back shrinks
+
+    # -------- NEW: TR geometry --------
+    norm_type: str = "2"       # {"2", "ellip"}
+    metric_shift: float = 1e-8 # small ridge to make M ≻ 0 when built from H
+    tau_ftb: float = 0.995  # fraction-to-boundary safety factor for box feasibility
+    history_length: int = 10  # for adaptive strategies
+    non_monotone: bool = False  # use non-monotone TR radius update
+    non_monotone_window: int = 5  # window size for non-monotone updates
+    max_iter: int = 100  # max TR iterations (for safety)
 
 # ======================================
 # Small helpers
@@ -307,16 +346,16 @@ class Model:
         haveI = mI > 0
         if "cI" in want_set:
             if haveI:
-                try:
-                    # Preallocate once; cheap loop (callable AD is Python-bound anyway)
-                    cI = np.empty(mI, dtype=float)
-                    for i, ci in enumerate(cI_funcs):
-                        cI[i] = float(ci(x))
-                    if not np.isfinite(cI).all():
-                        cI = np.zeros(mI, dtype=float)
-                    res["cI"] = cI
-                except Exception:
-                    res["cI"] = np.zeros(mI, dtype=float)
+               # try:
+                # Preallocate once; cheap loop (callable AD is Python-bound anyway)
+                cI = np.empty(mI, dtype=float)
+                for i, ci in enumerate(cI_funcs):
+                    cI[i] = float(ci(x))
+                if not np.isfinite(cI).all():
+                    cI = np.zeros(mI, dtype=float)
+                res["cI"] = cI
+                #except Exception:
+                #    res["cI"] = np.zeros(mI, dtype=float)
             else:
                 res["cI"] = None
 

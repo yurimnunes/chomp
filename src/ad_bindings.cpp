@@ -130,6 +130,21 @@ static py::object unary_dispatch(py::object x, Operator op) {
 }
 
 // ========= pow helpers =========
+// ========= pow helpers (fixed) =========
+
+// Robust integer test (relative)
+static inline bool _is_effectively_int(double p, double &pr_out) {
+    double pr = std::round(p);
+    // relative tolerance; handles large |p|
+    if (std::isfinite(pr) && std::fabs(p - pr) <= 1e-12 * std::max(1.0, std::fabs(p))) {
+        pr_out = pr;
+        return true;
+    }
+    return false;
+}
+
+// Build x^e for integer e using exponentiation-by-squaring.
+// Handles e < 0 by returning 1 / (x^|e|).
 static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base, long long e) {
     if (e == 0) {
         auto one = std::make_shared<ADNode>();
@@ -160,12 +175,20 @@ static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base, long long
         }
         return have_result ? result : base;
     };
+
     if (e > 0) return pow_pos(e);
+
+    // e < 0 : 1 / (x^|e|)
+    // If base is a known zero constant, 0^negative is undefined → throw.
+    if (base->type == Operator::cte && base->value == 0.0) {
+        throw std::domain_error("x**p: base == 0 and integer exponent p < 0 is undefined.");
+    }
     auto num = std::make_shared<ADNode>();
     num->type = Operator::cte;
     num->value = 1.0;
     g->addNode(num);
     auto den = pow_pos(-e);
+
     auto div = std::make_shared<ADNode>();
     div->type = Operator::Divide;
     div->addInput(num);
@@ -173,18 +196,40 @@ static ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base, long long
     g->addNode(div);
     return div;
 }
+
+// x**p : x is Expression/Variable/number; p is double scalar exponent.
+// - Integer p → powi_node (supports negative integers).
+// - Non-integer p → exp(p * log(x)).
+// Notes:
+//   • If p is non-integer and base is a known constant ≤ 0, we throw (real domain).
+//   • We reuse the input graph if x is an Expression; otherwise we create a new one.
 static std::shared_ptr<Expression> expr_pow_any(py::object x, double p) {
-    ADGraphPtr g = std::make_shared<ADGraph>();
-    auto ex = as_expression(x, g);
+    // Reuse graph when possible
+    ADGraphPtr g;
+    std::shared_ptr<Expression> ex;
+
+    if (py::isinstance<Expression>(x)) {
+        ex = x.cast<std::shared_ptr<Expression>>();
+        g = ex->graph ? ex->graph : std::make_shared<ADGraph>();
+    } else {
+        g = std::make_shared<ADGraph>();
+        ex = as_expression(x, g);
+    }
     if (ex->node) g->adoptSubgraph(ex->node);
 
-    double pr = std::round(p);
-    bool is_int = std::fabs(p - pr) < 1e-12 && std::isfinite(pr);
-    if (is_int) {
-        long long e = static_cast<long long>(pr);
+    // Integer path (relative-tolerant)
+    double pr = 0.0;
+    if (_is_effectively_int(p, pr)) {
         auto out = std::make_shared<Expression>(g);
-        out->node = powi_node(g, ex->node, e);
+        out->node = powi_node(g, ex->node, static_cast<long long>(pr));
         return out;
+    }
+
+    // Non-integer path: exp(p * log(x))  — real domain requires x > 0
+    if (ex->node && ex->node->type == Operator::cte) {
+        if (ex->node->value <= 0.0) {
+            throw std::domain_error("x**p with non-integer p requires base > 0 in the reals.");
+        }
     }
     auto e_log = std::make_shared<Expression>(g);
     e_log->node->type = Operator::Log;
@@ -203,6 +248,10 @@ static std::shared_ptr<Expression> expr_pow_any(py::object x, double p) {
     g->addNode(e_exp->node);
     return e_exp;
 }
+
+// s**x : scalar base to Expression exponent.
+// We require s > 0 for real-domain semantics.
+// Maps to exp( log(s) * x ).
 static std::shared_ptr<Expression> scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
     if (s <= 0.0) throw std::domain_error("scalar ** Expression requires base > 0");
     ADGraphPtr g = x->graph ? x->graph : std::make_shared<ADGraph>();

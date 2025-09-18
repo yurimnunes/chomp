@@ -52,8 +52,8 @@ _CFG_DEFAULTS: Dict[str, object] = dict(
     ip_eq_reg=1e-4,
     # shifted barrier
     ip_use_shifted_barrier=True,
-    ip_shift_tau=0.9,
-    ip_shift_bounds=1e-3,
+    ip_shift_tau=0.5,
+    ip_shift_bounds=0.5,
     ip_shift_adaptive=True,
     # barrier & PC
     ip_mu_init=1e-2,
@@ -98,7 +98,7 @@ _CFG_DEFAULTS: Dict[str, object] = dict(
     ip_ho_blend=0.3,
     ip_ho_rel_cap=0.5,
     # Gondzio MC
-    ip_gondzio_mc=True,
+    ip_gondzio_mc=False,
     ip_gondzio_iters=3,
     ip_gondzio_blend=0.4,
     ip_mc_alpha_thresh=0.8,
@@ -633,6 +633,7 @@ class InteriorPointStepper:
             )
 
         # --- Hessian + PSD regularization
+        print(self.hess.get_hessian(model, x, lmb, nuv))
         H = model.lagrangian_hessian(x, lmb, nuv) if cfg.ip_exact_hessian else self.hess.get_hessian(model, x, lmb, nuv)
         H, _ = make_psd_advanced(H, self.reg, it)
 
