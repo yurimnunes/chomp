@@ -1,280 +1,128 @@
 import re
-from typing import Dict, List, Any, Tuple
-import numpy as np
+from pprint import pprint
 
 class APMParser:
-    def __init__(self):
-        self.model_name = ""
-        self.variables = []
-        self.objective = ""
-        self.constraints = []
-        self.bounds = {}
-        
-    def parse(self, apm_content: str) -> Dict[str, Any]:
+    """
+    Uma classe para analisar (parse) arquivos de otimização no formato .apm
+    e extrair informações do modelo em um dicionário estruturado.
+    """
+
+    def parse(self, apm_content: str) -> dict:
         """
-        Parse APM content and return problem definition
-        
+        Analisa o conteúdo de uma string no formato .apm.
+
         Args:
-            apm_content: String content of APM file
-            
+            apm_content: Uma string contendo o modelo APM.
+
         Returns:
-            Dictionary with problem definition compatible with your professor's solver
+            Um dicionário com as informações extraídas do modelo,
+            contendo as chaves: 'name', 'variables', 'equations', 'obj', 'best'.
         """
-        lines = apm_content.split('\n')
-        in_variables = False
-        in_equations = False
-        
-        for line in lines:
-            line = line.strip()
-            
-            # Skip empty lines and comments
-            if not line or line.startswith('!'):
-                continue
-                
-            # Check for model name
-            if line.lower().startswith('model'):
-                self.model_name = line.split()[1]
-                continue
-                
-            # Check section boundaries
-            if line.lower().startswith('variables'):
-                in_variables = True
-                in_equations = False
-                continue
-            elif line.lower().startswith('equations'):
-                in_variables = False
-                in_equations = True
-                continue
-            elif line.lower().startswith('end variables'):
-                in_variables = False
-                continue
-            elif line.lower().startswith('end equations'):
-                in_equations = False
-                continue
-            elif line.lower().startswith('end model'):
-                break
-                
-            # Process content based on section
-            if in_variables:
-                self._parse_variable_line(line)
-            elif in_equations:
-                self._parse_equation_line(line)
-                
-        return self._build_problem()
-    
-    def _parse_variable_line(self, line: str):
-        """
-        Parse a variable definition line
-        Examples:
-          x[1] = 1.125, >= 1
-          x[2] = 0.125, >= 0
-          obj
-        """
-        # Check if it's just a declaration without value
-        if '=' not in line:
-            var_name = line.strip()
-            self.variables.append({'name': var_name, 'value': 0.0, 'bounds': (None, None)})
-            return
-            
-        # Split variable name and the rest
-        parts = line.split('=', 1)
-        var_name = parts[0].strip()
-        
-        # Extract value and constraints
-        value_part = parts[1].strip()
-        value = 0.0
-        bounds = (None, None)
-        
-        # Extract numerical value if present
-        value_match = re.search(r'[-+]?\d*\.?\d+', value_part)
-        if value_match:
-            value = float(value_match.group())
-            
-        # Extract bounds
-        if '>=' in value_part:
-            match = re.search(r'>=\s*([-+]?\d*\.?\d+)', value_part)
-            if match:
-                bounds = (float(match.group(1)), bounds[1])
-        if '<=' in value_part:
-            match = re.search(r'<=\s*([-+]?\d*\.?\d+)', value_part)
-            if match:
-                bounds = (bounds[0], float(match.group(1)))
-        if '>' in value_part and '>=' not in value_part:
-            match = re.search(r'>\s*([-+]?\d*\.?\d+)', value_part)
-            if match:
-                bounds = (float(match.group(1)) + 1e-10, bounds[1])  # Add small epsilon for strict inequality
-        if '<' in value_part and '<=' not in value_part:
-            match = re.search(r'<\s*([-+]?\d*\.?\d+)', value_part)
-            if match:
-                bounds = (bounds[0], float(match.group(1)) - 1e-10)  # Subtract small epsilon for strict inequality
-                
-        self.variables.append({'name': var_name, 'value': value, 'bounds': bounds})
-        
-    def _parse_equation_line(self, line: str):
-        """
-        Parse an equation line
-        Examples:
-          obj = (x[1]+1)^3/3 + x[2]
-          x[1] + x[2]^2 >= 0
-        """
-        # Remove comments
-        line = re.sub(r'!.*', '', line).strip()
-        if not line:
-            return
-            
-        # Check if it's the objective function
-        if line.startswith('obj ='):
-            self.objective = line.split('=', 1)[1].strip()
-        else:
-            # It's a constraint
-            self.constraints.append(line)
-            
-    def _build_problem(self) -> Dict[str, Any]:
-        """
-        Build problem definition compatible with your professor's solver
-        """
-        # Filter out the objective variable from the variables list
-        decision_vars = [var for var in self.variables if var['name'] != 'obj']
-        
-        # Extract initial values and bounds
-        x0 = np.array([var['value'] for var in decision_vars])
-        bounds = [var['bounds'] for var in decision_vars]
-        
-        # Create variable mapping for expression parsing
-        var_map = {}
-        for i, var in enumerate(decision_vars):
-            var_map[var['name']] = i
-            
-        # Create objective function
-        def objective_func(x):
-            expr = self.objective
-            for var_name, idx in var_map.items():
-                expr = expr.replace(var_name, f'x[{idx}]')
-            # Replace APM operators with Python operators
-            expr = expr.replace('^', '**')
-            return eval(expr)
-            
-        # Create constraint functions
-        inequality_constraints = []
-        equality_constraints = []
-        
-        for constraint in self.constraints:
-            if '<=' in constraint:
-                parts = constraint.split('<=')
-                lhs = parts[0].strip()
-                rhs = parts[1].strip()
-                
-                def ineq_constr(x, l=lhs, r=rhs):
-                    # Replace variables in expression
-                    expr = l
-                    for var_name, idx in var_map.items():
-                        expr = expr.replace(var_name, f'x[{idx}]')
-                    expr = expr.replace('^', '**')
-                    lhs_val = eval(expr)
-                    
-                    # Evaluate right hand side
-                    expr = r
-                    for var_name, idx in var_map.items():
-                        expr = expr.replace(var_name, f'x[{idx}]')
-                    expr = expr.replace('^', '**')
-                    rhs_val = eval(expr)
-                    
-                    return lhs_val - rhs_val  # Convert to g(x) <= 0 form
-                    
-                inequality_constraints.append(ineq_constr)
-                
-            elif '>=' in constraint:
-                parts = constraint.split('>=')
-                lhs = parts[0].strip()
-                rhs = parts[1].strip()
-                
-                def ineq_constr(x, l=lhs, r=rhs):
-                    # Replace variables in expression
-                    expr = l
-                    for var_name, idx in var_map.items():
-                        expr = expr.replace(var_name, f'x[{idx}]')
-                    expr = expr.replace('^', '**')
-                    lhs_val = eval(expr)
-                    
-                    # Evaluate right hand side
-                    expr = r
-                    for var_name, idx in var_map.items():
-                        expr = expr.replace(var_name, f'x[{idx}]')
-                    expr = expr.replace('^', '**')
-                    rhs_val = eval(expr)
-                    
-                    return rhs_val - lhs_val  # Convert to g(x) <= 0 form
-                    
-                inequality_constraints.append(ineq_constr)
-                
-            elif '=' in constraint and not constraint.startswith('obj'):
-                parts = constraint.split('=')
-                lhs = parts[0].strip()
-                rhs = parts[1].strip()
-                
-                def eq_constr(x, l=lhs, r=rhs):
-                    # Replace variables in expression
-                    expr = l
-                    for var_name, idx in var_map.items():
-                        expr = expr.replace(var_name, f'x[{idx}]')
-                    expr = expr.replace('^', '**')
-                    lhs_val = eval(expr)
-                    
-                    # Evaluate right hand side
-                    expr = r
-                    for var_name, idx in var_map.items():
-                        expr = expr.replace(var_name, f'x[{idx}]')
-                    expr = expr.replace('^', '**')
-                    rhs_val = eval(expr)
-                    
-                    return lhs_val - rhs_val  # Convert to h(x) = 0 form
-                    
-                equality_constraints.append(eq_constr)
-                
-        return {
-            'x0': x0,
-            'f': objective_func,
-            'c_ineq': inequality_constraints,
-            'c_eq': equality_constraints,
-            'bounds': bounds
+        model_info = {
+            'name': None,
+            'variables': {},
+            'equations': [],
+            'obj': None,
+            'best': None
         }
+        current_section = None
+
+        for line in apm_content.strip().split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            line_lower = line.lower()
+
+            if line_lower.startswith('model'):
+                model_info['name'] = line.split()[1]
+            elif line_lower.startswith('variables'):
+                current_section = 'variables'
+            elif line_lower.startswith('equations'):
+                current_section = 'equations'
+            elif line_lower.startswith(('end variables', 'end equations', 'end model')):
+                current_section = None
+            elif current_section == 'variables':
+                self._parse_variable_line(line, model_info)
+            elif current_section == 'equations':
+                self._parse_equation_line(line, model_info)
+
+        return model_info
+
+    def _parse_variable_line(self, line: str, model_info: dict):
+        """Método auxiliar para analisar uma linha da seção de variáveis."""
+        
+        # --- ALTERAÇÃO AQUI ---
+        # Ignora a linha de declaração 'obj', pois não é uma variável de decisão.
+        if line.lower() == 'obj':
+            return
+        
+        match = re.match(r'(\w+)\[(\d+)\]', line)
+        if not match:
+            return # Ignora outras linhas malformadas ou sem índice
+
+        base_name = match.group(1)
+        index = int(match.group(2))
+
+        initial_value = None
+        lower_bound = None
+        upper_bound = None
+        
+        parts = line.split('=', 1)
+        if len(parts) > 1:
+            value_parts = [p.strip() for p in parts[1].split(',')]
+            if value_parts[0]:
+                initial_value = float(value_parts[0])
+            for part in value_parts[1:]:
+                if '<=' in part:
+                    upper_bound = float(part.replace('<=', '').strip())
+                elif '>=' in part:
+                    lower_bound = float(part.replace('>=', '').strip())
+
+        if base_name not in model_info['variables']:
+            model_info['variables'][base_name] = {}
+        
+        model_info['variables'][base_name][index] = [initial_value, upper_bound, lower_bound]
+
+    def _parse_equation_line(self, line: str, model_info: dict):
+        """Método auxiliar para analisar uma linha da seção de equações."""
+        if line.startswith('!'):
+            if 'best known objective' in line.lower():
+                best_value_str = line.split('=')[-1].strip()
+                model_info['best'] = float(best_value_str)
+            return
+        
+        if '=' in line and line.lstrip().startswith('obj'):
+            model_info['obj'] = line.split('=', 1)[1].strip()
+        else:
+            model_info['equations'].append(line)
 
 
-# Example usage
-def test_apm_parser():
-    # Example APM content from your message
-    apm_content = """
-Model hs04
-  Variables
-    x[1] = 1.125, >= 1
-    x[2] = 0.125, >= 0
-    obj
-  End Variables
+# --- Exemplo de Uso ---
+if __name__ == '__main__':
+    apm_file_content = """
+    Model hs23
+      Variables
+        x[1] = 3, <=50, >=-50
+        x[2] = 1, <=50, >=-50
+        obj
+      End Variables
 
-  Equations
-    ! best known objective = 8/3
-    obj = (x[1]+1)^3/3 + x[2]
-  End Equations
-End Model
-"""
-    
+      Equations
+        x[1] + x[2] >= 1
+        x[1]^2 + x[2]^2 >= 1
+        9*x[1]^2 + x[2]^2 >= 9
+        x[1]^2 - x[2] >= 0
+        x[2]^2 - x[1] >= 0    
+
+        ! best known objective = 2
+        obj = x[1]^2 + x[2]^2
+      End Equations
+    End Model
+    """
+
     parser = APMParser()
-    problem = parser.parse(apm_content)
-    
-    print("Model parsed successfully!")
-    print(f"Initial point: {problem['x0']}")
-    print(f"Bounds: {problem['bounds']}")
-    print(f"Objective at x0: {problem['f'](problem['x0'])}")
-    
-    # Test constraints
-    for i, constr in enumerate(problem['c_ineq']):
-        print(f"Inequality constraint {i}: {constr(problem['x0'])}")
-    
-    for i, constr in enumerate(problem['c_eq']):
-        print(f"Equality constraint {i}: {constr(problem['x0'])}")
-    
-    return problem
+    modelo_hs23 = parser.parse(apm_file_content)
 
-
-if __name__ == "__main__":
-    test_apm_parser()
+    print("--- Resultado do Parser (Corrigido) ---")
+    pprint(modelo_hs23)
