@@ -839,7 +839,7 @@ private:
         set_if_missing("ip_exact_hessian", py::bool_(true));
         set_if_missing("ip_hess_reg0", py::float_(1e-4));
         set_if_missing("ip_eq_reg", py::float_(1e-4));
-        set_if_missing("ip_use_shifted_barrier", py::bool_(true));
+        set_if_missing("ip_use_shifted_barrier", py::bool_(false));
         set_if_missing("ip_shift_tau", py::float_(0.1));
         set_if_missing("ip_shift_bounds", py::float_(0.1));
         set_if_missing("ip_shift_adaptive", py::bool_(true));

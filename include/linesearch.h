@@ -1,16 +1,16 @@
 // line_searcher_pybind.cc
+#include "funnel.h" // provides FunnelConfig and Funnel
 #include <Eigen/Core>
-#include <pybind11/eigen.h>
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
 #include <algorithm>
 #include <cmath>
 #include <memory>
 #include <optional>
+#include <pybind11/eigen.h>
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
 #include <string>
 #include <tuple>
 #include <utility>
-#include "funnel.h" // provides FunnelConfig and Funnel
 namespace py = pybind11;
 using dvec = Eigen::VectorXd;
 
@@ -24,14 +24,14 @@ struct LSConfig {
     double ip_fraction_to_boundary_tau{0.995};
     double ls_theta_restoration{1e3};
     int max_soc{4};
-    double kappa_soc_min{0.1}; // Minimum kappa_soc for adaptive strategy
+    double kappa_soc_min{0.1};  // Minimum kappa_soc for adaptive strategy
     double kappa_soc_max{0.99}; // Maximum kappa_soc for adaptive strategy
     double kappa_soc_base{0.5}; // Base kappa_soc when theta_t/theta0 is large
 };
 
 // ---------------- small helpers ----------------
 static inline double getattr_or_double(const py::object &obj, const char *name,
-                                      double fallback) {
+                                       double fallback) {
     if (!obj || obj.is_none())
         return fallback;
     if (py::hasattr(obj, name))
@@ -40,7 +40,7 @@ static inline double getattr_or_double(const py::object &obj, const char *name,
 }
 
 static inline int getattr_or_int(const py::object &obj, const char *name,
-                                int fallback) {
+                                 int fallback) {
     if (!obj || obj.is_none())
         return fallback;
     if (py::hasattr(obj, name))
@@ -49,7 +49,7 @@ static inline int getattr_or_int(const py::object &obj, const char *name,
 }
 
 static inline bool getattr_or_bool(const py::object &obj, const char *name,
-                                  bool fallback) {
+                                   bool fallback) {
     if (!obj || obj.is_none())
         return fallback;
     if (py::hasattr(obj, name))
@@ -106,18 +106,19 @@ public:
             getattr_or_double(cfg_obj_, "ip_fraction_to_boundary_tau", 0.995);
         cfg_.ls_theta_restoration =
             getattr_or_double(cfg_obj_, "ls_theta_restoration", 1e3);
-        cfg_.max_soc =
-            std::max(0, getattr_or_int(cfg_obj_, "max_soc", 4));
-        cfg_.kappa_soc_min =
-            std::clamp(getattr_or_double(cfg_obj_, "kappa_soc_min", 0.1), 0.01, 0.5);
-        cfg_.kappa_soc_max =
-            std::clamp(getattr_or_double(cfg_obj_, "kappa_soc_max", 0.99), 0.5, 0.99);
+        cfg_.max_soc = std::max(0, getattr_or_int(cfg_obj_, "max_soc", 4));
+        cfg_.kappa_soc_min = std::clamp(
+            getattr_or_double(cfg_obj_, "kappa_soc_min", 0.1), 0.01, 0.5);
+        cfg_.kappa_soc_max = std::clamp(
+            getattr_or_double(cfg_obj_, "kappa_soc_max", 0.99), 0.5, 0.99);
         cfg_.kappa_soc_base =
-            std::clamp(getattr_or_double(cfg_obj_, "kappa_soc_base", 0.5), cfg_.kappa_soc_min, cfg_.kappa_soc_max);
+            std::clamp(getattr_or_double(cfg_obj_, "kappa_soc_base", 0.5),
+                       cfg_.kappa_soc_min, cfg_.kappa_soc_max);
     }
 
     // Returns (alpha, iters, needs_restoration, dx_cor, ds_cor)
-    // If dx_cor is empty, use original dx, ds with alpha; else use alpha with dx_cor, ds_cor
+    // If dx_cor is empty, use original dx, ds with alpha; else use alpha with
+    // dx_cor, ds_cor
     std::tuple<double, int, bool, dvec, dvec>
     search(py::object model_, const dvec &x, const dvec &dx, const dvec &ds,
            const dvec &s, double mu, double d_phi,
@@ -131,7 +132,9 @@ public:
         comps[3] = py::str("cI");
         comps[4] = py::str("JE");
         comps[5] = py::str("JI");
-        py::dict d0 = model_.attr("eval_all")(py::cast(x), py::arg("components") = comps).cast<py::dict>();
+        py::dict d0 =
+            model_.attr("eval_all")(py::cast(x), py::arg("components") = comps)
+                .cast<py::dict>();
         const double f0 = py::cast<double>(d0["f"]);
         const dvec g0 = to_vec_opt(d0["g"]);
         const py::object cE0 = dict_get(d0, "cE");
@@ -146,11 +149,12 @@ public:
 
         // φ0 and θ0
         const double barrier_eps = std::max(1e-8 * mu, 1e-16);
-        const double phi0 = f0 - mu * (s.array()
-                                          .unaryExpr([&](double v) {
-                                              return std::log(std::max(v, barrier_eps));
-                                          })
-                                          .sum());
+        const double phi0 =
+            f0 - mu * (s.array()
+                           .unaryExpr([&](double v) {
+                               return std::log(std::max(v, barrier_eps));
+                           })
+                           .sum());
         double theta0 = 0.0;
         if (theta0_opt) {
             theta0 = *theta0_opt;
@@ -176,7 +180,8 @@ public:
         if (ds.size() == s.size()) {
             for (Eigen::Index i = 0; i < ds.size(); ++i) {
                 if (ds[i] < 0.0) {
-                    const double am = (1.0 - cfg_.ip_fraction_to_boundary_tau) * s[i] / (-ds[i]);
+                    const double am = (1.0 - cfg_.ip_fraction_to_boundary_tau) *
+                                      s[i] / (-ds[i]);
                     if (am < alpha_max)
                         alpha_max = am;
                 }
@@ -199,7 +204,8 @@ public:
         double thE_lin = 0.0, thI_lin = 0.0;
         if (!cE0.is_none()) {
             dvec vE = py::cast<dvec>(cE0);
-            thE_lin = (je_dx.size() ? (vE + je_dx).array().abs().sum() : vE.array().abs().sum());
+            thE_lin = (je_dx.size() ? (vE + je_dx).array().abs().sum()
+                                    : vE.array().abs().sum());
         }
         if (!cI0.is_none()) {
             dvec vI = py::cast<dvec>(cI0);
@@ -231,18 +237,23 @@ public:
                 comps_t[0] = py::str("f");
                 comps_t[1] = py::str("cE");
                 comps_t[2] = py::str("cI");
-                d_t = model_.attr("eval_all")(py::cast(x_t), py::arg("components") = comps_t).cast<py::dict>();
+                d_t = model_
+                          .attr("eval_all")(py::cast(x_t),
+                                            py::arg("components") = comps_t)
+                          .cast<py::dict>();
                 const double f_t = py::cast<double>(d_t["f"]);
                 if (!std::isfinite(f_t)) {
                     alpha *= cfg_.ls_backtrack;
                     ++it;
                     continue;
                 }
-                const double phi_t = f_t - mu * (s_t.array()
-                                                    .unaryExpr([&](double v) {
-                                                        return std::log(std::max(v, barrier_eps));
-                                                    })
-                                                    .sum());
+                const double phi_t =
+                    f_t -
+                    mu * (s_t.array()
+                              .unaryExpr([&](double v) {
+                                  return std::log(std::max(v, barrier_eps));
+                              })
+                              .sum());
                 if (!std::isfinite(phi_t)) {
                     alpha *= cfg_.ls_backtrack;
                     ++it;
@@ -252,7 +263,10 @@ public:
                 if (phi_t <= phi0 + cfg_.ls_armijo_f * alpha * d_phi) {
                     const py::object cE_t = dict_get(d_t, "cE");
                     const py::object cI_t = dict_get(d_t, "cI");
-                    const double thE_t = cE_t.is_none() ? 0.0 : py::cast<dvec>(cE_t).array().abs().sum();
+                    const double thE_t =
+                        cE_t.is_none()
+                            ? 0.0
+                            : py::cast<dvec>(cE_t).array().abs().sum();
                     double thI_t = 0.0;
                     if (!cI_t.is_none()) {
                         dvec vI_t = py::cast<dvec>(cI_t);
@@ -261,15 +275,19 @@ public:
                     theta_t = thE_t + thI_t; // Update theta_t
                     bool acceptable_ok = true;
                     if (funnel_) {
-                        acceptable_ok = funnel_->is_acceptable(theta0, f0, theta_t, f_t, pred_df, pred_dtheta);
+                        acceptable_ok = funnel_->is_acceptable(
+                            theta0, f0, theta_t, f_t, pred_df, pred_dtheta);
                     } else if (filter_ && !filter_.is_none()) {
-                        acceptable_ok = py::cast<bool>(filter_.attr("is_acceptable")(theta_t, f_t));
+                        acceptable_ok = py::cast<bool>(
+                            filter_.attr("is_acceptable")(theta_t, f_t));
                     }
                     if (acceptable_ok) {
                         if (funnel_) {
-                            (void)funnel_->add_if_acceptable(theta0, f0, theta_t, f_t, pred_df, pred_dtheta);
+                            (void)funnel_->add_if_acceptable(
+                                theta0, f0, theta_t, f_t, pred_df, pred_dtheta);
                         } else if (filter_ && !filter_.is_none()) {
-                            (void)filter_.attr("add_if_acceptable")(theta_t, f_t);
+                            (void)filter_.attr("add_if_acceptable")(theta_t,
+                                                                    f_t);
                         }
                         return {alpha, it, false, dvec(), dvec()};
                     }
@@ -294,50 +312,67 @@ public:
                     if (theta0 > 1e-8) { // Avoid division by near-zero
                         const double theta_ratio = theta_t / theta0;
                         if (theta_ratio > 10.0) {
-                            kappa_soc = cfg_.kappa_soc_min; // Strict reduction for large infeasibility
+                            kappa_soc =
+                                cfg_.kappa_soc_min; // Strict reduction for
+                                                    // large infeasibility
                         } else if (theta_ratio > 1.0) {
-                            // Linear interpolation between kappa_soc_min and kappa_soc_max
-                            kappa_soc = cfg_.kappa_soc_min + (cfg_.kappa_soc_max - cfg_.kappa_soc_min) * (1.0 - (theta_ratio - 1.0) / 9.0);
+                            // Linear interpolation between kappa_soc_min and
+                            // kappa_soc_max
+                            kappa_soc =
+                                cfg_.kappa_soc_min +
+                                (cfg_.kappa_soc_max - cfg_.kappa_soc_min) *
+                                    (1.0 - (theta_ratio - 1.0) / 9.0);
                         } else {
-                            kappa_soc = cfg_.kappa_soc_max; // Loose reduction if theta_t <= theta0
+                            kappa_soc =
+                                cfg_.kappa_soc_max; // Loose reduction if
+                                                    // theta_t <= theta0
                         }
                     }
                     // Relax kappa_soc for later SOC iterations
-                    kappa_soc = std::min(kappa_soc + 0.1 * (soc_count - 1), cfg_.kappa_soc_max);
+                    kappa_soc = std::min(kappa_soc + 0.1 * (soc_count - 1),
+                                         cfg_.kappa_soc_max);
                     // Compute c_soc
                     dvec c_soc_E = dvec();
                     if (!cE0.is_none()) {
-                        c_soc_E = alpha * py::cast<dvec>(cE0) + py::cast<dvec>(cE_t_current);
+                        c_soc_E = alpha * py::cast<dvec>(cE0) +
+                                  py::cast<dvec>(cE_t_current);
                     }
                     dvec c_soc_I = dvec();
                     if (!cI0.is_none()) {
                         dvec ci0_plus_s = py::cast<dvec>(cI0) + s;
-                        dvec ci_t_plus_s_t = py::cast<dvec>(cI_t_current) + s_t_current;
+                        dvec ci_t_plus_s_t =
+                            py::cast<dvec>(cI_t_current) + s_t_current;
                         c_soc_I = alpha * ci0_plus_s + ci_t_plus_s_t;
                     }
                     // Call model.compute_soc_step(c_soc_E, c_soc_I, mu)
                     py::tuple soc_res;
                     try {
-                        soc_res = model_.attr("compute_soc_step")(py::cast(c_soc_E), py::cast(c_soc_I), py::cast(mu));
-                    } catch (const std::exception&) {
+                        soc_res = model_.attr("compute_soc_step")(
+                            py::cast(c_soc_E), py::cast(c_soc_I), py::cast(mu));
+                    } catch (const std::exception &) {
                         break;
                     }
                     dvec dx_cor = to_vec_opt(soc_res[0]);
                     dvec ds_cor = to_vec_opt(soc_res[1]);
-                    if (dx_cor.size() == 0 || ds_cor.size() == 0) break;
+                    if (dx_cor.size() == 0 || ds_cor.size() == 0)
+                        break;
                     // Fraction-to-boundary for corrected direction
                     double alpha_soc = 1.0;
                     for (Eigen::Index i = 0; i < ds_cor.size(); ++i) {
                         if (ds_cor[i] < 0.0) {
-                            const double am = (1.0 - cfg_.ip_fraction_to_boundary_tau) * s[i] / (-ds_cor[i]);
-                            if (am < alpha_soc) alpha_soc = am;
+                            const double am =
+                                (1.0 - cfg_.ip_fraction_to_boundary_tau) *
+                                s[i] / (-ds_cor[i]);
+                            if (am < alpha_soc)
+                                alpha_soc = am;
                         }
                     }
                     alpha_soc = std::max(alpha_soc, cfg_.ls_min_alpha);
                     // Trial point for SOC
                     dvec x_t_soc = x + alpha_soc * dx_cor;
                     dvec s_t_soc = s + alpha_soc * ds_cor;
-                    if ((s_t_soc.array() <= 0.0).any()) break;
+                    if ((s_t_soc.array() <= 0.0).any())
+                        break;
                     // Eval at SOC trial
                     py::dict d_t_soc;
                     try {
@@ -345,48 +380,71 @@ public:
                         comps_t[0] = py::str("f");
                         comps_t[1] = py::str("cE");
                         comps_t[2] = py::str("cI");
-                        d_t_soc = model_.attr("eval_all")(py::cast(x_t_soc), py::arg("components") = comps_t).cast<py::dict>();
-                    } catch (const std::exception&) {
+                        d_t_soc = model_
+                                      .attr("eval_all")(py::cast(x_t_soc),
+                                                        py::arg("components") =
+                                                            comps_t)
+                                      .cast<py::dict>();
+                    } catch (const std::exception &) {
                         continue;
                     }
                     const double f_t_soc = py::cast<double>(d_t_soc["f"]);
-                    if (!std::isfinite(f_t_soc)) continue;
-                    const double phi_t_soc = f_t_soc - mu * (s_t_soc.array().unaryExpr([&](double v) {
-                        return std::log(std::max(v, barrier_eps));
-                    }).sum());
-                    if (!std::isfinite(phi_t_soc)) continue;
+                    if (!std::isfinite(f_t_soc))
+                        continue;
+                    const double phi_t_soc =
+                        f_t_soc -
+                        mu * (s_t_soc.array()
+                                  .unaryExpr([&](double v) {
+                                      return std::log(std::max(v, barrier_eps));
+                                  })
+                                  .sum());
+                    if (!std::isfinite(phi_t_soc))
+                        continue;
                     const py::object cE_t_soc = dict_get(d_t_soc, "cE");
                     const py::object cI_t_soc = dict_get(d_t_soc, "cI");
-                    const double thE_t_soc = cE_t_soc.is_none() ? 0.0 : py::cast<dvec>(cE_t_soc).array().abs().sum();
+                    const double thE_t_soc =
+                        cE_t_soc.is_none()
+                            ? 0.0
+                            : py::cast<dvec>(cE_t_soc).array().abs().sum();
                     double thI_t_soc = 0.0;
                     if (!cI_t_soc.is_none()) {
                         dvec vI_t_soc = py::cast<dvec>(cI_t_soc);
-                        thI_t_soc = (vI_t_soc.array() + s_t_soc.array()).abs().sum();
+                        thI_t_soc =
+                            (vI_t_soc.array() + s_t_soc.array()).abs().sum();
                     }
                     const double theta_t_soc = thE_t_soc + thI_t_soc;
                     // Check sufficient reduction in theta for continuing SOC
-                    if (theta_t_soc >= kappa_soc * theta_last) break;
+                    if (theta_t_soc >= kappa_soc * theta_last)
+                        break;
                     // Update for next iteration
                     theta_last = theta_t_soc;
                     cE_t_current = cE_t_soc;
                     cI_t_current = cI_t_soc;
                     s_t_current = s_t_soc;
                     // Armijo on φ using original alpha
-                    if (phi_t_soc > phi0 + cfg_.ls_armijo_f * alpha * d_phi) continue;
+                    if (phi_t_soc > phi0 + cfg_.ls_armijo_f * alpha * d_phi)
+                        continue;
                     // Check acceptability
                     bool acceptable_ok_soc = true;
                     if (funnel_) {
-                        acceptable_ok_soc = funnel_->is_acceptable(theta0, f0, theta_t_soc, f_t_soc, pred_df, pred_dtheta);
+                        acceptable_ok_soc = funnel_->is_acceptable(
+                            theta0, f0, theta_t_soc, f_t_soc, pred_df,
+                            pred_dtheta);
                     } else if (filter_ && !filter_.is_none()) {
-                        acceptable_ok_soc = py::cast<bool>(filter_.attr("is_acceptable")(theta_t_soc, f_t_soc));
+                        acceptable_ok_soc = py::cast<bool>(filter_.attr(
+                            "is_acceptable")(theta_t_soc, f_t_soc));
                     }
                     if (acceptable_ok_soc) {
                         if (funnel_) {
-                            (void)funnel_->add_if_acceptable(theta0, f0, theta_t_soc, f_t_soc, pred_df, pred_dtheta);
+                            (void)funnel_->add_if_acceptable(
+                                theta0, f0, theta_t_soc, f_t_soc, pred_df,
+                                pred_dtheta);
                         } else if (filter_ && !filter_.is_none()) {
-                            (void)filter_.attr("add_if_acceptable")(theta_t_soc, f_t_soc);
+                            (void)filter_.attr("add_if_acceptable")(theta_t_soc,
+                                                                    f_t_soc);
                         }
-                        return {alpha_soc, it + soc_count, false, dx_cor, ds_cor};
+                        return {alpha_soc, it + soc_count, false, dx_cor,
+                                ds_cor};
                     }
                 }
             }

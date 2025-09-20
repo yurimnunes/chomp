@@ -632,6 +632,154 @@ class Model:
         self._cache.clear()
         self._cache_x = None
 
+    def compute_soc_step(
+        self,
+        rE: np.ndarray | None,
+        rI: np.ndarray | None,
+        mu: float,
+        *,
+        active_tol: float = 1e-6,
+        w_eq: float = 1.0,
+        w_ineq: float = 1.0,
+        gamma: float = 1e-8,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Compute a second-order-correction direction (dx_cor, ds_cor) that reduces
+        the constraint residuals at the *current SOC base point* x_t.
+
+        Contract expected by your LineSearcher:
+            (dx_cor, ds_cor) = model.compute_soc_step(rE, rI, mu)
+
+        Requirements/assumptions:
+        - You *must* have called `eval_all(x_t, components=["JE","JI"])` (or any
+        superset) immediately before calling this method, so the model cache
+        holds JE/JI at the SOC base x_t.
+        - rE = cE(x_t)          (shape (mE,)) or None if no equalities
+        rI = cI(x_t) + s_t    (shape (mI,)) or None if no inequalities
+        - Returns:
+            dx_cor: shape (n,)
+            ds_cor: shape (mI,)  (empty vector if no inequalities)
+
+        Strategy:
+        - Solve the regularized LS problem:
+            min_x  0.5*w_eq^2*||JE x + rE||^2  +  0.5*w_ineq^2*||W (JI x + rI)||^2
+                    + 0.5*gamma*||x||^2
+        where W is a diagonal selector emphasizing only violated / near-active
+        inequalities using `active_tol`.
+        - Then set ds_cor = -(rI + JI dx_cor).
+        """
+
+        n = self.n
+        mE = self.m_eq
+        mI = self.m_ineq
+
+        # Clean/shape inputs
+        rE = None if (rE is None or (isinstance(rE, (list, tuple, np.ndarray)) and len(rE) == 0)) else np.asarray(rE, dtype=float).ravel()
+        rI = None if (rI is None or (isinstance(rI, (list, tuple, np.ndarray)) and len(rI) == 0)) else np.asarray(rI, dtype=float).ravel()
+
+        # Fetch JE, JI from cache; if missing, try to evaluate from current cache x
+        JE = self._cache.get("JE", None)
+        JI = self._cache.get("JI", None)
+
+        # If needed, recompute (uses last cached x if available)
+        if (JE is None and mE > 0) or (JI is None and mI > 0):
+            x_cached = self._cache_x
+            if x_cached is not None:
+                x_arr = np.asarray(x_cached, dtype=float)
+                need = []
+                if mE > 0: need.append("JE")
+                if mI > 0: need.append("JI")
+                d = self.eval_all(x_arr, components=need)
+                if JE is None and mE > 0: JE = d.get("JE", None)
+                if JI is None and mI > 0: JI = d.get("JI", None)
+
+        # Convert JE/JI to dense arrays for a small normal-equations solve
+        # (robust to None if no such constraints)
+        def _to_dense(M):
+            if M is None:
+                return None
+            if sp.issparse(M):
+                return M.toarray()
+            M = np.asarray(M, dtype=float, order="C")
+            return M
+
+        JE_d = _to_dense(JE) if mE > 0 else None
+        JI_d = _to_dense(JI) if mI > 0 else None
+
+        # Build weighted least-squares normal equations:
+        #   (A^T A + gamma I) dx = -A^T b
+        # with A = [ w_eq*JE ; w_ineq*W*JI ],  b = [ w_eq*rE ; w_ineq*W*rI ]
+        # W selects violated / near-active inequalities (|rI| > active_tol or rI > 0).
+        blocks = []
+        rhs_blocks = []
+
+        if (mE > 0) and (rE is not None) and (JE_d is not None) and JE_d.size:
+            blocks.append((w_eq, JE_d, rE))
+
+        if (mI > 0) and (rI is not None) and (JI_d is not None) and JI_d.size:
+            # Build W: emphasize entries we want to reduce
+            # Heuristic: target rI > 0 (violations) or |rI| >= active_tol (near-active)
+            sel = (rI > 0.0) | (np.abs(rI) >= active_tol)
+            if np.any(sel):
+                W = np.zeros_like(rI)
+                W[sel] = 1.0
+                # Optionally scale with magnitude (soft weighting):
+                # W[sel] = 1.0 + 0.0*np.minimum(5.0, np.abs(rI[sel]) / max(active_tol, 1e-12))
+                blocks.append((w_ineq, JI_d, rI, W))
+            else:
+                # No active/violated rows: still allow a tiny pull (very small weights)
+                W = np.full_like(rI, 0.0)
+                blocks.append((0.0, JI_d, rI, W))
+
+        # If nothing to do, return zeros
+        if not blocks:
+            return np.zeros(n, dtype=float), (np.zeros(mI, dtype=float) if mI > 0 else np.zeros(0, dtype=float))
+
+        # Assemble normal equations
+        AtA = np.eye(n, dtype=float) * gamma
+        ATb = np.zeros(n, dtype=float)
+
+        for blk in blocks:
+            if len(blk) == 3:
+                w, J, r = blk
+                if w == 0.0 or J.size == 0:
+                    continue
+                # A = w * J,  b = w * r
+                # Add J^T J and J^T r
+                AtA += (w * J).T @ (w * J)
+                ATb += (w * J).T @ (w * r)
+            else:
+                w, J, r, W = blk
+                if (w == 0.0) or J.size == 0:
+                    continue
+                # Weighted rows: A = w * diag(W) * J, b = w * diag(W) * r
+                # Implement via row scaling
+                WJ = (J.T * W).T            # scale rows of J by W
+                Wr = W * r
+                AtA += (w * WJ).T @ (w * WJ)
+                ATb += (w * WJ).T @ (w * Wr)
+
+        # Solve (AtA) dx = -ATb  (small, symmetric PD after gamma)
+        try:
+            dx_cor = -np.linalg.solve(AtA, ATb)
+        except np.linalg.LinAlgError:
+            # Fallback: least-squares
+            dx_cor = -np.linalg.lstsq(AtA, ATb, rcond=None)[0]
+
+        # Compute ds_cor if inequalities exist: ds = -(rI + JI dx)
+        if (mI > 0) and (rI is not None) and (JI_d is not None) and JI_d.size:
+            ds_cor = -(rI + JI_d @ dx_cor)
+        else:
+            ds_cor = np.zeros(0, dtype=float)
+
+        # Sanity: replace non-finite
+        if not np.all(np.isfinite(dx_cor)):
+            dx_cor = np.nan_to_num(dx_cor, nan=0.0, posinf=0.0, neginf=0.0)
+        if ds_cor.size and not np.all(np.isfinite(ds_cor)):
+            ds_cor = np.nan_to_num(ds_cor, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return dx_cor, ds_cor
+
 
 # ======================================
 # Restoration (weighted L1 feasibility)

@@ -98,7 +98,7 @@ static void print_iteration_row(int k, const SolverInfo &info,
         // Banner
         fmt::print(fg(color::cyan) | emphasis::bold, "\nCHOMP");
         fmt::print(fg(color::light_gray) | emphasis::bold, " — made by ");
-        fmt::print(fg(color::yellow) | emphasis::bold, "L. O. Seman\n");
+        fmt::print(fg(color::white) | emphasis::bold, "L. O. Seman\n");
 
         // Preamble
         // if (info.n >= 0) {
@@ -137,8 +137,8 @@ static void print_iteration_row(int k, const SolverInfo &info,
     // Trend-based color selection
     auto trend_color = [](std::optional<double> prev, double val) -> fmt::color {
         if (!prev.has_value() || std::isnan(val)) return color::white;
-        if (val < prev.value()) return color::green;
-        if (val > prev.value()) return color::red;
+        // if (val < prev.value()) return color::green;
+        // if (val > prev.value()) return color::red;
         return color::white;
     };
     const auto f_col     = trend_color(f_prev, info.f);
@@ -282,7 +282,7 @@ public:
         // ip_mod.attr("InteriorPointStepper");
 
         ip_state_ = IPState(); // empty init, like Python
-        ip_stepper_ = new InteriorPointStepper(model_, cfg_, hess_);
+        ip_stepper_ = new InteriorPointStepper(cfg_, hess_);
 
         // SQP stepper
         sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_);
@@ -376,7 +376,7 @@ private:
     // ---- steps --------------------------------------------------------------
 
     SolverInfo ip_step_(int it) {
-        auto step_ret = ip_stepper_->step( // model
+        auto step_ret = ip_stepper_->step( model_,  // model
             x_,                            // x
             lam_,                          // lam
             nu_,                           // nu

@@ -538,6 +538,8 @@ class InteriorPointStepper:
         comp_tol = float(getattr(self.cfg, "tol_comp", 1e-6))
         cond_max = float(getattr(self.cfg, "cond_threshold", 1e6))
         comp = self.compute_complementarity(s, lam, mu, tau_shift, use_shifted)
+        print(comp, mu, mu_aff, sigma)
+        print(kkt)
         good = (
             accepted
             and theta <= theta_tol
@@ -545,6 +547,8 @@ class InteriorPointStepper:
             and kkt["stat"] <= float(getattr(self.cfg, "tol_stat", 1e-6))
             and (np.isnan(cond_H) or cond_H <= cond_max)
         )
+        
+        
 
         # Adaptive mu reduction based on complementarity progress
         comp_ratio = comp / max(mu, 1e-12)
@@ -557,8 +561,12 @@ class InteriorPointStepper:
             mu_new = min(10.0 * mu, mu_base * 1.2)
         else:
             mu_new = min(mu_base, mu**kappa)
+            
+        print("mu updated to:", mu_new)
 
         return max(mu_new, mu_min)
+    
+    
 
     # ---------- Gondzio MC (unchanged behavior; compact form) ----------
     def _gondzio_multicorrector(
@@ -1099,6 +1107,7 @@ class InteriorPointStepper:
             if cfg.ip_exact_hessian
             else self.hess.get_hessian(model, x, lmb, nuv)
         )
+        print('H', H)
         #H, _ = make_psd_advanced(H, self.reg, it)
 
         # --- residuals (branch on presence to avoid zeros allocs)
@@ -1184,7 +1193,9 @@ class InteriorPointStepper:
             # JIw = JI * Sigma_s along rows, so JIw = diag(Sigma_s) @ JI
             JIw = JI * Sigma_s_vec[:, None]
             W = W + (JI.T @ JIw)
-
+        print(Sigma_x_vec)
+        print(Sigma_s_vec)
+        print('W', W)
         rhs_x = -r_d
         
         print('rhs_x', rhs_x)
@@ -1270,6 +1281,7 @@ class InteriorPointStepper:
             mI=mI,
         )
         print('dx', dx)
+        
         if dx is None:
             dx, dnu = self.solve_KKT(
                 W,
@@ -1536,6 +1548,7 @@ class InteriorPointStepper:
         else:
             cond_H = np.nan
 
+        print("mu prev", mu)
         mu = self.update_mu(
             mu=mu,
             s=(s_new if mI > 0 else np.zeros(0)),
@@ -1549,6 +1562,8 @@ class InteriorPointStepper:
             use_shifted=use_shifted,
             tau_shift=tau_shift,
         )
+        
+        print('mu post-update', mu)
 
         info = dict(
             mode="ip",
@@ -1580,4 +1595,7 @@ class InteriorPointStepper:
             mu,
         )
         st.tau_shift = tau_shift
+        print(x_new)
+        print(lmb_new)
+        print(nu_new)
         return x_new, lmb_new, nu_new, info
