@@ -31,6 +31,12 @@
 
 namespace py = pybind11;
 
+struct StepResult {
+    dvec x;   // new primal iterate
+    dvec lam; // new inequality multipliers
+    dvec nu;  // new equality multipliers (empty if no JE)
+};
+
 struct KKTResult {
     dvec dx; // primal search direction
     dvec dy; // equality multipliers (empty if no JE)
@@ -389,17 +395,21 @@ public:
     std::shared_ptr<regx::Regularizer> regularizer_ =
         std::make_shared<regx::Regularizer>();
 
-    InteriorPointStepper(py::object cfg, py::object hess)
-        : cfg_(std::move(cfg)), hess_(std::move(hess)) {
+    py::object model;
+    Bounds B;
+
+    InteriorPointStepper(py::object model, py::object cfg, py::object hess)
+        : model(std::move(model)), cfg_(std::move(cfg)),
+          hess_(std::move(hess)) {
         load_defaults_();
         load_gondzio_defaults_();
         std::shared_ptr<Funnel> funnel = std::shared_ptr<Funnel>();
         ls_ = std::make_shared<LineSearcher>(cfg_, py::none(), funnel);
     }
 
-    std::tuple<dvec, dvec, dvec, py::dict>
-    step(py::object model, const dvec &x, const dvec &lam, const dvec &nu,
-         int it, std::optional<IPState> ip_state_opt = std::nullopt) {
+    std::tuple<dvec, dvec, dvec, SolverInfo>
+    step(const dvec &x, const dvec &lam, const dvec &nu, int it,
+         std::optional<IPState> ip_state_opt = std::nullopt) {
 
         if (!st.initialized) {
             st = state_from_model_(model, x);
@@ -449,7 +459,7 @@ public:
         double theta = model.attr("constraint_violation")(x).cast<double>();
 
         // Bounds with adaptive shifts
-        Bounds B = detail::get_bounds(model, x);
+        // Bounds B = detail::get_bounds(model, x);
         if (use_shifted && shift_adapt) {
             tau_shift = adaptive_shift_slack_(s, cI, it);
             st.tau_shift = tau_shift;
@@ -463,26 +473,97 @@ public:
 
         // Quick convergence check
         const double tol = pyu::getattr_or<double>(cfg_, "tol", 1e-8);
-        const double err_0 =
-            compute_error_(model, x, lmb, nuv, zL, zU, 0.0, s, mI);
+        auto compute_error_ = [&](const py::object &model, const dvec &x,
+                                  const dvec &lmb, const dvec &nu,
+                                  const dvec &zL, const dvec &zU, double mu,
+                                  const dvec &s, int mI) {
+            // Primal residual
+            // Stationarity residual
+            dvec r_d = g;
+            if (JI.size())
+                r_d.noalias() += JI.transpose() * lam;
+            if (JE.size())
+                r_d.noalias() += JE.transpose() * nu;
+            r_d -= zL;
+            r_d += zU;
+
+            // Scaling factors
+            const double s_max =
+                pyu::getattr_or<double>(cfg_, "ip_s_max", 100.0);
+            const int denom_ct = mI + mE + n;
+            const double sum_mults = lam.lpNorm<1>() + nu.lpNorm<1>() +
+                                     zL.lpNorm<1>() + zU.lpNorm<1>();
+            const double s_d =
+                clamp_min(sum_mults / clamp_min(denom_ct, 1), s_max) / s_max;
+            const double s_c =
+                clamp_min((zL.lpNorm<1>() + zU.lpNorm<1>()) / clamp_min(n, 1),
+                          s_max) /
+                s_max;
+
+            // Complementarity residuals
+            const bool use_shifted =
+                pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", false);
+            const double tau_shift = use_shifted ? st.tau_shift : 0.0;
+            const double bshift =
+                use_shifted
+                    ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0)
+                    : 0.0;
+
+            dvec r_comp_L(n), r_comp_U(n), r_comp_s;
+            if (use_shifted) {
+                for (int i = 0; i < n; ++i) {
+                    r_comp_L[i] =
+                        B.hasL[i] ? ((B.sL[i] + bshift) * zL[i] - mu) : 0.0;
+                    r_comp_U[i] =
+                        B.hasU[i] ? ((B.sU[i] + bshift) * zU[i] - mu) : 0.0;
+                }
+                if (mI > 0 && s.size()) {
+                    r_comp_s.resize(s.size());
+                    for (int i = 0; i < s.size(); ++i) {
+                        r_comp_s[i] = (s[i] + tau_shift) * lam[i] - mu;
+                    }
+                }
+            } else {
+                for (int i = 0; i < n; ++i) {
+                    r_comp_L[i] = B.hasL[i] ? (B.sL[i] * zL[i] - mu) : 0.0;
+                    r_comp_U[i] = B.hasU[i] ? (B.sU[i] * zU[i] - mu) : 0.0;
+                }
+                if (mI > 0 && s.size()) {
+                    r_comp_s.resize(s.size());
+                    for (int i = 0; i < s.size(); ++i) {
+                        r_comp_s[i] = s[i] * lam[i] - mu;
+                    }
+                }
+            }
+
+            return std::max(
+                {safe_inf_norm(r_d) / s_d, (mE > 0) ? safe_inf_norm(cE) : 0.0,
+                 (mI > 0) ? safe_inf_norm(cI) : 0.0,
+                 std::max(safe_inf_norm(r_comp_L), safe_inf_norm(r_comp_U)) /
+                     s_c,
+                 (r_comp_s.size() > 0) ? (safe_inf_norm(r_comp_s) / s_c)
+                                       : 0.0});
+        };
+        auto err_0 = compute_error_(model, x, lmb, nuv, zL, zU, mu, s, mI);
         if (err_0 <= tol) {
-            py::dict info;
-            info["mode"] = "ip";
-            info["step_norm"] = 0.0;
-            info["accepted"] = true;
-            info["converged"] = true;
-            info["f"] = f;
-            info["theta"] = theta;
-            info["stat"] = safe_inf_norm(g);
-            info["ineq"] =
+            struct SolverInfo info;
+            info.mode = "ip";
+            info.step_norm = 0.0;
+            info.accepted = true;
+            info.converged = true;
+            info.f = f;
+            info.theta = theta;
+            info.stat = safe_inf_norm(g);
+            info.ineq =
                 (mI > 0) ? safe_inf_norm((cI.array().max(0.0)).matrix()) : 0.0;
-            info["eq"] = (mE > 0) ? safe_inf_norm(cE) : 0.0;
-            info["comp"] = 0.0;
-            info["ls_iters"] = 0;
-            info["alpha"] = 0.0;
-            info["rho"] = 0.0;
-            info["tr_radius"] = tr_radius_();
-            info["mu"] = mu;
+            info.eq = (mE > 0) ? safe_inf_norm(cE) : 0.0;
+            info.comp =
+                detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
+            info.ls_iters = 0;
+            info.alpha = 0.0;
+            info.rho = 0.0;
+            info.tr_radius = 0.0;
+            info.mu = mu;
             return {x, lmb, nuv, info};
         }
 
@@ -504,16 +585,69 @@ public:
         spmat H_obj_sparse = pyconv::to_sparse(H_obj);
         auto [H, reg_info] = regularizer_->regularize(H_obj_sparse, it);
 
-        // Assemble KKT matrix: W = H + diag(Sigma_x) + JI^T diag(Sigma_s) JI
-        spmat W = H;
-        for (int i = 0; i < std::min<int>(W.rows(), Sg.Sigma_x.size()); ++i) {
-            W.coeffRef(i, i) += Sg.Sigma_x[i];
-        }
+        // // Assemble KKT matrix: W = H + diag(Sigma_x) + JI^T diag(Sigma_s) JI
+        // spmat W = H;
+        // for (int i = 0; i < std::min<int>(W.rows(), Sg.Sigma_x.size()); ++i)
+        // {
+        //     W.coeffRef(i, i) += Sg.Sigma_x[i];
+        // }
 
-        if (mI > 0 && JI.size() && Sg.Sigma_s.size()) {
-            spmat JIw = Sg.Sigma_s.asDiagonal() * JI;
-            W += JI.transpose() * JIw;
-        }
+        // if (mI > 0 && JI.size() && Sg.Sigma_s.size()) {
+        //     spmat JIw = Sg.Sigma_s.asDiagonal() * JI;
+        //     W += JI.transpose() * JIw;
+        // }
+
+        auto build_W_efficient = [](const spmat &H, const dvec &Sigma_x,
+                                    const spmat &JI, const dvec &Sigma_s) {
+            const int n = H.rows();
+            const int mI = Sigma_s.size();
+
+            // Estimate non-zeros: H + diagonal + JI^T*JI structure
+            const size_t est_nnz =
+                H.nonZeros() + n + (mI > 0 ? 2 * JI.nonZeros() : 0);
+
+            std::vector<Eigen::Triplet<double>> triplets;
+            triplets.reserve(est_nnz);
+
+            // Add H entries
+            for (int j = 0; j < H.outerSize(); ++j) {
+                for (spmat::InnerIterator it(H, j); it; ++it) {
+                    triplets.emplace_back(it.row(), it.col(), it.value());
+                }
+            }
+
+            // Add diagonal regularization
+            for (int i = 0; i < std::min(n, static_cast<int>(Sigma_x.size()));
+                 ++i) {
+                if (Sigma_x[i] != 0.0) {
+                    triplets.emplace_back(i, i, Sigma_x[i]);
+                }
+            }
+
+            // Add JI^T * diag(Sigma_s) * JI efficiently
+            if (mI > 0 && JI.size() > 0) {
+                for (int j = 0; j < JI.outerSize(); ++j) {
+                    for (spmat::InnerIterator it_j(JI, j); it_j; ++it_j) {
+                        const int row_j = it_j.row();
+                        const double val_j = it_j.value() * Sigma_s[row_j];
+
+                        // Inner product with column j of JI
+                        for (spmat::InnerIterator it_k(JI, j); it_k; ++it_k) {
+                            const int row_k = it_k.row();
+                            const double val_k = it_k.value() * Sigma_s[row_k];
+
+                            triplets.emplace_back(j, j, val_j * val_k);
+                        }
+                    }
+                }
+            }
+
+            spmat W(n, n);
+            W.setFromTriplets(triplets.begin(), triplets.end());
+            W.makeCompressed();
+            return W;
+        };
+        spmat W = build_W_efficient(H, Sg.Sigma_x, JI, Sg.Sigma_s);
 
         // Build residuals
         dvec r_d = g;
@@ -679,24 +813,43 @@ public:
             const double a_safe = std::min(alpha_max, 1e-2);
             dvec x_new = x + a_safe * dxf;
 
-            py::dict info;
-            info["mode"] = "ip";
-            info["step_norm"] = (x_new - x).norm();
-            info["accepted"] = true;
-            info["converged"] = false;
-            info["f"] = model.attr("eval_all")(x_new, py::make_tuple("f"))["f"]
-                            .cast<double>();
-            info["theta"] =
+            // py::dict info;
+            // info["mode"] = "ip";
+            // info["step_norm"] = (x_new - x).norm();
+            // info["accepted"] = true;
+            // info["converged"] = false;
+            // info["f"] = model.attr("eval_all")(x_new,
+            // py::make_tuple("f"))["f"]
+            //                 .cast<double>();
+            // info["theta"] =
+            //     model.attr("constraint_violation")(x_new).cast<double>();
+            // info["stat"] = 0.0;
+            // info["ineq"] = 0.0;
+            // info["eq"] = 0.0;
+            // info["comp"] = 0.0;
+            // info["ls_iters"] = ls_iters;
+            // info["alpha"] = 0.0;
+            // info["rho"] = 0.0;
+            // info["tr_radius"] = tr_radius_();
+            // info["mu"] = mu;
+            struct SolverInfo info;
+            info.mode = "ip";
+            info.step_norm = (x_new - x).norm();
+            info.accepted = true;
+            info.converged = false;
+            info.f = model.attr("eval_all")(x_new, py::make_tuple("f"))["f"]
+                         .cast<double>();
+            info.theta =
                 model.attr("constraint_violation")(x_new).cast<double>();
-            info["stat"] = 0.0;
-            info["ineq"] = 0.0;
-            info["eq"] = 0.0;
-            info["comp"] = 0.0;
-            info["ls_iters"] = ls_iters;
-            info["alpha"] = 0.0;
-            info["rho"] = 0.0;
-            info["tr_radius"] = tr_radius_();
-            info["mu"] = mu;
+            info.stat = 0.0;
+            info.ineq = 0.0;
+            info.eq = 0.0;
+            info.comp = 0.0;
+            info.ls_iters = ls_iters;
+            info.alpha = 0.0;
+            info.rho = 0.0;
+            info.tr_radius = 0.0;
+            info.mu = mu;
             return {x_new, lmb, nuv, info};
         }
 
@@ -773,50 +926,46 @@ public:
             }
         }
 
-        py::dict kkt_new;
-        kkt_new["stat"] = safe_inf_norm(r_d_new);
-        kkt_new["ineq"] =
+        struct KKT kkt_new;
+        kkt_new.stat = safe_inf_norm(r_d_new);
+        kkt_new.ineq =
             (mI > 0) ? safe_inf_norm((cI_new.array().max(0.0)).matrix()) : 0.0;
-        kkt_new["eq"] = (mE > 0) ? safe_inf_norm(cE_new) : 0.0;
-
-        double comp_val =
+        kkt_new.eq = (mE > 0) ? safe_inf_norm(cE_new) : 0.0;
+        double comp_val_new =
             std::max(safe_inf_norm(r_comp_L_new), safe_inf_norm(r_comp_U_new));
         if (mI > 0 && r_comp_s_new.size()) {
-            comp_val = std::max(comp_val, safe_inf_norm(r_comp_s_new));
+            comp_val_new = std::max(comp_val_new, safe_inf_norm(r_comp_s_new));
         }
-        kkt_new["comp"] = comp_val;
+        kkt_new.comp = comp_val_new;
 
         const bool converged =
-            (kkt_new["stat"].cast<double>() <= tol &&
-             kkt_new["ineq"].cast<double>() <= tol &&
-             kkt_new["eq"].cast<double>() <= tol &&
-             kkt_new["comp"].cast<double>() <= tol && mu <= tol / 10.0);
+            (kkt_new.stat <= tol && kkt_new.ineq <= tol && kkt_new.eq <= tol &&
+             kkt_new.comp <= tol && mu <= tol / 10.0);
 
         // Update barrier parameter
         mu = update_mu_(mu, s_new, lmb_new, theta_new, kkt_new, true,
                         std::numeric_limits<double>::quiet_NaN(), sigma, mu_aff,
                         use_shifted, tau_shift);
 
-        // Build result
-        py::dict info;
-        info["mode"] = "ip";
-        info["step_norm"] = (x_new - x).norm();
-        info["accepted"] = true;
-        info["converged"] = converged;
-        info["f"] = f_new;
-        info["theta"] = theta_new;
-        info["stat"] = kkt_new["stat"];
-        info["ineq"] = kkt_new["ineq"];
-        info["eq"] = kkt_new["eq"];
-        info["comp"] = kkt_new["comp"];
-        info["ls_iters"] = ls_iters;
-        info["alpha"] = alpha;
-        info["rho"] = 0.0;
-        info["tr_radius"] = tr_radius_();
-        info["mu"] = mu;
-        info["shifted_barrier"] = use_shifted;
-        info["tau_shift"] = tau_shift;
-        info["bound_shift"] = bound_shift;
+        struct SolverInfo info;
+        info.mode = "ip";
+        info.step_norm = (x_new - x).norm();
+        info.accepted = true;
+        info.converged = converged;
+        info.f = f_new;
+        info.theta = theta_new;
+        info.stat = kkt_new.stat;
+        info.ineq = kkt_new.ineq;
+        info.eq = kkt_new.eq;
+        info.comp = kkt_new.comp;
+        info.ls_iters = ls_iters;
+        info.alpha = alpha;
+        info.rho = 0.0;
+        info.tr_radius = 0.0;
+        info.mu = mu;
+        info.shifted_barrier = use_shifted;
+        info.tau_shift = tau_shift;
+        info.bound_shift = bound_shift;
 
         // Update state
         st.s = std::move(s_new);
@@ -834,7 +983,17 @@ private:
     py::object cfg_, hess_;
     std::unordered_map<std::string, dvec> kkt_cache_;
     spmat prev_kkt_matrix_;
-    std::shared_ptr<kkt::KKTReusable> prev_factorization_{};
+    std::shared_ptr<kkt::KKTReusable> cached_kkt_solver_{};
+
+    spmat cached_kkt_matrix_;
+    bool kkt_factorization_valid_ = false;
+
+    // Add matrix comparison helper
+    bool matrices_equal(const spmat &A, const spmat &B, double tol = 1e-14) {
+        if (A.rows() != B.rows() || A.cols() != B.cols())
+            return false;
+        return (A - B).norm() < tol;
+    }
 
     void load_defaults_() {
         auto set_if_missing = [&](const char *name, py::object v) {
@@ -845,9 +1004,9 @@ private:
         set_if_missing("ip_exact_hessian", py::bool_(true));
         set_if_missing("ip_hess_reg0", py::float_(1e-4));
         set_if_missing("ip_eq_reg", py::float_(1e-4));
-        set_if_missing("ip_use_shifted_barrier", py::bool_(false));
+        set_if_missing("ip_use_shifted_barrier", py::bool_(true));
         set_if_missing("ip_shift_tau", py::float_(0.1));
-        set_if_missing("ip_shift_bounds", py::float_(0.1));
+        set_if_missing("ip_shift_bounds", py::float_(1e-3));
         set_if_missing("ip_shift_adaptive", py::bool_(true));
         set_if_missing("ip_mu_init", py::float_(1e-2));
         set_if_missing("ip_mu_min", py::float_(1e-12));
@@ -860,14 +1019,14 @@ private:
         set_if_missing("ip_theta_clip", py::float_(1e-2));
         set_if_missing("sigma_eps_abs", py::float_(1e-8));
         set_if_missing("sigma_cap", py::float_(1e8));
-        set_if_missing("ip_kkt_method", py::str("hykkt"));
+        set_if_missing("ip_kkt_method", py::str("ldl"));
         set_if_missing("tol", py::float_(1e-8));
         set_if_missing("ls_backtrack", py::float_(pyu::getattr_or<double>(
                                            cfg_, "ip_alpha_backtrack", 0.5)));
         set_if_missing("ls_armijo_f", py::float_(pyu::getattr_or<double>(
                                           cfg_, "ip_armijo_coeff", 1e-4)));
         set_if_missing("ls_max_iter",
-                       py::int_(pyu::getattr_or<int>(cfg_, "ip_ls_max", 30)));
+                       py::int_(pyu::getattr_or<int>(cfg_, "ip_ls_max", 5)));
         set_if_missing("ls_min_alpha", py::float_(pyu::getattr_or<double>(
                                            cfg_, "ip_alpha_min", 1e-10)));
     }
@@ -910,7 +1069,7 @@ private:
         s.nu = (s.mE > 0) ? dvec::Zero(s.mE) : dvec();
 
         // Initialize bound duals
-        Bounds B = detail::get_bounds(model, x);
+        B = detail::get_bounds(model, x);
         s.zL = dvec::Zero(x.size());
         s.zU = dvec::Zero(x.size());
         for (int i = 0; i < x.size(); ++i) {
@@ -998,23 +1157,48 @@ private:
         if (mE == 0 && method_cpp == "hykkt")
             method_cpp = "ldl";
 
-        kkt::ChompConfig conf;
-        conf.cg_tol = 1e-6;
-        conf.cg_maxit = 200;
-        conf.ip_hess_reg0 = 1e-8;
-        conf.schur_dense_cutoff = 0.25;
+        const bool can_reuse = kkt_factorization_valid_ && cached_kkt_solver_ &&
+                               matrices_equal(W, cached_kkt_matrix_);
 
-        auto &reg = kkt::default_registry();
-        auto strat = reg.get(method_cpp);
+        if (can_reuse) {
+            // Reuse existing factorization
+            std::optional<dvec> r2 =
+                rpE ? std::optional<dvec>(-(*rpE)) : std::nullopt;
+            auto [dx, dy] = cached_kkt_solver_->solve(rhs_x, r2, 1e-8, 200);
 
-        auto [dx, dy, reusable] =
-            strat->factor_and_solve(W, G, r1, r2, conf, std::nullopt,
-                                    kkt_cache_, 0.0, std::nullopt, true, true);
+            return KKTResult{std::move(dx), std::move(dy), cached_kkt_solver_};
+        } else {
+            kkt::ChompConfig conf;
+            conf.cg_tol = 1e-6;
+            conf.cg_maxit = 200;
+            conf.ip_hess_reg0 = 1e-8;
+            conf.schur_dense_cutoff = 0.25;
 
-        prev_kkt_matrix_ = W;
-        prev_factorization_ = (method_cpp == "ldl") ? reusable : nullptr;
+            auto &reg = kkt::default_registry();
+            auto strat = reg.get(method_cpp);
 
-        return KKTResult{std::move(dx), std::move(dy), std::move(reusable)};
+            // Need fresh factorization
+            auto [dx, dy, reusable] = strat->factor_and_solve(
+                W, G, r1, r2, conf, std::nullopt, kkt_cache_, 0.0, std::nullopt,
+                true, true);
+
+            // Cache the results
+            cached_kkt_matrix_ = W;
+            cached_kkt_solver_ = reusable;
+            kkt_factorization_valid_ = true;
+
+            return KKTResult{std::move(dx), std::move(dy), std::move(reusable)};
+        }
+
+        // auto [dx, dy, reusable] =
+        //     strat->factor_and_solve(W, G, r1, r2, conf, std::nullopt,
+        //                             kkt_cache_, 0.0, std::nullopt, true,
+        //                             true);
+
+        // prev_kkt_matrix_ = W;
+        // prev_factorization_ = (method_cpp == "ldl") ? reusable : nullptr;
+
+        // return KKTResult{std::move(dx), std::move(dy), std::move(reusable)};
     }
 
     [[nodiscard]] std::tuple<double, double, double> mehrotra_affine_predictor_(
@@ -1175,97 +1359,8 @@ private:
         return {alpha_aff, mu_aff, sigma};
     }
 
-    [[nodiscard]] double compute_error_(const py::object &model, const dvec &x,
-                                        const dvec &lam, const dvec &nu,
-                                        const dvec &zL, const dvec &zU,
-                                        double mu, const dvec &s, int mI_decl) {
-        auto data = model
-                        .attr("eval_all")(
-                            x, py::make_tuple("g", "cI", "cE", "JI", "JE"))
-                        .cast<py::dict>();
-        dvec g = pyconv::to_vec(data["g"]);
-        int mI = pyu::getattr_or<int>(model, "m_ineq", 0);
-        int mE = pyu::getattr_or<int>(model, "m_eq", 0);
-
-        dvec cI = (mI > 0 && !data["cI"].is_none()) ? pyconv::to_vec(data["cI"])
-                                                    : dvec::Zero(mI);
-        dvec cE = (mE > 0 && !data["cE"].is_none()) ? pyconv::to_vec(data["cE"])
-                                                    : dvec::Zero(mE);
-
-        spmat JI, JE;
-        if (!data["JI"].is_none())
-            JI = pyconv::to_sparse(data["JI"]);
-        if (!data["JE"].is_none())
-            JE = pyconv::to_sparse(data["JE"]);
-
-        Bounds B = detail::get_bounds(model, x);
-        const int n = static_cast<int>(x.size());
-
-        // Stationarity residual
-        dvec r_d = g;
-        if (JI.size())
-            r_d.noalias() += JI.transpose() * lam;
-        if (JE.size())
-            r_d.noalias() += JE.transpose() * nu;
-        r_d -= zL;
-        r_d += zU;
-
-        // Scaling factors
-        const double s_max = pyu::getattr_or<double>(cfg_, "ip_s_max", 100.0);
-        const int denom_ct = mI + mE + n;
-        const double sum_mults =
-            lam.lpNorm<1>() + nu.lpNorm<1>() + zL.lpNorm<1>() + zU.lpNorm<1>();
-        const double s_d =
-            clamp_min(sum_mults / clamp_min(denom_ct, 1), s_max) / s_max;
-        const double s_c =
-            clamp_min((zL.lpNorm<1>() + zU.lpNorm<1>()) / clamp_min(n, 1),
-                      s_max) /
-            s_max;
-
-        // Complementarity residuals
-        const bool use_shifted =
-            pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", false);
-        const double tau_shift = use_shifted ? st.tau_shift : 0.0;
-        const double bshift =
-            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0)
-                        : 0.0;
-
-        dvec r_comp_L(n), r_comp_U(n), r_comp_s;
-        if (use_shifted) {
-            for (int i = 0; i < n; ++i) {
-                r_comp_L[i] =
-                    B.hasL[i] ? ((B.sL[i] + bshift) * zL[i] - mu) : 0.0;
-                r_comp_U[i] =
-                    B.hasU[i] ? ((B.sU[i] + bshift) * zU[i] - mu) : 0.0;
-            }
-            if (mI > 0 && s.size()) {
-                r_comp_s.resize(s.size());
-                for (int i = 0; i < s.size(); ++i) {
-                    r_comp_s[i] = (s[i] + tau_shift) * lam[i] - mu;
-                }
-            }
-        } else {
-            for (int i = 0; i < n; ++i) {
-                r_comp_L[i] = B.hasL[i] ? (B.sL[i] * zL[i] - mu) : 0.0;
-                r_comp_U[i] = B.hasU[i] ? (B.sU[i] * zU[i] - mu) : 0.0;
-            }
-            if (mI > 0 && s.size()) {
-                r_comp_s.resize(s.size());
-                for (int i = 0; i < s.size(); ++i) {
-                    r_comp_s[i] = s[i] * lam[i] - mu;
-                }
-            }
-        }
-
-        return std::max(
-            {safe_inf_norm(r_d) / s_d, (mE > 0) ? safe_inf_norm(cE) : 0.0,
-             (mI > 0) ? safe_inf_norm(cI) : 0.0,
-             std::max(safe_inf_norm(r_comp_L), safe_inf_norm(r_comp_U)) / s_c,
-             (r_comp_s.size() > 0) ? (safe_inf_norm(r_comp_s) / s_c) : 0.0});
-    }
-
     [[nodiscard]] double update_mu_(double mu, const dvec &s, const dvec &lam,
-                                    double theta, py::dict &kkt, bool accepted,
+                                    double theta, KKT &kkt, bool accepted,
                                     double cond_H, double sigma, double mu_aff,
                                     bool use_shifted, double tau_shift) {
         const double mu_min = pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12);
@@ -1280,8 +1375,7 @@ private:
             detail::complementarity(s, lam, mu, tau_shift, use_shifted);
         const bool good =
             (accepted && theta <= theta_tol && comp <= comp_tol &&
-             kkt["stat"].cast<double>() <=
-                 pyu::getattr_or<double>(cfg_, "tol_stat", 1e-6) &&
+             kkt.stat <= pyu::getattr_or<double>(cfg_, "tol_stat", 1e-6) &&
              (std::isnan(cond_H) || cond_H <= cond_max));
 
         const double comp_ratio = comp / clamp_min(mu, 1e-12);

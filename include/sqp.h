@@ -17,6 +17,7 @@
 #include <unordered_map>
 
 #include "../include/tr.h" // TrustRegionManager, TRConfig, TRResult, TRInfo
+#include "definitions.h"
 
 namespace py = pybind11;
 using dvec = Eigen::VectorXd;
@@ -80,32 +81,6 @@ static py::object get_or_none(const py::dict &d, const char *k) {
     return py::none();
 }
 
-static py::dict tr_info_to_dict(const TRInfo &inf) {
-    py::dict d;
-    d["status"] = inf.status;
-    d["iterations"] = inf.iterations;
-    d["step_norm"] = inf.step_norm;
-    d["model_reduction"] = inf.model_reduction;
-    d["model_reduction_quad"] = inf.model_reduction_quad;
-    d["sigma_est"] = inf.sigma_est;
-    d["predicted_reduction_cubic"] = inf.predicted_reduction_cubic;
-    d["constraint_violation"] = inf.constraint_violation;
-    d["preconditioned"] = inf.preconditioned;
-    d["preconditioned_reduced"] = inf.preconditioned_reduced;
-    d["active_set_size"] = inf.active_set_size;
-    d["active_set_iterations"] = inf.active_set_iterations;
-    d["active_set_indices"] = py::cast(inf.active_set_indices);
-    d["accepted_by"] = inf.accepted_by;
-    d["accepted"] = inf.accepted;
-    d["soc_applied"] = inf.soc_applied;
-    d["theta0"] = inf.theta0;
-    d["theta1"] = inf.theta1;
-    d["criticality"] = inf.criticality;
-    d["criticality_shrinks"] = inf.criticality_shrinks;
-    // Note: rho not available from TRInfo; leave it unset or set to NaN.
-    return d;
-}
-
 // ------------------------ SQP Stepper (C++) ------------------------ //
 class SQPStepper {
 public:
@@ -120,10 +95,10 @@ public:
     }
 
     // step(model, x, lam, nu, it) -> (x_trial, lam_user, nu_new, info_dict)
-    std::tuple<dvec, dvec, dvec, py::dict> step(py::object model,
-                                                const dvec &x_in,
-                                                const dvec &lam_in,
-                                                const dvec &nu_in, int it) {
+    std::tuple<dvec, dvec, dvec, SolverInfo> step(py::object model,
+                                                  const dvec &x_in,
+                                                  const dvec &lam_in,
+                                                  const dvec &nu_in, int it) {
         // ---- 0) Box clipping ----
         std::optional<dvec> lb = get_opt_vec(model, "lb");
         std::optional<dvec> ub = get_opt_vec(model, "ub");
@@ -209,8 +184,8 @@ public:
         if (!p.allFinite()) {
             return std::make_tuple(
                 x, dvec(), dvec(),
-                make_info_dict(0.0, false, false, f0, theta0, py::dict(), 0,
-                               0.0, std::numeric_limits<double>::quiet_NaN(),
+                make_info_dict(0.0, false, false, f0, theta0, KKT{}, 0, 0.0,
+                               std::numeric_limits<double>::quiet_NaN(),
                                tr_.get_delta()));
         }
 
@@ -270,14 +245,14 @@ public:
             std::numeric_limits<double>::quiet_NaN(); // not exposed by TR
         const bool accepted = tinfo.accepted;
 
-        py::dict kkt_dict = kkt.to_dict();
-        py::dict tr_info = tr_info_to_dict(tinfo);
+        // py::dict kkt_dict = kkt.to_dict();
+        // py::dict tr_info = tr_info_to_dict(tinfo);
 
-        py::dict info =
-            make_info_dict(step_norm, accepted, converged, f1, theta1, kkt_dict,
-                           0, 1.0, rho, tr_.get_delta());
-        info["delta"] = tr_.get_delta();
-        info["tr"] = tr_info;
+        SolverInfo info =
+            make_info_dict(step_norm, accepted, converged, f1, theta1, kkt, 0,
+                           1.0, rho, tr_.get_delta());
+        info.delta = tr_.get_delta();
+        // info["tr"] = tr_info;
 
         return std::make_tuple(x_trial, lam_user, nu_new, info);
     }
@@ -380,18 +355,6 @@ private:
         }
     }
 
-    struct KKT {
-        double stat{0.0}, eq{0.0}, ineq{0.0}, comp{0.0};
-        py::dict to_dict() const {
-            py::dict d;
-            d["stat"] = stat;
-            d["eq"] = eq;
-            d["ineq"] = ineq;
-            d["comp"] = comp;
-            return d;
-        }
-    };
-
     static KKT compute_kkt(const dvec &g, const std::optional<dmat> &JE,
                            const std::optional<dmat> &JI,
                            const std::optional<dvec> &cE,
@@ -455,24 +418,40 @@ private:
         return {stat, feas_eq, ineq, comp};
     }
 
-    static py::dict make_info_dict(double step_norm, bool accepted,
-                                   bool converged, double f_val, double theta,
-                                   const py::dict &kkt, int ls_iters,
-                                   double alpha, double rho, double tr_delta) {
-        py::dict d;
-        d["step_norm"] = step_norm;
-        d["accepted"] = accepted;
-        d["converged"] = converged;
-        d["f"] = f_val;
-        d["theta"] = theta;
-        d["stat"] = kkt["stat"];
-        d["ineq"] = kkt["ineq"];
-        d["eq"] = kkt["eq"];
-        d["comp"] = kkt["comp"];
-        d["ls_iters"] = ls_iters;
-        d["alpha"] = alpha;
-        d["rho"] = rho;
-        d["tr_radius"] = tr_delta;
+    SolverInfo make_info_dict(double step_norm, bool accepted, bool converged,
+                              double f_val, double theta, const KKT &kkt,
+                              int ls_iters, double alpha, double rho,
+                              double tr_delta) {
+        SolverInfo d;
+        d.mode = "sqp";
+        d.step_norm = step_norm;
+        d.accepted = accepted;
+        d.converged = converged;
+        d.f = f_val;
+        d.theta = theta;
+        d.stat = kkt.stat;
+        d.ineq = kkt.ineq;
+        d.eq = kkt.eq;
+        d.comp = kkt.comp;
+        d.ls_iters = ls_iters;
+        d.alpha = alpha;
+        d.rho = rho;
+        d.tr_radius = tr_delta;
+        // Alternative: return as py::dict
+        // py::dict d;
+        // d["step_norm"] = step_norm;
+        // d["accepted"] = accepted;
+        // d["converged"] = converged;
+        // d["f"] = f_val;
+        // d["theta"] = theta;
+        // d["stat"] = kkt["stat"];
+        // d["ineq"] = kkt["ineq"];
+        // d["eq"] = kkt["eq"];
+        // d["comp"] = kkt["comp"];
+        // d["ls_iters"] = ls_iters;
+        // d["alpha"] = alpha;
+        // d["rho"] = rho;
+        // d["tr_radius"] = tr_delta;
         return d;
     }
 };

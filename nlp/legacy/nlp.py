@@ -125,8 +125,10 @@ class NLPSolver:
     # -------------------------------------------------------------------------
     def solve(self, max_iter: int = 2, tol: float = 1e-8, verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
         hist: List[Dict] = []
+        import time
         self.mode = "ip"
         for k in range(max_iter):
+            start_time = time.time()
             if self.mode == "ip":
                 info = self._ip_step(k)
             elif self.mode == "sqp":
@@ -179,6 +181,8 @@ class NLPSolver:
             #             )
             #         if verbose:
             #             hist[-1] = {**hist[-1], "switched_to": self.mode}
+            end_time = time.time()
+            print(f"Iteration {k} took {end_time - start_time:.3f} seconds.")
         return self.x, hist
 
     # -------------------------------------------------------------------------

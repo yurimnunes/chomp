@@ -4,11 +4,11 @@
 // Build: compile into a module (e.g., target name `nlp_hybrid_cpp`)
 // Requires: pybind11, Eigen, and your existing ip_cpp / sqp_cpp Python modules.
 
+#include <fmt/core.h>
 #include <pybind11/eigen.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <fmt/core.h>
 
 #include <Eigen/Core>
 #include <cmath>
@@ -19,6 +19,9 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include "fmt/color.h"
+#include "fmt/format.h"
 
 #include "../include/ip.h"
 #include "../include/sqp.h"
@@ -78,48 +81,84 @@ inline py::object import_attr(const char *mod, const char *name) {
     return m.attr(name);
 }
 
-// pretty, fixed-width iteration printer (ANSI if stdout is a TTY on Python
-// side)
 
-static void print_iteration_row(int k, const py::dict &info,
+// -------------------- Printer --------------------
+static void print_iteration_row(int k, const SolverInfo &info,
                                 const std::string &mode, int last_header_ref,
                                 bool force_header = false) {
-    const double f = info.contains("f")
-                         ? py::cast<double>(info["f"])
-                         : std::numeric_limits<double>::quiet_NaN();
-    const double theta = info.contains("theta")
-                             ? py::cast<double>(info["theta"])
-                             : std::numeric_limits<double>::quiet_NaN();
-    const double alpha =
-        info.contains("alpha") ? py::cast<double>(info["alpha"]) : 1.0;
-    const double step_n = info.contains("step_norm")
-                              ? py::cast<double>(info["step_norm"])
-                              : std::numeric_limits<double>::quiet_NaN();
-    const double delta = info.contains("tr_radius")
-                             ? py::cast<double>(info["tr_radius"])
-                             : std::numeric_limits<double>::quiet_NaN();
-    const bool acc =
-        info.contains("accepted") ? py::cast<bool>(info["accepted"]) : false;
+    using fmt::color;
+    using fmt::emphasis;
+    using fmt::fg;
 
-    const std::string sw =
-        info.contains("switched_to")
-            ? ("->" + py::cast<std::string>(info["switched_to"]))
-            : "";
+    static bool banner_printed = false;
+    static std::optional<double> f_prev;
+    static std::optional<double> theta_prev;
 
-    if (force_header || k == 0 || (k - last_header_ref) >= 20) {
-        fmt::print(" k  st  mode   sw        step        f           theta       alpha        Δ\n");
+    if (!banner_printed) {
+        // Banner
+        fmt::print(fg(color::cyan) | emphasis::bold, "\nCHOMP");
+        fmt::print(fg(color::light_gray) | emphasis::bold, " — made by ");
+        fmt::print(fg(color::yellow) | emphasis::bold, "L. O. Seman\n");
+
+        // Preamble
+        // if (info.n >= 0) {
+        //     fmt::print(fg(color::light_gray), "Problem: ");
+        //     fmt::print("n={}  mI={}  mE={}\n", info.n, info.mI, info.mE);
+        // }
+        // if (!mode.empty() || !info.hess.empty() || !info.reg.empty() || !info.backend.empty()) {
+        //     fmt::print(fg(color::light_gray), "Config:  ");
+        //     if (!mode.empty())        fmt::print("mode={}  ", mode);
+        //     if (!info.hess.empty())   fmt::print("hess={}  ", info.hess);
+        //     if (!info.reg.empty())    fmt::print("reg={}  ", info.reg);
+        //     if (!info.backend.empty())fmt::print("lin.solver={}  ", info.backend);
+        //     fmt::print("\n");
+        // }
+        // if (info.max_iter >= 0 || !std::isnan(info.tol)) {
+        //     fmt::print(fg(color::light_gray), "Limits:  ");
+        //     if (info.max_iter >= 0) fmt::print("max_iter={}  ", info.max_iter);
+        //     if (!std::isnan(info.tol)) fmt::print("tol={:.2e}  ", info.tol);
+        //     fmt::print("\n");
+        // }
+
+        // Header
+        // fmt::print(fg(color::light_gray) | emphasis::bold,
+        //            "\n {:>3s} {:>3s} {:>5s} {:>8s} {:>12s} {:>13s} {:>11s} {:>9s} {:>9s}\n",
+        //            "k", "st", "mode", "sw", "step", "f", "theta", "alpha", "Δ");
+        banner_printed = true;
     }
 
-    fmt::print("{:>2d} {:1s} [{:>3s}] {:<6s} {:>10.3e} {:>11.5e} {:>10.3e} {:>9.2e} {:>9.2e}\n",
-               k,
-               acc ? "A" : "R",
-               mode.substr(0, 3),
-               sw,
-               step_n,
-               f,
-               theta,
-               alpha,
-               delta);
+    // Periodic header
+    if (force_header || k == 0 || (k - last_header_ref) >= 20) {
+        fmt::print(fg(color::light_gray) | emphasis::bold,
+                   " {:>3s} {:>3s} {:>5s} {:>8s} {:>12s} {:>13s} {:>11s} {:>9s} {:>9s}\n",
+                   "k", "st", "mode", "sw", "step", "f", "theta", "alpha", "Δ");
+    }
+
+    // Trend-based color selection
+    auto trend_color = [](std::optional<double> prev, double val) -> fmt::color {
+        if (!prev.has_value() || std::isnan(val)) return color::white;
+        if (val < prev.value()) return color::green;
+        if (val > prev.value()) return color::red;
+        return color::white;
+    };
+    const auto f_col     = trend_color(f_prev, info.f);
+    const auto theta_col = trend_color(theta_prev, info.theta);
+    const auto st_col    = info.accepted ? color::green : color::red;
+
+    // Row
+    fmt::print(" {:>3d} ", k);
+    fmt::print(fg(st_col) | emphasis::bold, "{:>3s} ", info.accepted ? "A" : "R");
+    const std::string mode3 = mode.size() >= 3 ? mode.substr(0, 3) : mode;
+    // fmt::print("[{:>3s}] {:>8s} ", mode3, info.switched_to);
+
+    fmt::print("{:>12.3e} ", info.step_norm);
+    fmt::print(fg(f_col),     "{:>13.6e} ", info.f);
+    fmt::print(fg(theta_col), "{:>11.3e} ", info.theta);
+    fmt::print("{:>9.2e} {:>9.2e}\n", info.alpha, info.tr_radius);
+
+    // Update trends
+    if (!std::isnan(info.f))     f_prev     = info.f;
+    if (!std::isnan(info.theta)) theta_prev = info.theta;
 }
 
 } // namespace
@@ -193,7 +232,11 @@ public:
         auto Model = import_attr("nlp.blocks.aux", "Model");
         py::object cI = c_ineq_list.is_none() ? py::none() : c_ineq_list;
         py::object cE = c_eq_list.is_none() ? py::none() : c_eq_list;
+        auto start_time = std::chrono::high_resolution_clock::now();
         model_ = Model(f, cI, cE, n_, lb_py, ub_py);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end_time - start_time;
+        std::cout << "Model creation took " << elapsed.count() << " seconds.\n";
         // Managers (Python-side re-use)
         auto HessianManager = import_attr("nlp.blocks.aux", "HessianManager");
         auto RestorationManager =
@@ -239,7 +282,7 @@ public:
         // ip_mod.attr("InteriorPointStepper");
 
         ip_state_ = IPState(); // empty init, like Python
-        ip_stepper_ = new InteriorPointStepper(cfg_, hess_);
+        ip_stepper_ = new InteriorPointStepper(model_, cfg_, hess_);
 
         // SQP stepper
         sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_);
@@ -252,14 +295,25 @@ public:
     }
 
     // Returns (x: np.ndarray, hist: list[dict])
-    std::pair<py::array_t<double>, py::list>
-    solve(int max_iter = 100, double tol = 1e-8, bool verbose = true) {
+    py::array_t<double> solve(int max_iter = 100, double tol = 1e-8,
+                              bool verbose = true) {
         py::list hist;
 
         // for this port we force starting in IP (matching your current Python
         // snippet)
+        // add timer and init time count
+        // create totaltime var
+        const double tol_stat = get_float_attr_or(cfg_, "tol_stat", 1e-6);
+        const double tol_feas = get_float_attr_or(cfg_, "tol_feas", 1e-6);
+        const double tol_comp = get_float_attr_or(cfg_, "tol_comp", 1e-6);
+        double k_stat = std::numeric_limits<double>::infinity();
+        double k_ineq = std::numeric_limits<double>::infinity();
+        double k_eq = std::numeric_limits<double>::infinity();
+        double k_comp = std::numeric_limits<double>::infinity();
+        // auto total_start_time = std::chrono::high_resolution_clock::now();
         for (int k = 0; k < max_iter; ++k) {
-            py::dict info;
+            // auto start_time = std::chrono::high_resolution_clock::now();
+            SolverInfo info;
             if (mode_ == "ip") {
                 info = ip_step_(k);
             } else if (mode_ == "sqp") {
@@ -271,48 +325,34 @@ public:
                 info["accepted"] = false;
                 info["mode"] = "dfo";
             } else {
-                info = sqp_step_(k);
+                throw std::runtime_error("Unknown mode: " + mode_);
             }
-
-            hist.append(info);
+            // add elapsed time to info
+            // auto end_time = std::chrono::high_resolution_clock::now();
+            // std::chrono::duration<double> elapsed = end_time - start_time;
+            // std::cout << "Iteration " << k << " took " << elapsed.count()
+            //           << " seconds.\n";
+            // hist.append(info);
 
             if (verbose) {
                 print_iteration_row(
                     k, info, mode_, last_header_row_,
-                    /*force_header*/ (k == 0 || (k - last_header_row_) >= 20));
+                    /*force_header*/ (k == 0 || (k - last_header_row_) >=
+                    20));
                 if (k == 0 || (k - last_header_row_) >= 20)
                     last_header_row_ = k;
             }
 
-            // Global termination: fetch KKT vector if not present in `info`
-            py::dict kkt;
-            // start as empty
-            kkt["stat"] = std::numeric_limits<double>::quiet_NaN();
-            kkt["ineq"] = std::numeric_limits<double>::quiet_NaN();
-            kkt["eq"] = std::numeric_limits<double>::quiet_NaN();
-            kkt["comp"] = std::numeric_limits<double>::quiet_NaN();
-
-            bool have_all = info.contains("stat") && info.contains("ineq") &&
-                            info.contains("eq") && info.contains("comp");
-            if (have_all) {
-                kkt["stat"] = info["stat"];
-                kkt["ineq"] = info["ineq"];
-                kkt["eq"] = info["eq"];
-                kkt["comp"] = info["comp"];
-            } else {
-                kkt = model_.attr("kkt_residuals")(eigen_to_numpy(x_),
-                                                   eigen_to_numpy(lam_),
-                                                   eigen_to_numpy(nu_));
-            }
-
-            const double tol_stat = get_float_attr_or(cfg_, "tol_stat", 1e-6);
-            const double tol_feas = get_float_attr_or(cfg_, "tol_feas", 1e-6);
-            const double tol_comp = get_float_attr_or(cfg_, "tol_comp", 1e-6);
-
-            const double k_stat = py::cast<double>(kkt["stat"]);
-            const double k_ineq = py::cast<double>(kkt["ineq"]);
-            const double k_eq = py::cast<double>(kkt["eq"]);
-            const double k_comp = py::cast<double>(kkt["comp"]);
+            // auto time_to_convert = std::chrono::high_resolution_clock::now();
+            k_stat = info.stat;
+            k_ineq = info.ineq;
+            k_eq = info.eq;
+            k_comp = info.comp;
+            // auto time_after_convert = std::chrono::high_resolution_clock::now();
+            // std::chrono::duration<double> convert_elapsed =
+                // time_after_convert - time_to_convert;
+            // std::cout << "Conversion took " << convert_elapsed.count()
+            //           << " seconds.\n";
 
             if (k_stat <= tol_stat && k_ineq <= tol_feas && k_eq <= tol_feas &&
                 k_comp <= tol_comp) {
@@ -323,27 +363,30 @@ public:
 
             // Optional: auto-switch logic can be re-enabled here if desired.
         }
+        // auto total_end_time = std::chrono::high_resolution_clock::now();
+        // std::chrono::duration<double> total_elapsed =
+        //     total_end_time - total_start_time;
+        // std::cout << "Total solve time: " << total_elapsed.count()
+        //           << " seconds.\n";
 
-        return {eigen_to_numpy(x_), hist};
+        return eigen_to_numpy(x_);
     }
 
 private:
     // ---- steps --------------------------------------------------------------
 
-    py::dict ip_step_(int it) {
-        auto step_ret = ip_stepper_->step(model_,   // model
-                                          x_,       // x
-                                          lam_,     // lam
-                                          nu_,      // nu
-                                          it,       // iteration
-                                          ip_state_ // state
+    SolverInfo ip_step_(int it) {
+        auto step_ret = ip_stepper_->step( // model
+            x_,                            // x
+            lam_,                          // lam
+            nu_,                           // nu
+            it,                            // iteration
+            ip_state_                      // state
         );
         // Python returns: (x_out, lam_out, nu_out, info)
         auto [x_out, lam_out, nu_out, info] = step_ret;
 
-        const bool accepted = info.contains("accepted")
-                                  ? py::cast<bool>(info["accepted"])
-                                  : false;
+        const bool accepted = info.accepted;
         if (accepted) {
             x_ = std::move(x_out);
             lam_ = std::move(lam_out);
@@ -352,16 +395,14 @@ private:
         return info;
     }
 
-    py::dict sqp_step_(int it) {
+    SolverInfo sqp_step_(int it) {
         auto step_ret = sqp_stepper_->step(model_, x_, lam_, nu_, it);
 
         auto [x_out, lam_out, nu_out, info] = step_ret;
 
-        //update_streaks_(info);
+        // update_streaks_(info);
 
-        const bool accepted = info.contains("accepted")
-                                  ? py::cast<bool>(info["accepted"])
-                                  : false;
+        const bool accepted = info.accepted;
         if (accepted) {
             if (get_bool_attr_or(cfg_, "use_watchdog", false)) {
                 watchdog_update_(
