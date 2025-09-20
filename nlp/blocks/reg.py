@@ -1285,6 +1285,21 @@ class Regularizer:
         self._precond_fail_streak = 0
         self.sigma = float(getattr(self.cfg, "reg_sigma", 1e-8))
 
+    def make_psd_advanced(self,
+        H: ArrayLike,
+        regularizer: Regularizer,
+        iteration: int = 0,
+        model_quality: Optional[float] = None,
+        constraint_count: int = 0,
+    ) -> Tuple[ArrayLike, RegInfo]:
+        """Convert H to a numerically PSD-usable matrix via the enhanced regularizer."""
+        return self.regularize(
+            H,
+            iteration=iteration,
+            model_quality=model_quality,
+            constraint_count=constraint_count,
+        )
+
 # ---------- convenience API ----------
 def make_psd_advanced(
     H: ArrayLike,

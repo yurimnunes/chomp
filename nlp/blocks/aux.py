@@ -219,8 +219,8 @@ class Model:
         c_ineq: List[Callable] | None = None,
         c_eq: List[Callable] | None = None,
         n: int | None = None,
-        lb: np.ndarray | None = None,
-        ub: np.ndarray | None = None,
+        lb: np.ndarray = np.array([]),
+        ub: np.ndarray = np.array([]),
         use_sparse: bool = False,
     ):
         """Initialize model with objective `f`, constraints, and dimension `n`."""

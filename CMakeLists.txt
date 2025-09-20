@@ -226,10 +226,10 @@ if(AD_ENABLE_QDLDL)
   ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
 endif()
 
-  ad_add_pybind_module(foretree src/foretree_pybind.cpp)
+ad_add_pybind_module(foretree src/foretree_pybind.cpp)
+ad_add_pybind_module(chomp src/chomp.cpp)
 
-    ad_add_pybind_module(tr_cpp src/tr_cpp.cpp)
-
+# ad_add_pybind_module(ip_cpp src/ip.cpp)
 
 #ad_add_pybind_module(lbl_cpp src/lbl_bindings.cpp)
 

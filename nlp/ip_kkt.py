@@ -11,7 +11,7 @@ import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from numba import njit
 
-from .blocks.reg import Regularizer, make_preconditioner_only, make_psd_advanced
+from .blocks.reg import make_psd_advanced
 from .ip_cg import *
 
 # Expect these base classes in your codebase:
@@ -19,6 +19,7 @@ from .ip_cg import *
 
 try:
     from numba import njit
+
     _HAS_NUMBA = True
 except Exception:
     _HAS_NUMBA = False
@@ -71,6 +72,7 @@ def _upper_csc(K: sp.spmatrix) -> sp.csc_matrix:
 
     return Kup
 
+
 # ---------------------- Reusable handle interface ----------------------
 class KKTReusable(Protocol):
     def solve(
@@ -94,6 +96,7 @@ class KKTCache:
     prev_kkt_matrix: Optional[sp.spmatrix] = None
     prev_factorization: Optional[Any] = None
     matrix_change_tol: Optional[float] = 1e-4
+
 
 # ---------------------- Abstract strategy ----------------------
 class KKTStrategy:
@@ -121,12 +124,17 @@ class KKTStrategy:
 
 try:
     from numba import njit
+
     _HAS_NUMBA = True
 except Exception:
     _HAS_NUMBA = False
+
     def njit(*args, **kwargs):
-        def _wrap(f): return f
+        def _wrap(f):
+            return f
+
         return _wrap
+
 
 # ======================= HYKKT Strategy (Numba-enabled, fixed preconds) ==================
 
@@ -134,15 +142,10 @@ except Exception:
 # Utilities & Helpers
 # ------------------------------------------------------------------------------
 
-import math
-from typing import Any, Callable, Optional, Tuple
-
-import numpy as np
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
 
 try:
     from numba import njit
+
     _HAS_NUMBA = True
 except Exception:
     _HAS_NUMBA = False
@@ -151,7 +154,9 @@ except Exception:
 # ------------------------------------------------------------------------------
 # Safe diagonal LinearOperator preconditioner
 # ------------------------------------------------------------------------------
-def _make_diag_prec(diag: Optional[np.ndarray], n: int) -> Optional[spla.LinearOperator]:
+def _make_diag_prec(
+    diag: Optional[np.ndarray], n: int
+) -> Optional[spla.LinearOperator]:
     """
     Safe diagonal LinearOperator preconditioner.
     If diag is None -> return None.
@@ -161,9 +166,11 @@ def _make_diag_prec(diag: Optional[np.ndarray], n: int) -> Optional[spla.LinearO
     d = np.asarray(diag, dtype=np.float64).reshape(-1)
     if d.size != n:
         raise ValueError(f"Preconditioner diagonal has size {d.size}, expected {n}")
+
     def mv(z):
         z = np.asarray(z, dtype=np.float64).reshape(-1)
         return d * z
+
     return spla.LinearOperator((n, n), matvec=mv, rmatvec=mv, dtype=np.float64)
 
 
@@ -177,7 +184,11 @@ def _cg_matfree_py(matvec, b, x0=None, tol=1e-10, maxit=200, M=None):
     """
     b = np.asarray(b, dtype=np.float64)
     n = b.size
-    x = np.zeros(n, dtype=np.float64) if x0 is None else np.array(x0, dtype=np.float64, copy=True)
+    x = (
+        np.zeros(n, dtype=np.float64)
+        if x0 is None
+        else np.array(x0, dtype=np.float64, copy=True)
+    )
 
     r = b - matvec(x)
     z = r if M is None else (M @ r)
@@ -210,6 +221,7 @@ def _cg_matfree_py(matvec, b, x0=None, tol=1e-10, maxit=200, M=None):
 # Numba CSR kernels & CG for Kγ = W + δI + γ GᵀG (no Python callables in-loop)
 # ------------------------------------------------------------------------------
 if _HAS_NUMBA:
+
     @njit(cache=True, fastmath=True)
     def _csr_mv(indptr, indices, data, x, out):
         out[:] = 0.0
@@ -217,15 +229,15 @@ if _HAS_NUMBA:
         for i in range(n):
             s = 0.0
             rs = indptr[i]
-            re = indptr[i+1]
+            re = indptr[i + 1]
             for k in range(rs, re):
                 s += data[k] * x[indices[k]]
             out[i] = s
 
     @njit(cache=True, fastmath=True)
-    def _kgamma_mv_into(W_indptr, W_indices, W_data,
-                        G_indptr, G_indices, G_data,
-                        x, delta, gamma, out):
+    def _kgamma_mv_into(
+        W_indptr, W_indices, W_data, G_indptr, G_indices, G_data, x, delta, gamma, out
+    ):
         # out = (W + δI + γ GᵀG) x
         n = out.size
         # out := W x
@@ -243,15 +255,13 @@ if _HAS_NUMBA:
             for i in range(m):
                 ti = gamma * tmp[i]
                 rs = G_indptr[i]
-                re = G_indptr[i+1]
+                re = G_indptr[i + 1]
                 for k in range(rs, re):
                     out[G_indices[k]] += G_data[k] * ti
 
     # ---------- SSOR preconditioner (on W + diag) ----------
     @njit(cache=True, fastmath=True)
-    def _ssor_apply_W_diag(W_indptr, W_indices, W_data,
-                           Kdiag, omega, sweeps,
-                           rhs, out):
+    def _ssor_apply_W_diag(W_indptr, W_indices, W_data, Kdiag, omega, sweeps, rhs, out):
         """
         out := M^{-1} rhs where M is SSOR(tilde K), tilde K ≈ W + diag(Kdiag).
         Two GS sweeps per 'sweeps' (forward, then backward). In-place write to 'out'.
@@ -263,7 +273,8 @@ if _HAS_NUMBA:
         for _ in range(sweeps):
             # forward
             for i in range(n):
-                rs = W_indptr[i]; re = W_indptr[i+1]
+                rs = W_indptr[i]
+                re = W_indptr[i + 1]
                 sumLU = 0.0
                 for k in range(rs, re):
                     j = W_indices[k]
@@ -274,7 +285,8 @@ if _HAS_NUMBA:
             # backward
             for ii in range(n):
                 i = n - 1 - ii
-                rs = W_indptr[i]; re = W_indptr[i+1]
+                rs = W_indptr[i]
+                re = W_indptr[i + 1]
                 sumLU = 0.0
                 for k in range(rs, re):
                     j = W_indices[k]
@@ -284,13 +296,26 @@ if _HAS_NUMBA:
                 out[i] = (1.0 - omega) * out[i] + omega * (rhs[i] - sumLU) / Kdiag[i]
 
     @njit(cache=True, fastmath=True)
-    def _cg_Kgamma_numba(W_indptr, W_indices, W_data,
-                         G_indptr, G_indices, G_data,
-                         b, x, tol, maxit,
-                         Minv_diag, use_prec,
-                         delta, gamma,
-                         use_ssor, ssor_omega, ssor_sweeps,
-                         Kdiag_full):
+    def _cg_Kgamma_numba(
+        W_indptr,
+        W_indices,
+        W_data,
+        G_indptr,
+        G_indices,
+        G_data,
+        b,
+        x,
+        tol,
+        maxit,
+        Minv_diag,
+        use_prec,
+        delta,
+        gamma,
+        use_ssor,
+        ssor_omega,
+        ssor_sweeps,
+        Kdiag_full,
+    ):
         """
         CG specialized for Kγ x = b with Kγ = W + δI + γ GᵀG (all CSR buffers).
         - b, x are float64 arrays
@@ -298,22 +323,40 @@ if _HAS_NUMBA:
         - If use_ssor, apply SSOR on tilde K ≈ W + diag(Kdiag_full)
         """
         n = b.size
-        r  = np.empty(n, dtype=np.float64)
-        z  = np.empty(n, dtype=np.float64)
-        p  = np.empty(n, dtype=np.float64)
+        r = np.empty(n, dtype=np.float64)
+        z = np.empty(n, dtype=np.float64)
+        p = np.empty(n, dtype=np.float64)
         Ap = np.empty(n, dtype=np.float64)
 
         # r := b - Kγ x
-        _kgamma_mv_into(W_indptr, W_indices, W_data,
-                        G_indptr, G_indices, G_data,
-                        x, delta, gamma, Ap)
+        _kgamma_mv_into(
+            W_indptr,
+            W_indices,
+            W_data,
+            G_indptr,
+            G_indices,
+            G_data,
+            x,
+            delta,
+            gamma,
+            Ap,
+        )
         for i in range(n):
             r[i] = b[i] - Ap[i]
 
         # z := M^{-1} r
         if use_prec:
             if use_ssor:
-                _ssor_apply_W_diag(W_indptr, W_indices, W_data, Kdiag_full, ssor_omega, ssor_sweeps, r, z)
+                _ssor_apply_W_diag(
+                    W_indptr,
+                    W_indices,
+                    W_data,
+                    Kdiag_full,
+                    ssor_omega,
+                    ssor_sweeps,
+                    r,
+                    z,
+                )
             else:
                 for i in range(n):
                     z[i] = r[i] * Minv_diag[i]
@@ -328,16 +371,25 @@ if _HAS_NUMBA:
         nrm0 = 0.0
         for i in range(n):
             rz_old += r[i] * z[i]
-            nrm0  += r[i] * r[i]
+            nrm0 += r[i] * r[i]
         nrm0 = np.sqrt(nrm0)
         stop = tol * nrm0
         if nrm0 <= stop:
             return 0
 
         for it in range(1, maxit + 1):
-            _kgamma_mv_into(W_indptr, W_indices, W_data,
-                            G_indptr, G_indices, G_data,
-                            p, delta, gamma, Ap)
+            _kgamma_mv_into(
+                W_indptr,
+                W_indices,
+                W_data,
+                G_indptr,
+                G_indices,
+                G_data,
+                p,
+                delta,
+                gamma,
+                Ap,
+            )
             pAp = 0.0
             for i in range(n):
                 pAp += p[i] * Ap[i]
@@ -347,16 +399,25 @@ if _HAS_NUMBA:
             alpha = rz_old / pAp
             nr = 0.0
             for i in range(n):
-                x[i]  = x[i]  + alpha * p[i]
-                r[i]  = r[i]  - alpha * Ap[i]
-                nr   += r[i]  * r[i]
+                x[i] = x[i] + alpha * p[i]
+                r[i] = r[i] - alpha * Ap[i]
+                nr += r[i] * r[i]
             nr = np.sqrt(nr)
             if nr <= stop:
                 return it
 
             if use_prec:
                 if use_ssor:
-                    _ssor_apply_W_diag(W_indptr, W_indices, W_data, Kdiag_full, ssor_omega, ssor_sweeps, r, z)
+                    _ssor_apply_W_diag(
+                        W_indptr,
+                        W_indices,
+                        W_data,
+                        Kdiag_full,
+                        ssor_omega,
+                        ssor_sweeps,
+                        r,
+                        z,
+                    )
                 else:
                     for i in range(n):
                         z[i] = r[i] * Minv_diag[i]
@@ -378,7 +439,9 @@ if _HAS_NUMBA:
 # ------------------------------------------------------------------------------
 # Hutchinson diag(K^{-1}) via a matrix-free inner solve
 # ------------------------------------------------------------------------------
-def hutch_diag_Kinv_via_inner(inner_solve, n: int, probes: int = 8, clip: float = 1e-12, seed: int = 12345):
+def hutch_diag_Kinv_via_inner(
+    inner_solve, n: int, probes: int = 8, clip: float = 1e-12, seed: int = 12345
+):
     """
     Estimate diag(K^{-1}) ≈ E[(K^{-1} z) ⊙ z], z in {±1}^n
     Uses provided `inner_solve(rhs) -> x` (e.g., numba K-CG).
@@ -389,7 +452,7 @@ def hutch_diag_Kinv_via_inner(inner_solve, n: int, probes: int = 8, clip: float 
     acc = np.zeros(n, dtype=float)
     # Running variance (kept for potential future adaptive stopping)
     mean = np.zeros(n, dtype=float)
-    m2   = np.zeros(n, dtype=float)
+    m2 = np.zeros(n, dtype=float)
     for t in range(1, probes + 1):
         z = rng.integers(0, 2, size=n, dtype=np.int8).astype(float)
         z[z == 0] = -1.0
@@ -399,7 +462,7 @@ def hutch_diag_Kinv_via_inner(inner_solve, n: int, probes: int = 8, clip: float 
         # Welford update
         delta = s - mean
         mean += delta / t
-        m2   += delta * (s - mean)
+        m2 += delta * (s - mean)
     d = acc / float(probes)
     d[~np.isfinite(d)] = clip
     return np.maximum(d, clip)
@@ -417,6 +480,7 @@ class HYKKTStrategy(KKTStrategy):
       • Adaptive gamma control and inexact-Newton forcing for CG
       • Aggressive reuse of factorizations & preconditioners
     """
+
     name = "hykkt"
 
     def __init__(self, cholmod_loader: Optional[Callable[[], Any]] = None):
@@ -454,7 +518,9 @@ class HYKKTStrategy(KKTStrategy):
         return np.array((G.multiply(G)).sum(axis=0)).ravel().astype(float)
 
     @staticmethod
-    def _forcing_tol(base_tol: float, mu: Optional[float], phase: Optional[str]) -> float:
+    def _forcing_tol(
+        base_tol: float, mu: Optional[float], phase: Optional[str]
+    ) -> float:
         # Inexact-Newton forcing (looser early, tighter late)
         if mu is not None:
             return max(base_tol, min(0.5, math.sqrt(max(mu, 0.0))) * base_tol)
@@ -472,7 +538,9 @@ class HYKKTStrategy(KKTStrategy):
         y[~np.isfinite(y)] = eps
         return np.maximum(y, eps)
 
-    def _hutch_diag_Kinv(self, cholK, n: int, probes: int, clip: float) -> Optional[np.ndarray]:
+    def _hutch_diag_Kinv(
+        self, cholK, n: int, probes: int, clip: float
+    ) -> Optional[np.ndarray]:
         """Hutchinson diagonal estimate for K^{-1}: mean((K^{-1} z) ⊙ z), z ∈ {±1}^n."""
         if probes <= 0 or cholK is None:
             return None
@@ -487,8 +555,15 @@ class HYKKTStrategy(KKTStrategy):
         return self._clip_pos(acc, clip)
 
     # ---------- gamma adaptation ----------
-    def _adapt_gamma(self, gamma: float, cg_iters: Optional[int], target: int, bounds: Tuple[float, float],
-                     inc: float, dec: float) -> float:
+    def _adapt_gamma(
+        self,
+        gamma: float,
+        cg_iters: Optional[int],
+        target: int,
+        bounds: Tuple[float, float],
+        inc: float,
+        dec: float,
+    ) -> float:
         if cg_iters is None:
             return gamma
         gmin, gmax = bounds
@@ -583,7 +658,9 @@ class HYKKTStrategy(KKTStrategy):
                 K_diag = K.diagonal().astype(float)
             else:
                 # approximate diag(K) cheaply without rebuilding
-                K_diag = (W.diagonal().astype(float) + delta + gamma * self._diag_of_GtG(G))
+                K_diag = (
+                    W.diagonal().astype(float) + delta + gamma * self._diag_of_GtG(G)
+                )
 
             cholK = self._cholK
 
@@ -601,12 +678,14 @@ class HYKKTStrategy(KKTStrategy):
                 elif not sticky_schur:
                     need_S_build = True
                 elif sticky_schur and schur_reuse_tol > 0.0:
-                    g_rel = abs((gamma - (self._last_gamma or gamma)) / max(1.0, abs(gamma)))
-                    need_S_build = (g_rel > schur_reuse_tol)
+                    g_rel = abs(
+                        (gamma - (self._last_gamma or gamma)) / max(1.0, abs(gamma))
+                    )
+                    need_S_build = g_rel > schur_reuse_tol
             if use_exact_S and need_S_build:
                 GT_dense = np.asfortranarray(G.T.toarray())  # (n, m)
-                Z = cholK.solve_A(GT_dense)                  # (n, m)
-                S_dense = G @ Z                              # (m, m)
+                Z = cholK.solve_A(GT_dense)  # (n, m)
+                S_dense = G @ Z  # (m, m)
                 S = sp.csc_matrix(np.asarray(S_dense))
                 self._S_explicit = S
                 self._cholS = cholmod.cholesky(S)
@@ -624,13 +703,19 @@ class HYKKTStrategy(KKTStrategy):
                 # Optional Hutchinson refinement for diag(K^{-1})
                 diag_Kinv = None
                 if hutch_probes > 0:
-                    diag_Kinv = self._hutch_diag_Kinv(cholK, n, hutch_probes, hutch_clip)
+                    diag_Kinv = self._hutch_diag_Kinv(
+                        cholK, n, hutch_probes, hutch_clip
+                    )
                 if diag_Kinv is None:
                     diag_Kinv = inv_diagK  # fallback
 
                 # diag( S ) ≈ (G.^2) @ diag(K^{-1})
-                Sdiag_hat = np.asarray((G.multiply(G)).dot(diag_Kinv), dtype=float).ravel()
-                Sinv_diag = 1.0 / np.maximum(Sdiag_hat, 1e-12) if jacobi_schur_prec else None
+                Sdiag_hat = np.asarray(
+                    (G.multiply(G)).dot(diag_Kinv), dtype=float
+                ).ravel()
+                Sinv_diag = (
+                    1.0 / np.maximum(Sdiag_hat, 1e-12) if jacobi_schur_prec else None
+                )
                 M = _make_diag_prec(Sinv_diag, m) if jacobi_schur_prec else None
 
                 def S_mv(y: np.ndarray) -> np.ndarray:
@@ -641,88 +726,148 @@ class HYKKTStrategy(KKTStrategy):
                 x0 = cache.prev_dy if cache.prev_dy is not None else None
 
                 # Python CG here (cholK.solve_A is a Python method)
-                dy, cg_iters = _cg_matfree_py(S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M)
+                dy, cg_iters = _cg_matfree_py(
+                    S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M
+                )
                 dx = cholK.solve_A(svec - (G.T @ dy))
 
             # Adaptive gamma update (for next call)
             if adaptive_gamma:
-                new_gamma = self._adapt_gamma(gamma, cg_iters, target_cg, gamma_bounds, gamma_increase, gamma_decrease)
+                new_gamma = self._adapt_gamma(
+                    gamma,
+                    cg_iters,
+                    target_cg,
+                    gamma_bounds,
+                    gamma_increase,
+                    gamma_decrease,
+                )
                 self._last_gamma = new_gamma  # hint next time
 
             # Save stats and warm-starts
             if save_cg_stats:
-                cache.hykkt_stats = {"schur_cg_iters": cg_iters, "m": m, "n": n, "gamma": gamma}
+                cache.hykkt_stats = {
+                    "schur_cg_iters": cg_iters,
+                    "m": m,
+                    "n": n,
+                    "gamma": gamma,
+                }
             cache.prev_dx, cache.prev_dy = dx, dy
             self._last_cg_iters = cg_iters
 
             # Reusable solver
             if self._cholS is not None:
+
                 class _Reusable(KKTReusable):
                     def __init__(self, cholK, cholS, G, gamma):
-                        self.cholK = cholK; self.cholS = cholS
-                        self.G = G; self.gamma = float(gamma)
+                        self.cholK = cholK
+                        self.cholS = cholS
+                        self.G = G
+                        self.gamma = float(gamma)
+
                     def solve(self, r1n, r2n, cg_tol=1e-8, cg_maxit=200):
                         svec_n = r1n + self.gamma * (self.G.T @ r2n)
                         rhs_s_n = (self.G @ self.cholK.solve_A(svec_n)) - r2n
                         dyn = self.cholS.solve_A(rhs_s_n)
                         dxn = self.cholK.solve_A(svec_n - (self.G.T @ dyn))
                         return dxn, dyn
+
                 return dx, dy, _Reusable(cholK, self._cholS, G, gamma)
             else:
+
                 class _Reusable(KKTReusable):
                     def __init__(self, cholK, G, gamma, Sinv_diag):
-                        self.cholK = cholK; self.G = G; self.gamma = float(gamma); self.Sinv_diag = Sinv_diag
+                        self.cholK = cholK
+                        self.G = G
+                        self.gamma = float(gamma)
+                        self.Sinv_diag = Sinv_diag
+
                     def solve(self, r1n, r2n, cg_tol=1e-8, cg_maxit=200):
                         svec_n = r1n + self.gamma * (self.G.T @ r2n)
                         rhs_s_n = (self.G @ self.cholK.solve_A(svec_n)) - r2n
-                        def S_mv_n(y): return self.G @ self.cholK.solve_A(self.G.T @ y)
-                        M_n = _make_diag_prec(self.Sinv_diag, self.G.shape[0]) if self.Sinv_diag is not None else None
-                        dyn, _ = _cg_matfree_py(S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n)
+
+                        def S_mv_n(y):
+                            return self.G @ self.cholK.solve_A(self.G.T @ y)
+
+                        M_n = (
+                            _make_diag_prec(self.Sinv_diag, self.G.shape[0])
+                            if self.Sinv_diag is not None
+                            else None
+                        )
+                        dyn, _ = _cg_matfree_py(
+                            S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n
+                        )
                         dxn = self.cholK.solve_A(svec_n - (self.G.T @ dyn))
                         return dxn, dyn
-                return dx, dy, _Reusable(cholK, G, gamma, Sinv_diag if jacobi_schur_prec else None)
+
+                return (
+                    dx,
+                    dy,
+                    _Reusable(
+                        cholK, G, gamma, Sinv_diag if jacobi_schur_prec else None
+                    ),
+                )
 
         # --- PATH B: Matrix-free CG for K_gamma (Numba-accelerated) -----
         # Build Kγ diag and its inverse
-        diagW   = np.asarray(W.diagonal(), dtype=np.float64)
+        diagW = np.asarray(W.diagonal(), dtype=np.float64)
         diagGtG = self._diag_of_GtG(G)
-        Kdiag   = np.maximum(diagW + delta + gamma * diagGtG, 1e-12)
+        Kdiag = np.maximum(diagW + delta + gamma * diagGtG, 1e-12)
         Minv_diag = 1.0 / Kdiag
-        use_prec  = True
+        use_prec = True
 
         # SSOR knobs
-        use_ssor    = bool(kw.get("kgamma_use_ssor", True))
-        ssor_omega  = float(kw.get("kgamma_ssor_omega", 1.4))  # 1.2–1.6 often good
-        ssor_sweeps = int(kw.get("kgamma_ssor_sweeps", 1))     # 1 sweep default
+        use_ssor = bool(kw.get("kgamma_use_ssor", True))
+        ssor_omega = float(kw.get("kgamma_ssor_omega", 1.4))  # 1.2–1.6 often good
+        ssor_sweeps = int(kw.get("kgamma_ssor_sweeps", 1))  # 1 sweep default
 
         # Prepare CSR arrays for Numba
         W_csr = W.tocsr()
         G_csr = G.tocsr()
-        W_indptr = W_csr.indptr.astype(np.int64); W_indices = W_csr.indices.astype(np.int64); W_data = W_csr.data.astype(np.float64)
-        G_indptr = G_csr.indptr.astype(np.int64); G_indices = G_csr.indices.astype(np.int64); G_data = G_csr.data.astype(np.float64)
+        W_indptr = W_csr.indptr.astype(np.int64)
+        W_indices = W_csr.indices.astype(np.int64)
+        W_data = W_csr.data.astype(np.float64)
+        G_indptr = G_csr.indptr.astype(np.int64)
+        G_indices = G_csr.indices.astype(np.int64)
+        G_data = G_csr.data.astype(np.float64)
 
         # Forcing on inner K-solve tolerance
-        inner_tol   = self._forcing_tol(max(1e-2 * cg_tol, 1e-12), mu, phase)
+        inner_tol = self._forcing_tol(max(1e-2 * cg_tol, 1e-12), mu, phase)
         inner_maxit = max(10 * cg_maxit, 200)
 
         def inner_solve(q: np.ndarray) -> np.ndarray:
             q = np.asarray(q, dtype=np.float64)
             x = np.zeros_like(q, dtype=np.float64)
             if _HAS_NUMBA:
-                _ = _cg_Kgamma_numba(W_indptr, W_indices, W_data,
-                                     G_indptr, G_indices, G_data,
-                                     q, x,
-                                     float(inner_tol), int(inner_maxit),
-                                     Minv_diag, use_prec,
-                                     float(delta), float(gamma),
-                                     use_ssor, ssor_omega, ssor_sweeps,
-                                     Kdiag)
+                _ = _cg_Kgamma_numba(
+                    W_indptr,
+                    W_indices,
+                    W_data,
+                    G_indptr,
+                    G_indices,
+                    G_data,
+                    q,
+                    x,
+                    float(inner_tol),
+                    int(inner_maxit),
+                    Minv_diag,
+                    use_prec,
+                    float(delta),
+                    float(gamma),
+                    use_ssor,
+                    ssor_omega,
+                    ssor_sweeps,
+                    Kdiag,
+                )
                 return x
             else:
                 # Fallback to Python CG if Numba unavailable
-                def K_mv_py(v): return (W @ v) + delta * v + gamma * (G.T @ (G @ v))
-                M_K_py  = _make_diag_prec(Minv_diag, n)
-                x_py, _ = _cg_matfree_py(K_mv_py, q, x0=None, tol=inner_tol, maxit=inner_maxit, M=M_K_py)
+                def K_mv_py(v):
+                    return (W @ v) + delta * v + gamma * (G.T @ (G @ v))
+
+                M_K_py = _make_diag_prec(Minv_diag, n)
+                x_py, _ = _cg_matfree_py(
+                    K_mv_py, q, x0=None, tol=inner_tol, maxit=inner_maxit, M=M_K_py
+                )
                 return x_py
 
         # Schur operator & rhs
@@ -732,7 +877,8 @@ class HYKKTStrategy(KKTStrategy):
         # Jacobi preconditioner for Schur: diag(Ŝ) using Hutchinson-refined diag(K^{-1})
         if jacobi_schur_prec:
             diag_Kinv = hutch_diag_Kinv_via_inner(
-                inner_solve, n,
+                inner_solve,
+                n,
                 probes=max(0, hutch_probes),
                 clip=hutch_clip,
                 seed=kw.get("hutch_seed", 12345),
@@ -754,149 +900,57 @@ class HYKKTStrategy(KKTStrategy):
             return G @ inner_solve(G.T @ y)
 
         # Outer Schur CG in Python (kept as-is)
-        dy, cg_iters = _cg_matfree_py(S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M_S)
+        dy, cg_iters = _cg_matfree_py(
+            S_mv, rhs_s, x0=x0, tol=schur_tol, maxit=cg_maxit, M=M_S
+        )
         dx = inner_solve(svec - (G.T @ dy))
 
         # Adaptive gamma update (for next calls)
         if adaptive_gamma:
-            new_gamma = self._adapt_gamma(gamma, cg_iters, target_cg, gamma_bounds, gamma_increase, gamma_decrease)
+            new_gamma = self._adapt_gamma(
+                gamma, cg_iters, target_cg, gamma_bounds, gamma_increase, gamma_decrease
+            )
             self._last_gamma = new_gamma
 
         if save_cg_stats:
-            cache.hykkt_stats = {"schur_cg_iters": cg_iters, "m": m, "n": n, "gamma": gamma, "path": "numba"}
+            cache.hykkt_stats = {
+                "schur_cg_iters": cg_iters,
+                "m": m,
+                "n": n,
+                "gamma": gamma,
+                "path": "numba",
+            }
 
         cache.prev_dx, cache.prev_dy = dx, dy
         self._last_cg_iters = cg_iters
 
         class _Reusable(KKTReusable):
             def __init__(self, G, inner_solve, gamma, Sinv_diag):
-                self.G = G; self.inner_solve = inner_solve; self.gamma = float(gamma); self.Sinv_diag = Sinv_diag
+                self.G = G
+                self.inner_solve = inner_solve
+                self.gamma = float(gamma)
+                self.Sinv_diag = Sinv_diag
+
             def solve(self, r1n, r2n, cg_tol=1e-8, cg_maxit=200):
                 svec_n = r1n + self.gamma * (self.G.T @ r2n)
                 rhs_s_n = (self.G @ self.inner_solve(svec_n)) - r2n
-                def S_mv_n(y): return self.G @ self.inner_solve(self.G.T @ y)
-                M_n = _make_diag_prec(self.Sinv_diag, self.G.shape[0]) if self.Sinv_diag is not None else None
-                dyn, _ = _cg_matfree_py(S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n)
+
+                def S_mv_n(y):
+                    return self.G @ self.inner_solve(self.G.T @ y)
+
+                M_n = (
+                    _make_diag_prec(self.Sinv_diag, self.G.shape[0])
+                    if self.Sinv_diag is not None
+                    else None
+                )
+                dyn, _ = _cg_matfree_py(
+                    S_mv_n, rhs_s_n, x0=None, tol=cg_tol, maxit=cg_maxit, M=M_n
+                )
                 dxn = self.inner_solve(svec_n - (self.G.T @ dyn))
                 return dxn, dyn
 
         return dx, dy, _Reusable(G, inner_solve, gamma, Sinv_diag)
 
-# ---------------------- Lifted SPD ----------------------
-# ---------------------- Lifted SPD (with CHOLMOD) ----------------------
-class LiftedStrategy(KKTStrategy):
-    """
-    LiftedKKT (τ-relaxation) — consistent with InteriorPointStepper.solve_KKT:
-      r1 = rhs_x, r2 = -cE.
-
-    System:
-      K_tau = W + δ_w I + (1/τ) Gᵀ G
-      K_tau dx = r1 - (1/τ) Gᵀ r2        # IMPORTANT: minus sign (since r2 = -cE)
-
-    Returns:
-      (dx, dy) with dy = 0 by default (true LiftedKKT has no equality dual step).
-      Set return_pseudo_dy=True to get dy_hat = (G dx - r2)/τ if you really need it.
-    """
-    name = "lifted"
-
-    def __init__(self, cholmod_loader: Optional[Callable[[], Any]] = None):
-        self._cholmod_loader = cholmod_loader
-        # tiny cache keyed on sparsity pattern only (values change every iter)
-        self._pat = None
-        self._chol = None
-        self._solveA = None
-        self._K = None
-        self._used = "none"
-
-    @staticmethod
-    def _eye(n: int):
-        return sp.eye(n, format="csr")
-
-    def factor_and_solve(self, W, G, r1, r2, cfg, reg, cache, **kw):
-        # --- inputs ---
-        assert G is not None and r2 is not None, "LiftedKKT needs equality Jacobian/residual"
-        W = W.tocsr() if not sp.isspmatrix_csr(W) else W
-        G = G.tocsr() if not sp.isspmatrix_csr(G) else G
-        n = int(W.shape[0])
-
-        # params
-        delta_w = float(cache.delta_w_last or 0.0)
-        tau = float(kw.get("tau", getattr(cfg, "lift_tau", 1e-8)))
-        tau = max(tau, 1e-16)
-        prefer_factorized = bool(kw.get("prefer_factorized", True))
-        max_refine = int(kw.get("max_refine", 2))
-        refine_tol = float(kw.get("refine_tol", 1e-10))
-        return_pseudo_dy = bool(kw.get("return_pseudo_dy", False))
-
-        # --- assemble K_tau ---
-        K = W.copy().tocsr()
-        if delta_w != 0.0:
-            K = (K + delta_w * self._eye(n)).tocsr()
-        if tau > 0.0:
-            K = (K + (1.0 / tau) * (G.T @ G).tocsr()).tocsr()
-        K_csc = K.tocsc()
-
-        # --- build RHS consistent with your (r1, r2) ---
-        # r2 = -cE  ⇒  r1 - (1/τ) Gᵀ r2 = r1 + (1/τ) Gᵀ cE
-        rhs = np.asarray(r1, float).ravel() - (1.0 / tau) * (G.T @ np.asarray(r2, float).ravel())
-
-        # --- (re)factorization cache on pattern only ---
-        pat = (W.shape, W.nnz, G.nnz)
-        if pat != self._pat:
-            self._chol = None
-            self._solveA = None
-            self._K = None
-            self._used = "none"
-            self._pat = pat
-
-        # --- factor: CHOLMOD → factorized → spsolve ---
-        solveA = None
-        used = "none"
-        try:
-            cholmod = self._cholmod_loader() if self._cholmod_loader else __import__("sksparse.cholmod", fromlist=["cholmod"])
-            chol = cholmod.cholesky(K_csc)
-            solveA = chol.solve_A
-            used = "cholmod"
-            self._chol = chol
-        except Exception:
-            if prefer_factorized:
-                try:
-                    solveA = spla.factorized(K_csc)
-                    used = "factorized"
-                except Exception:
-                    solveA = None
-                    used = "spsolve"
-
-        # --- solve & refinement (important for small τ) ---
-        dx = solveA(rhs) if solveA is not None else spla.spsolve(K_csc, rhs)
-        bnorm = np.linalg.norm(rhs)
-        for _ in range(max_refine):
-            r = rhs - (K_csc @ dx)
-            if np.linalg.norm(r) <= refine_tol * (bnorm + 1.0):
-                break
-            e = solveA(r) if solveA is not None else spla.spsolve(K_csc, r)
-            dx = dx + e
-
-        # LiftedKKT has no equality dual; keep dnu neutral unless explicitly requested.
-        if return_pseudo_dy:
-            dy = (G @ dx - np.asarray(r2, float).ravel()) * (1.0 / tau)  # δc-style pseudo
-        else:
-            dy = np.zeros_like(np.asarray(r2, float).ravel())
-
-        # save small state
-        self._solveA, self._K, self._used = solveA, K_csc, used
-        cache.prev_dx, cache.prev_dy = dx, dy
-
-        class _Reusable(KKTReusable):
-            def __init__(self, K, solveA):
-                self.K = K; self.solveA = solveA
-            def solve(self, r1n, r2n, **_):
-                rhsn = np.asarray(r1n, float).ravel() - (1.0 / tau) * (G.T @ np.asarray(r2n, float).ravel())
-                dxn = self.solveA(rhsn) if self.solveA is not None else spla.spsolve(self.K, rhsn)
-                dyn = np.zeros_like(np.asarray(r2n, float).ravel())
-                return dxn, dyn
-
-        return dx, dy, _Reusable(K_csc, solveA)
 
 # ---------------------- Indefinite LDLᵀ ----------------------
 class LDLStrategy(KKTStrategy):
@@ -1058,7 +1112,6 @@ def _load_cholmod():
 
 DEFAULT_KKT_REGISTRY = KKTSolverRegistry()
 DEFAULT_KKT_REGISTRY.register(HYKKTStrategy(cholmod_loader=_load_cholmod))
-DEFAULT_KKT_REGISTRY.register(LiftedStrategy())
 DEFAULT_KKT_REGISTRY.register(LDLStrategy(prefer_lldl=False))  # name "ldl"
 
 # Optional aliases if you want:

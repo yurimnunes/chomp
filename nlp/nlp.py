@@ -9,8 +9,12 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional, Tuple
 
+#import ip_cpp as ip
 import numpy as np
 import scipy.sparse as sp
+
+#from .sqp import *
+import sqp_cpp as sqp
 
 # ---- reuse shared infra (no duplication; we assume sqp_aux exists) ----
 from .blocks.aux import (
@@ -19,15 +23,10 @@ from .blocks.aux import (
     RestorationManager,
     SQPConfig,  # we extend via _ensure_cfg_fields
 )
-from .blocks.filter import *
-from .blocks.linesearch import *
 from .blocks.qp import *
 from .blocks.reg import Regularizer, make_psd_advanced
-from .blocks.soc import *
-from .blocks.tr import *
 from .dfo import *
 from .ip import *
-from .sqp import *
 
 
 # ---- small helper: extend config with new fields if missing ----
@@ -65,26 +64,13 @@ class NLPSolver:
         self.rest = RestorationManager(self.cfg)
         self.regularizer = Regularizer(self.cfg)
 
-        # Acceptance managers
-        self.filter = Filter(self.cfg) if self.cfg.use_filter else None
-        self.funnel = Funnel(self.cfg) if self.cfg.use_funnel else None
-
-        # Step infrastructure
-        self.tr = TrustRegionManager(self.cfg) if self.cfg.use_trust_region else None
-        self.ls = (
-            LineSearcher(self.cfg, self.filter, self.funnel) if self.cfg.use_line_search else None
-        )
         self.qp = QPSolver(self.cfg, Regularizer(self.cfg))
-        self.soc = SOCCorrector(self.cfg) if self.cfg.use_soc else None
 
         # SQP stepper
-        self.sqp_stepper = SQPStepper(
+        self.sqp_stepper = sqp.SQPStepper(
             self.cfg,
             self.hess,
-            TrustRegionManager(self.cfg),
-            None,
             self.qp,
-            None,
             self.regularizer,
             self.rest,
         )
@@ -94,18 +80,14 @@ class NLPSolver:
 
         # IP stepper + state
         self.ip_state = IPState.from_model(self.model, self.x, self.cfg)
-        ip_funnel = Funnel(self.cfg)
+        #ip_funnel = Funnel(self.cfg)
         self.ip_stepper = InteriorPointStepper(
             self.cfg,
             self.hess,
-            funnel=ip_funnel,
-            ls=LineSearcher(self.cfg, None, ip_funnel),
             regularizer=self.regularizer,
-            soc=None,
         )
         mI = len(c_ineq) if c_ineq else 0
         mE = len(c_eq) if c_eq else 0
-        #self.dfo_stepper = L1DFOStepper(self.model, self.cfg, x0=self.x, var_lb=lb, var_ub=ub)
 
         _ensure_cfg_fields(self.cfg)  # add missing fields if needed
 
@@ -125,13 +107,6 @@ class NLPSolver:
                 if theta0 > max(self.cfg.ip_switch_theta, 10 * self.cfg.tol_feas)
                 else "sqp"
             )
-
-        if self.filter:
-            self.filter.add_if_acceptable(
-                self.model.constraint_violation(self.x),
-                float(self.model.eval_all(self.x)["f"]),
-            )
-
         # Watchdog
         self.watchdog_patience = 5
         self.watchdog_counter = 0
@@ -148,8 +123,9 @@ class NLPSolver:
     # -------------------------------------------------------------------------
     # Public API
     # -------------------------------------------------------------------------
-    def solve(self, max_iter: int = 200, tol: float = 1e-8, verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
+    def solve(self, max_iter: int = 2, tol: float = 1e-8, verbose: bool = True) -> Tuple[np.ndarray, List[Dict]]:
         hist: List[Dict] = []
+        self.mode = "ip"
         for k in range(max_iter):
             if self.mode == "ip":
                 info = self._ip_step(k)
@@ -186,23 +162,23 @@ class NLPSolver:
                 if verbose: print(f"✓ Converged at iteration {k}")
                 break
 
-            # Auto-mode switch (lazy-create steppers)
-            if self.cfg.mode == "auto":
-                switched = self._maybe_switch_mode(k, info, kkt)
-                if switched:
-                    if self.mode == "ip" and self.ip_stepper is None:
-                        self.ip_state = IPState.from_model(self.model, self.x, self.cfg)
-                        self.ip_stepper = InteriorPointStepper(
-                            self.cfg, self.hess, funnel=self.funnel, ls=self.ls,
-                            regularizer=self.regularizer, soc=None
-                        )
-                    elif self.mode == "sqp" and self.sqp_stepper is None:
-                        self.sqp_stepper = SQPStepper(
-                            self.cfg, self.hess, self.tr, self.ls, self.qp, self.soc,
-                            self.regularizer, self.rest
-                        )
-                    if verbose:
-                        hist[-1] = {**hist[-1], "switched_to": self.mode}
+            # # Auto-mode switch (lazy-create steppers)
+            # if self.cfg.mode == "auto":
+            #     switched = self._maybe_switch_mode(k, info, kkt)
+            #     if switched:
+            #         if self.mode == "ip" and self.ip_stepper is None:
+            #             self.ip_state = IPState.from_model(self.model, self.x, self.cfg)
+            #             self.ip_stepper = InteriorPointStepper(
+            #                 self.cfg, self.hess,
+            #                 regularizer=self.regularizer, soc=None
+            #             )
+            #         elif self.mode == "sqp" and self.sqp_stepper is None:
+            #             self.sqp_stepper = SQPStepper(
+            #                 self.cfg, self.hess, self.tr, self.ls, self.qp, self.soc,
+            #                 self.regularizer, self.rest
+            #             )
+            #         if verbose:
+            #             hist[-1] = {**hist[-1], "switched_to": self.mode}
         return self.x, hist
 
     # -------------------------------------------------------------------------
