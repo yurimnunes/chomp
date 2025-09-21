@@ -39,13 +39,13 @@ using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 // ------------------------------ config -------------------------------
 struct ChompConfig {
     double cg_tol = 1e-6;
-    int cg_maxit = 200;
+    int cg_maxit = 25;
     double ip_hess_reg0 = 1e-8;
     double schur_dense_cutoff = 0.25;
-    std::string prec_type = "jacobi"; // "jacobi" | "ssor" | "none"
+    std::string prec_type = "ssor"; // "jacobi" | "ssor" | "none"
     double ssor_omega = 1.0;
-    std::string sym_ordering = "none"; // "amd" | "none"
-    bool use_simd = false;
+    std::string sym_ordering = "amd"; // "amd" | "none"
+    bool use_simd = true;
     int block_size = 256;
     bool adaptive_gamma = true;
 };

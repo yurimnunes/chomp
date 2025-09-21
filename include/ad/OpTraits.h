@@ -562,165 +562,185 @@ template <> struct OpTraits<Operator::Add> : BinaryOp<AddRule, _op_names::ADD> {
 // =====================================================================
 //                 MULTIPLY (n-ary) — keep your optimized version
 // =====================================================================
+// =====================================================================
+//                 MULTIPLY (n-ary) — O(m) with zero-aware math
+// =====================================================================
 template <> struct OpTraits<Operator::Multiply> {
     static constexpr const char *name = _op_names::MUL;
 
-    static inline std::vector<double> &tls_vals() {
-        thread_local std::vector<double> v;
-        return v;
-    }
-    static inline std::vector<double> &tls_dots() {
-        thread_local std::vector<double> v;
-        return v;
-    }
-    static inline std::vector<double> &tls_pre() {
-        thread_local std::vector<double> v;
-        return v;
-    }
-    static inline std::vector<double> &tls_suf() {
-        thread_local std::vector<double> v;
-        return v;
-    }
+    // Thread-local scratch (kept tiny; we only need indices)
+    static inline std::vector<double> &tls_vals() { thread_local std::vector<double> v; return v; }
+    static inline std::vector<double> &tls_dots() { thread_local std::vector<double> v; return v; }
 
-    static inline void build_prefix_suffix(const std::vector<double> &vals,
-                                           std::vector<double> &pre,
-                                           std::vector<double> &suf) {
-        const size_t m = vals.size();
-        pre.assign(m + 1, 1.0);
-        suf.assign(m + 1, 1.0);
-        for (size_t i = 0; i < m; ++i)
-            pre[i + 1] = pre[i] * vals[i];
-        for (size_t i = m; i-- > 0;)
-            suf[i] = suf[i + 1] * vals[i];
-    }
-
-    static inline void forward(ADNode &n, ADGraph &g) {
-        if (!_nary_ok(n))
-            return;
-        double p = 1.0;
-        for (auto &a : n.inputs)
-            p *= a->value;
-        set_epoch_value(n.value, n.val_epoch, g.cur_val_epoch_, p);
-    }
-    static inline void forward_dot(ADNode &n, ADGraph &g) {
-        if (!_nary_ok(n))
-            return;
-        const size_t m = n.inputs.size();
-        auto &vals = tls_vals();
-        auto &dots = tls_dots();
-        vals.resize(m);
-        dots.resize(m);
-        for (size_t i = 0; i < m; ++i) {
-            vals[i] = n.inputs[i]->value;
-            dots[i] = n.inputs[i]->dot;
+    // Helper: count zeros, track index of the (unique) zero if any, and product of nonzeros
+    static inline void analyze_inputs(const std::vector<std::shared_ptr<ADNode>> &ins,
+                                      size_t &zero_count, size_t &zero_idx,
+                                      double &prod_nz) {
+        zero_count = 0; zero_idx = (size_t)-1; prod_nz = 1.0;
+        const size_t m = ins.size();
+        for (size_t i=0;i<m;++i) {
+            const double v = ins[i]->value;
+            if (v == 0.0) {
+                if (++zero_count == 1) zero_idx = i;
+            } else {
+                prod_nz *= v;
+            }
         }
-        auto &pre = tls_pre();
-        auto &suf = tls_suf();
-        build_prefix_suffix(vals, pre, suf);
-        double ds = 0.0;
-        for (size_t i = 0; i < m; ++i)
-            ds += dots[i] * pre[i] * suf[i + 1];
-        set_epoch_value(n.dot, n.dot_epoch, g.cur_dot_epoch_, ds);
+    }
+
+    // y = Π x_i
+    static inline void forward(ADNode &n, ADGraph &g) {
+        if (!_nary_ok(n)) return;
+        size_t zc, zi; double prod_nz;
+        analyze_inputs(n.inputs, zc, zi, prod_nz);
+        const double y = (zc == 0) ? prod_nz : 0.0;
+        set_epoch_value(n.value, n.val_epoch, g.cur_val_epoch_, y);
+    }
+
+    // ẏ = y * Σ (ẋ_i / x_i), but handle zeros:
+    //  - if zc>=2 -> y=0 and local Jacobian is zero ⇒ ẏ=0
+    //  - if zc==1 -> only term from the zero index survives: ẏ = ẋ_z * Π_{j≠z} x_j
+    //  - if zc==0 -> formula above
+    static inline void forward_dot(ADNode &n, ADGraph &g) {
+        if (!_nary_ok(n)) return;
+        const size_t m = n.inputs.size();
+
+        size_t zc, zi; double prod_nz;
+        analyze_inputs(n.inputs, zc, zi, prod_nz);
+
+        double ydot = 0.0;
+        if (zc >= 2) {
+            ydot = 0.0;
+        } else if (zc == 1) {
+            // y = 0 but dy/dx_z = Π_{j≠z} x_j
+            ydot = n.inputs[zi]->dot * prod_nz;
+        } else {
+            // regular case
+            double sum = 0.0;
+            for (size_t i=0;i<m;++i) {
+                const double xi = n.inputs[i]->value;
+                // xi != 0 here
+                sum += n.inputs[i]->dot / xi;
+            }
+            ydot = prod_nz * sum;
+        }
+
+        set_epoch_value(n.dot, n.dot_epoch, g.cur_dot_epoch_, ydot);
         touch_epoch(n.val_epoch, g.cur_val_epoch_);
     }
+
+    // ∂y/∂x_i:
+    //  - zc>=2 -> 0
+    //  - zc==1 -> only i==zi gets Π_{j≠zi} x_j
+    //  - zc==0 -> y / x_i
     static inline void backward(ADNode &n, ADGraph &g) {
-        if (!_nary_ok(n))
-            return;
+        if (!_nary_ok(n)) return;
         const size_t m = n.inputs.size();
-        auto &vals = tls_vals();
-        vals.resize(m);
-        for (size_t i = 0; i < m; ++i)
-            vals[i] = n.inputs[i]->value;
-        auto &pre = tls_pre();
-        auto &suf = tls_suf();
-        build_prefix_suffix(vals, pre, suf);
-        for (size_t i = 0; i < m; ++i) {
-            const double P_wo_i = pre[i] * suf[i + 1];
-            ensure_epoch_zero(n.inputs[i]->gradient, n.inputs[i]->grad_epoch,
-                              g.cur_grad_epoch_) += n.gradient * P_wo_i;
+
+        size_t zc, zi; double prod_nz;
+        analyze_inputs(n.inputs, zc, zi, prod_nz);
+
+        const double w = n.gradient;
+        if (zc >= 2) {
+            // all zero; nothing to do
+            return;
+        } else if (zc == 1) {
+            auto &gacc = ensure_epoch_zero(n.inputs[zi]->gradient, n.inputs[zi]->grad_epoch, g.cur_grad_epoch_);
+            gacc += w * prod_nz;
+            return;
+        } else {
+            // zc==0
+            for (size_t i=0;i<m;++i) {
+                const double xi = n.inputs[i]->value; // nonzero
+                auto &gacc = ensure_epoch_zero(n.inputs[i]->gradient, n.inputs[i]->grad_epoch, g.cur_grad_epoch_);
+                gacc += w * (prod_nz / xi);
+            }
         }
     }
+
+    // H·v column for product:
+    // if zc>=2 -> 0
+    // if zc==1 -> only the zero index survives; (H·v)_i = 0 for i≠zi and for i==zi: sum_{j≠zi} v_j * Π_{ℓ≠{zi,j}} x_ℓ
+    // if zc==0 -> (H·v)_i = (y/xi)*( Σ_j v_j/x_j - v_i/x_i )
     static inline void hvp_backward(ADNode &n, ADGraph &g) {
-    if (!_nary_ok(n)) return;
+        if (!_nary_ok(n)) return;
+        const size_t m = n.inputs.size();
 
-    const size_t m = n.inputs.size();
+        // Fast binary specialization (kept: already optimal)
+        if (m == 2) {
+            auto* a = n.inputs[0].get();
+            auto* b = n.inputs[1].get();
+            const double aval=a->value, bval=b->value;
+            const double adot=a->dot,   bdot=b->dot;
+            const double ybar=n.gradient, ybdot=n.grad_dot;
 
-    // --- Fast, robust specialization for binary multiply: z = a * b
-    if (m == 2) {
-        auto* a = n.inputs[0].get();
-        auto* b = n.inputs[1].get();
+            auto &ga  = ensure_epoch_zero(a->gradient, a->grad_epoch, g.cur_grad_epoch_);
+            auto &gb  = ensure_epoch_zero(b->gradient, b->grad_epoch, g.cur_grad_epoch_);
+            auto &gda = ensure_epoch_zero(a->grad_dot, a->gdot_epoch, g.cur_gdot_epoch_);
+            auto &gdb = ensure_epoch_zero(b->grad_dot, b->gdot_epoch, g.cur_gdot_epoch_);
 
-        const double aval  = a->value,  bval  = b->value;
-        const double adot  = a->dot,    bdot  = b->dot;
-        const double ybar  = n.gradient;
-        const double ybdot = n.grad_dot;
+            ga  += ybar * bval;                gb  += ybar * aval;
+            gda += ybdot * bval + ybar * bdot; gdb += ybdot * aval + ybar * adot;
+            return;
+        }
 
-        auto &ga   = ensure_epoch_zero(a->gradient, a->grad_epoch, g.cur_grad_epoch_);
-        auto &gb   = ensure_epoch_zero(b->gradient, b->grad_epoch, g.cur_grad_epoch_);
-        auto &gda  = ensure_epoch_zero(a->grad_dot, a->gdot_epoch, g.cur_gdot_epoch_);
-        auto &gdb  = ensure_epoch_zero(b->grad_dot, b->gdot_epoch, g.cur_gdot_epoch_);
+        // General case
+        size_t zc, zi; double prod_nz;
+        analyze_inputs(n.inputs, zc, zi, prod_nz);
 
-        // First order: ∂z/∂a = b, ∂z/∂b = a
-        ga  += ybar * bval;
-        gb  += ybar * aval;
+        const double w  = n.gradient;
+        const double wd = n.grad_dot;
 
-        // Second order column (HVP):
-        // (H·v)_a = ybdot*b + ybar*bdot
-        // (H·v)_b = ybdot*a + ybar*adot
-        gda += ybdot * bval + ybar * bdot;
-        gdb += ybdot * aval + ybar * adot;
-        return;
-    }
+        if (zc >= 2) {
+            // everything is zero; nothing to accumulate
+            return;
+        }
 
-    // --- General n-ary case (m >= 3)
-    auto &vals = tls_vals();
-    auto &dots = tls_dots();
-    vals.resize(m);
-    dots.resize(m);
-    for (size_t i = 0; i < m; ++i) {
-        vals[i] = n.inputs[i]->value;
-        dots[i] = n.inputs[i]->dot;
-    }
-
-    auto &pre = tls_pre();
-    auto &suf = tls_suf();
-    build_prefix_suffix(vals, pre, suf);
-
-    for (size_t i = 0; i < m; ++i) {
-        const double P_wo_i = pre[i] * suf[i + 1];
-
-        // sum_{k != i} v_k * ∏_{ℓ ≠ i,k} vals[ℓ]
-        double sum_term = 0.0;
-        for (size_t k = 0; k < m; ++k) {
-            if (k == i) continue;
-
-            // We want product of the "between" segment [a+1 .. b-1] without division
-            const size_t a = (i < k ? i : k);
-            const size_t b = (i < k ? k : i);
-
-            double mid_prod = 1.0;
-            // If the segment is short, this loop is tiny; avoids 0/0 when pre[b]==pre[a+1]==0
-            for (size_t t = a + 1; t < b; ++t) {
-                mid_prod *= vals[t];
-                if (mid_prod == 0.0) break; // early-out
+        if (zc == 1) {
+            // Only i==zi receives first-order and second-order contributions
+            // First-order: dy/dx_zi = Π_{j≠zi} x_j = prod_nz
+            {
+                auto &gacc = ensure_epoch_zero(n.inputs[zi]->gradient, n.inputs[zi]->grad_epoch, g.cur_grad_epoch_);
+                gacc += w * prod_nz;
             }
 
-            // left * mid * right = ∏_{ℓ < a} vals[ℓ]  *  ∏_{a<ℓ<b} vals[ℓ]  *  ∏_{ℓ > b} vals[ℓ]
-            const double left  = pre[a];
-            const double right = suf[b + 1];
-
-            sum_term += dots[k] * (left * mid_prod * right);
+            // Second-order column:
+            // (H·v)_zi = Σ_{j≠zi} v_j * Π_{ℓ≠{zi,j}} x_ℓ   ; others zero
+            double sum_Hv_zi = 0.0;
+            for (size_t j=0;j<m;++j) {
+                if (j == zi) continue;
+                // product without zi and j: prod_nz / x_j (since prod_nz = Π_{ℓ≠zi} x_ℓ and x_j≠0 here)
+                const double xj = n.inputs[j]->value;
+                sum_Hv_zi += n.inputs[j]->dot * (prod_nz / xj);
+            }
+            auto &gdacc = ensure_epoch_zero(n.inputs[zi]->grad_dot, n.inputs[zi]->gdot_epoch, g.cur_gdot_epoch_);
+            gdacc += wd * prod_nz + w * sum_Hv_zi;
+            return;
         }
 
-        auto &gacc  = ensure_epoch_zero(n.inputs[i]->gradient,  n.inputs[i]->grad_epoch,  g.cur_grad_epoch_);
-        auto &gdacc = ensure_epoch_zero(n.inputs[i]->grad_dot,  n.inputs[i]->gdot_epoch,  g.cur_gdot_epoch_);
+        // zc == 0 : fully nonzero, use O(m) formulas
+        // y = prod_nz
+        const double y = prod_nz;
 
-        // First order
-        gacc  += n.gradient  * P_wo_i;
-        // Second order column (HVP)
-        gdacc += n.grad_dot  * P_wo_i + n.gradient * sum_term;
+        // Precompute S = Σ (v_j / x_j)
+        double S = 0.0;
+        for (size_t j=0;j<m;++j) {
+            S += n.inputs[j]->dot / n.inputs[j]->value;
+        }
+
+        for (size_t i=0;i<m;++i) {
+            const double xi  = n.inputs[i]->value;
+            const double vi  = n.inputs[i]->dot;
+            const double dfi = y / xi;                  // ∂y/∂x_i
+            const double Hvi = (y / xi) * (S - vi/xi);  // (H·v)_i
+
+            auto &gacc  = ensure_epoch_zero(n.inputs[i]->gradient,  n.inputs[i]->grad_epoch,  g.cur_grad_epoch_);
+            auto &gdacc = ensure_epoch_zero(n.inputs[i]->grad_dot,  n.inputs[i]->gdot_epoch,  g.cur_gdot_epoch_);
+            gacc  += w  * dfi;
+            gdacc += wd * dfi + w * Hvi;
+        }
     }
-}
+
 
 };
 

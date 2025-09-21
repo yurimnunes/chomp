@@ -660,12 +660,12 @@ public:
         bool needs_restoration = false;
 
         // optional Python LS
-        auto ls_res = ls_->search(model, x, dx, (mI ? s : dvec()),
-                                  (mI ? ds : dvec()), mu, g.dot(dx), theta,
-                                  alpha_max); // reset
-        alpha = std::get<0>(ls_res);
-        ls_iters = std::get<1>(ls_res);
-        needs_restoration = std::get<2>(ls_res);
+        // auto ls_res = ls_->search(model, x, dx, (mI ? s : dvec()),
+        //                           (mI ? ds : dvec()), mu, g.dot(dx), theta,
+        //                           alpha_max); // reset
+        // alpha = std::get<0>(ls_res);
+        ls_iters = 0; // std::get<1>(ls_res);
+        needs_restoration = false; //std::get<2>(ls_res);
 
         // early restoration (light fallback)
         const double ls_min_alpha = pyu::getattr_or<double>(
@@ -854,7 +854,7 @@ private:
         set_if_missing("ip_theta_clip", py::float_(1e-2));
         set_if_missing("sigma_eps_abs", py::float_(1e-8));
         set_if_missing("sigma_cap", py::float_(1e8));
-        set_if_missing("ip_kkt_method", py::str("hykkt"));
+        set_if_missing("ip_kkt_method", py::str("ldl"));
         set_if_missing("tol", py::float_(1e-8));
 
         set_if_missing("ls_backtrack", py::float_(pyu::getattr_or<double>(

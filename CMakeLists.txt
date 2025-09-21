@@ -81,7 +81,62 @@ endif()
 # Python 3 — Interpreter + Development
 find_package(Python3 3.13 COMPONENTS Interpreter Development REQUIRED)
 
-# Eigen
+
+    message(STATUS "nanobind not found via find_package; will use CPM to fetch it.")
+    
+    # CRITICAL: Set Python variables BEFORE CPMAddPackage
+    # This ensures nanobind's CMake configuration uses the correct Python
+    set(Python_EXECUTABLE ${Python3_EXECUTABLE} CACHE FILEPATH "" FORCE)
+    set(Python3_EXECUTABLE ${Python3_EXECUTABLE} CACHE FILEPATH "" FORCE)
+    set(Python_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
+    set(Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
+    set(Python_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
+    set(Python3_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
+    
+    # Also set the specific variables nanobind looks for
+    set(Python_INCLUDE_DIR ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
+    set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
+    set(PYTHON_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
+    
+    # Debug: Show what we're passing to nanobind
+    message(STATUS "Configuring nanobind with:")
+    message(STATUS "  Python3_EXECUTABLE: ${Python3_EXECUTABLE}")
+    message(STATUS "  Python3_INCLUDE_DIRS: ${Python3_INCLUDE_DIRS}")
+    message(STATUS "  Python3_LIBRARIES: ${Python3_LIBRARIES}")
+    
+    # allow overriding the tag on the command line if desired
+    set(NANOBIND_TAG v2.9.2 CACHE STRING "nanobind version/tag to fetch via CPM")
+    
+    CPMAddPackage(
+        NAME nanobind
+        GITHUB_REPOSITORY wjakob/nanobind
+        GIT_TAG ${NANOBIND_TAG}
+        OPTIONS
+            "Python_EXECUTABLE ${Python3_EXECUTABLE}"
+            "Python3_EXECUTABLE ${Python3_EXECUTABLE}"
+            "Python_INCLUDE_DIRS ${Python3_INCLUDE_DIRS}"
+            "Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIRS}"
+            "Python_LIBRARIES ${Python3_LIBRARIES}"
+            "Python3_LIBRARIES ${Python3_LIBRARIES}"
+    )
+    
+    # Verify that nanobind found Python correctly
+    if(TARGET nanobind-static)
+        get_target_property(NB_INCLUDES nanobind-static INCLUDE_DIRECTORIES)
+        message(STATUS "nanobind-static include directories: ${NB_INCLUDES}")
+        
+        # Force Python include dirs on nanobind-static if they're missing
+        if(Python3_INCLUDE_DIRS AND NOT "${NB_INCLUDES}" MATCHES "Python")
+            message(STATUS "Force-adding Python includes to nanobind-static")
+            target_include_directories(nanobind-static PRIVATE ${Python3_INCLUDE_DIRS})
+        endif()
+    endif()
+
+
+set(Python_EXECUTABLE      ${Python3_EXECUTABLE})
+set(Python_INCLUDE_DIR     ${Python3_INCLUDE_DIRS})
+set(Python_LIBRARY         ${Python3_LIBRARIES})
+set(Python_NumPy_INCLUDE_DIRS ${Python3_NumPy_INCLUDE_DIRS})
 
 # OpenMP (optional)
 if(AD_ENABLE_OPENMP)
@@ -165,6 +220,48 @@ function(ad_add_pybind_module name)
         target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
     endif()
 endfunction()
+
+# ------------------------------------------------------------------
+# Helper: add a nanobind module with common settings
+# ------------------------------------------------------------------
+function(ad_add_nanobind_module name)
+    # Usage: ad_add_nanobind_module(<name> src1.cpp src2.cpp ...)
+    set(_srcs ${ARGN})
+
+    # Create the nanobind extension target
+    nanobind_add_module(${name} ${_srcs})
+    message(STATUS "Added nanobind module: ${name} with sources: ${_srcs}")
+
+    target_compile_features(${name} PRIVATE cxx_std_23)
+
+    # Common include dirs
+    target_include_directories(${name}
+        PRIVATE
+        "${PROJECT_SOURCE_DIR}/src"
+        ${Python3_INCLUDE_DIRS}
+    )
+
+    # Common links
+    target_link_libraries(${name}
+        PRIVATE
+        fmt::fmt
+        Eigen3::Eigen
+        Python3::Module          # provided by find_package(Python3 ... Development.Module)
+    )
+
+    if(AD_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+        target_link_libraries(${name} PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+
+    # Warnings / visibility similar to your pybind helper
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4)
+    else()
+        target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
+    endif()
+endfunction()
+
+
 # ------------------------------------------------------------------
 # Core AD Python module
 # ------------------------------------------------------------------
@@ -176,7 +273,7 @@ set(AD_SOURCES
   src/ad/ADGraph.cpp
 )
 
-ad_add_pybind_module(ad ${AD_SOURCES})
+ad_add_nanobind_module(ad ${AD_SOURCES})
 
 # External system libs specific to 'ad' (from original list)
 # Prefer target_link_libraries with plain names; avoid raw -L/-l unless needed.
@@ -227,9 +324,8 @@ if(AD_ENABLE_QDLDL)
 endif()
 
 ad_add_pybind_module(foretree src/foretree_pybind.cpp)
-ad_add_pybind_module(chomp src/chomp.cpp)
+ad_add_nanobind_module(chomp src/chomp.cpp)
 
-# ad_add_pybind_module(ip_cpp src/ip.cpp)
 
 #ad_add_pybind_module(lbl_cpp src/lbl_bindings.cpp)
 

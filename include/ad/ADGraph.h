@@ -73,6 +73,8 @@ static inline double &set_epoch_value(double &x, unsigned &e, unsigned cur,
     return x;
 }
 
+#include "../../third_party/robin_map.h"
+
 
 struct ADNode {
     Operator type = Operator::NA;
@@ -130,7 +132,7 @@ struct ADGraph {
     void resetGradients();
 
     // ---- Public Gradient API
-    std::unordered_map<std::string, double>
+tsl::robin_map<std::string, double>
     computePartialDerivatives(const ADNodePtr &expr);
 
     ADNodePtr getNode(const std::string &name);
@@ -140,12 +142,12 @@ struct ADGraph {
     std::vector<double> getGradientVector(const ADNodePtr &expr);
 
     // ---- Rebuild graph (unique variables)
-    std::tuple<ADGraphPtr, std::unordered_map<std::string, ADNodePtr>>
+    std::tuple<ADGraphPtr, tsl::robin_map<std::string, ADNodePtr>>
     rebuildGraphWithUniqueVariables(const ADNodePtr &rootNode);
     void collectNodes(const ADNodePtr &start,
-                      std::unordered_map<std::string, ADNodePtr> &coll,
+                      tsl::robin_map<std::string, ADNodePtr> &coll,
                       std::unordered_set<ADNodePtr> &vis,
-                      std::unordered_map<std::string, ADNodePtr> &vars);
+                      tsl::robin_map<std::string, ADNodePtr> &vars);
 
     // ---- HVP (forward-over-reverse)
     void resetTangents();
@@ -161,7 +163,7 @@ struct ADGraph {
 
     // ---- Public fields (existing)
     std::vector<ADNodePtr> nodes;
-    std::unordered_map<std::string, ADNodePtr> nodeVariables;
+    tsl::robin_map<std::string, ADNodePtr> nodeVariables;
 
     // ===== Epoch counters for lazy reset =====
     unsigned cur_val_epoch_ = 1;
@@ -174,7 +176,9 @@ private:
     struct Cache {
         std::vector<ADNode *> topo;              // forward order
         std::vector<std::vector<ADNode *>> out;  // children (by index)
-        std::unordered_map<ADNode *, int> id_of; // raw* -> id
+        //std::unordered_map<ADNode *, int> id_of; // raw* -> id
+        tsl::robin_map<ADNode*, int> id_of; // or as a member
+
         bool dirty = true;
     } cache_;
 

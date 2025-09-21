@@ -34,6 +34,8 @@ public:
         initializeNode();
     }
 
+    Expression &operator=(const Expression &) = default;
+
     // From a (placeholder) Variable object; creates an empty node
     explicit Expression(const Variable) {
         graph = std::make_shared<ADGraph>();
@@ -71,7 +73,7 @@ public:
         return graph->getExpression(rootNode);
     }
 
-    std::unordered_map<std::string, double> computeGradient() {
+    tsl::robin_map<std::string, double> computeGradient() {
         prepare();
         return graph->computePartialDerivatives(rootNode);
     }
@@ -223,7 +225,7 @@ public:
     }
 
 private:
-    std::unordered_map<std::string, ADNodePtr> expVariables;
+    tsl::robin_map<std::string, ADNodePtr> expVariables;
 
     void initializeNode(Operator type = Operator::NA, std::string name = "",
                         double value = 0.0, int order = -1,
@@ -270,9 +272,9 @@ ExpressionPtr reciprocal(const Expression &x);    // NEW
 ExpressionPtr pow(const Expression &x, double p); // NEW
 
 // -------- C++ trig/exp/log helpers ----
-ExpressionPtr sin(const Expression &x); // NEW
-ExpressionPtr cos(const Expression &x); // NEW
-ExpressionPtr tan(const Expression &x); // NEW
-ExpressionPtr exp(const Expression &x); // NEW
-ExpressionPtr log(const Expression &x); // NEW
-ExpressionPtr maximum(const Expression& a, const Expression& b); // NEW
+ExpressionPtr sin(const Expression &x);                          // NEW
+ExpressionPtr cos(const Expression &x);                          // NEW
+ExpressionPtr tan(const Expression &x);                          // NEW
+ExpressionPtr exp(const Expression &x);                          // NEW
+ExpressionPtr log(const Expression &x);                          // NEW
+ExpressionPtr maximum(const Expression &a, const Expression &b); // NEW
