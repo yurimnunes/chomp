@@ -70,11 +70,11 @@ struct RegularizerConfig {
 
     // Permutation + scaling
     bool reg_use_rcm{false};
-    bool reg_use_ruiz{true};
+    bool reg_use_ruiz{false};
     int reg_ruiz_iters{3};
 
     // Preconditioning
-    bool use_preconditioning{true};
+    bool use_preconditioning{false};
     std::string precond_type{
         "auto"};               // auto|none|jacobi|bjacobi|ssor|ilu|shift_invert
                                // (shift_invert becomes sparseLU)
@@ -782,12 +782,12 @@ public:
 
         // Optional RCM
         std::optional<Eigen::VectorXi> perm;
-        if (cfg_.reg_use_rcm && n >= 200) {
-            perm = detail::rcm_permutation(H);
-            if (perm) {
-                H = permute(H, *perm);
-            }
-        }
+        // if (cfg_.reg_use_rcm && n >= 200) {
+        //     perm = detail::rcm_permutation(H);
+        //     if (perm) {
+        //         H = permute(H, *perm);
+        //     }
+        // }
 
         // Optional Ruiz (symmetric)
         std::optional<dvec> dscale;
@@ -872,12 +872,12 @@ public:
             H = inverse_permute(H, *perm);
         }
 
-        auto post = post_analyze_sparse_(H);
-        info.min_eig_after = post.min_eig;
-        info.cond_after = post.cond;
-        info.rank_def = post.rank_def;
-        info.inertia_after = post.inertia;
-        info.nnz_after = H.nonZeros();
+        // auto post = post_analyze_sparse_(H);
+        // info.min_eig_after = post.min_eig;
+        // info.cond_after = post.cond;
+        // info.rank_def = post.rank_def;
+        // info.inertia_after = post.inertia;
+        // info.nnz_after = H.nonZeros();
 
         return {H, info};
     }

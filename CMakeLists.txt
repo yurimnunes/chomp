@@ -97,13 +97,7 @@ find_package(Python3 3.13 COMPONENTS Interpreter Development REQUIRED)
     set(Python_INCLUDE_DIR ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
     set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
     set(PYTHON_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
-    
-    # Debug: Show what we're passing to nanobind
-    message(STATUS "Configuring nanobind with:")
-    message(STATUS "  Python3_EXECUTABLE: ${Python3_EXECUTABLE}")
-    message(STATUS "  Python3_INCLUDE_DIRS: ${Python3_INCLUDE_DIRS}")
-    message(STATUS "  Python3_LIBRARIES: ${Python3_LIBRARIES}")
-    
+
     # allow overriding the tag on the command line if desired
     set(NANOBIND_TAG v2.9.2 CACHE STRING "nanobind version/tag to fetch via CPM")
     
@@ -326,7 +320,65 @@ endif()
 ad_add_pybind_module(foretree src/foretree_pybind.cpp)
 ad_add_nanobind_module(chomp src/chomp.cpp)
 
+# ------------------------------------------------------------------
+# Optional: SuiteSparse / CHOLMOD (for HYKKTCholmodStrategy)
+# ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Optional: SuiteSparse / CHOLMOD (for HYKKTCholmodStrategy)
+# ------------------------------------------------------------------
+option(AD_ENABLE_CHOLMOD "Enable HYKKT via SuiteSparse CHOLMOD" ON)
 
+set(AD_USE_CHOLMOD OFF)
+set(AD_CHOLMOD_PROVIDER "")
+set(AD_CHOLMOD_INCLUDE_DIRS "")
+set(AD_CHOLMOD_LIBRARIES "")
+
+if(AD_ENABLE_CHOLMOD)
+  # Try modern SuiteSparse config packages first
+  find_package(SuiteSparse CONFIG)
+  if(TARGET SuiteSparse::cholmod)
+    set(AD_USE_CHOLMOD ON)
+    set(AD_CHOLMOD_PROVIDER "SuiteSparse::cholmod")
+  else()
+    # Try a Cholmod config
+    find_package(Cholmod) # some distros expose Cholmod::Cholmod
+    if(TARGET Cholmod::Cholmod OR Cholmod_FOUND)
+      set(AD_USE_CHOLMOD ON)
+      set(AD_CHOLMOD_PROVIDER "Cholmod::Cholmod")
+    else()
+      # Fallback: pkg-config
+      find_package(PkgConfi)
+      if(PKG_CONFIG_FOUND)
+        pkg_check_modules(CHOLMOD cholmod)
+        if(CHOLMOD_FOUND)
+          set(AD_USE_CHOLMOD ON)
+          set(AD_CHOLMOD_INCLUDE_DIRS ${CHOLMOD_INCLUDE_DIRS})
+          set(AD_CHOLMOD_LIBRARIES    ${CHOLMOD_LINK_LIBRARIES})
+          set(AD_CHOLMOD_PROVIDER "pkg-config:cholmod")
+        endif()
+      endif()
+    endif()
+  endif()
+
+  if(AD_USE_CHOLMOD)
+    message(STATUS "CHOLMOD enabled via: ${AD_CHOLMOD_PROVIDER}")
+  else()
+    message(WARNING "AD_ENABLE_CHOLMOD=ON but CHOLMOD was not found. "
+                    "HYKKT cholmod strategy will be disabled.")
+  endif()
+endif()
+
+# Helper: attach CHOLMOD + EIGEN_CHOLMOD_SUPPORT to a target
+function(ad_use_cholmod tgt)
+include_directories(/usr/include/suitesparse)
+
+    target_include_directories(${tgt} PRIVATE ${AD_CHOLMOD_INCLUDE_DIRS})
+    target_link_libraries(${tgt} PRIVATE -lcholmod)
+set(EIGEN_CHOLMOD_SUPPORT ON)
+
+endfunction()
+
+ad_use_cholmod(chomp)
 #ad_add_pybind_module(lbl_cpp src/lbl_bindings.cpp)
 
 # ------------------------------------------------------------------

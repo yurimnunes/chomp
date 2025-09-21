@@ -84,7 +84,6 @@ namespace nb = nanobind;
 static inline nb::object nb_dict_get(const nb::dict& d, const nb::handle& k) {
     return d.contains(k) ? d[k] : nb::none();
 }
-
 // ---------- Python attribute helpers ----------
 namespace pyu {
 [[nodiscard]] inline bool has_attr(const nb::object &o,
@@ -95,7 +94,7 @@ namespace pyu {
 template <class T>
 [[nodiscard]] T getattr_or(const nb::object &o, const char *name,
                            const T &fallback) {
-    if (!o.is_valid() || !has_attr(o, name))
+    if (!o.is_valid() || !has_attr(o, name)) [[likely]]
         return fallback;
     try {
         return nb::cast<T>(o.attr(name));
@@ -108,11 +107,17 @@ template <class T>
 // ---------- Optimized Python ↔ Eigen conversions ----------
 namespace pyconv {
 
+// Cache frequently used numpy module
+inline nb::object& get_numpy_module() {
+    static nb::object numpy = nb::module_::import_("numpy");
+    return numpy;
+}
+
 inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
-    if (!a.is_valid())
+    if (!a.is_valid()) [[unlikely]]
         return false;
     const auto ndim = a.ndim();
-    if (ndim == 1)
+    if (ndim == 1) [[likely]]
         return a.stride(0) == sizeof(double);
     if (ndim == 2)
         return a.stride(1) == sizeof(double) &&
@@ -120,50 +125,96 @@ inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
     return false;
 }
 
-// Minimal safe version for debugging
-[[nodiscard]] inline dvec to_vec_safe(const nb::object &obj) {
-    if (!obj.is_valid() || obj.is_none())
-        return dvec();
-    
-    // Ultra-conservative approach: convert via Python list
+// Helper function to check if object is numpy array (avoid template issues)
+[[nodiscard]] inline bool is_numpy_array(const nb::object& obj) noexcept {
+    return PyObject_HasAttrString(obj.ptr(), "__array_interface__") || 
+           PyObject_HasAttrString(obj.ptr(), "__array__");
+}
+
+// Helper to get array dtype as string - optimized with string_view
+[[nodiscard]] inline std::string_view get_array_dtype(const nb::object& obj) noexcept {
     try {
-        nb::list py_list = nb::cast<nb::list>(obj);
-        dvec v(py_list.size());
-        for (size_t i = 0; i < py_list.size(); ++i) {
-            v[i] = nb::cast<double>(py_list[i]);
-        }
-        return v;
+        static thread_local std::string dtype_str;
+        dtype_str = nb::cast<std::string>(obj.attr("dtype").attr("name"));
+        return dtype_str;
     } catch (...) {
-        // If that fails, try sequence protocol
+        return "unknown";
+    }
+}
+
+// Helper to get array shape - optimized with span-like interface
+[[nodiscard]] inline std::vector<size_t> get_array_shape(const nb::object& obj) {
+    try {
+        nb::object shape_tuple = obj.attr("shape");
+        nb::tuple shape_tup = nb::cast<nb::tuple>(shape_tuple);
+        const size_t size = shape_tup.size();
+        
+        std::vector<size_t> shape;
+        shape.reserve(size); // Pre-allocate
+        
+        for (size_t i = 0; i < size; ++i) {
+            shape.emplace_back(nb::cast<size_t>(shape_tup[i]));
+        }
+        return shape;
+    } catch (...) {
+        return {};
+    }
+}
+
+// Fast optimized vector conversion - prioritizes performance
+[[nodiscard]] inline dvec to_vec_safe(const nb::object &obj) {
+    if (!obj.is_valid() || obj.is_none()) [[unlikely]]
+        return dvec{};
+    
+    // Fast path: Direct numpy array conversion (most common case)
+    if (is_numpy_array(obj)) [[likely]] {
         try {
-            if (PySequence_Check(obj.ptr())) {
-                Py_ssize_t size = PySequence_Size(obj.ptr());
-                if (size < 0) return dvec();
-                
-                dvec v(size);
-                for (Py_ssize_t i = 0; i < size; ++i) {
-                    PyObject* item = PySequence_GetItem(obj.ptr(), i);
-                    if (!item) {
-                        Py_XDECREF(item);
-                        throw std::runtime_error("Failed to get sequence item");
-                    }
-                    v[i] = PyFloat_AsDouble(item);
-                    Py_DECREF(item);
-                    if (PyErr_Occurred()) {
-                        PyErr_Clear();
-                        throw std::runtime_error("Failed to convert item to double");
-                    }
-                }
-                return v;
+            auto& numpy = get_numpy_module();
+            // Force contiguous double array in one call
+            nb::object arr = numpy.attr("ascontiguousarray")(obj, nb::arg("dtype") = "float64");
+            auto a = nb::cast<nb::ndarray<nb::numpy>>(arr);
+            
+            if (a.ndim() == 0) [[unlikely]] {
+                // Scalar case
+                return dvec::Constant(1, *static_cast<const double*>(a.data()));
             }
+            
+            if (a.ndim() != 1) [[unlikely]]
+                throw std::runtime_error("Expected 1-D array");
+            
+            const size_t n = a.shape(0);
+            if (n == 0) [[unlikely]] return dvec{};
+            
+            // Direct memory copy - fastest possible
+            dvec v(n);
+            std::memcpy(v.data(), a.data(), n * sizeof(double));
+            return v;
         } catch (...) {
-            if (PyErr_Occurred()) PyErr_Clear();
+            // Fall through to slower methods
         }
     }
     
-    throw std::runtime_error("to_vec_safe_safe: cannot convert object to vector");
-}
+    // Medium speed path: Direct sequence access (lists, tuples)
+    if (PySequence_Check(obj.ptr()) && !PyUnicode_Check(obj.ptr())) [[likely]] {
+        const Py_ssize_t size = PySequence_Fast_GET_SIZE(PySequence_Fast(obj.ptr(), ""));
+        if (size <= 0) [[unlikely]] return dvec{};
+        
+        dvec v(size);
+        PyObject* fast_seq = PySequence_Fast(obj.ptr(), "");
+        if (fast_seq) [[likely]] {
+            // Use fast sequence access
+            for (Py_ssize_t i = 0; i < size; ++i) {
+                PyObject* item = PySequence_Fast_GET_ITEM(fast_seq, i);
+                // Skip error checking for speed - assume valid doubles
+                v[i] = PyFloat_AsDouble(item);
+            }
+            Py_DECREF(fast_seq);
+            return v;
+        }
+    }
 
+    std::runtime_error("Unable to convert to vector");
+}
 // ---------- Zero-copy sparse views (CSR for RowMajor / CSC for ColMajor)
 // ----------
 template <class SparseT>
@@ -178,56 +229,17 @@ struct SciPyCompressed {
     long long nnz = 0;
 };
 
-// Add these includes at the top if not already present
-// #include <nanobind/nanobind.h>
-// #include <nanobind/ndarray.h>
-// #include <nanobind/stl.h>
-
-// Helper function to check if object is numpy array (avoid template issues)
-inline bool is_numpy_array(const nb::object& obj) {
-    return PyObject_HasAttrString(obj.ptr(), "__array_interface__") || 
-           PyObject_HasAttrString(obj.ptr(), "__array__");
-}
-
-// Helper to get array dtype as string
-inline std::string get_array_dtype(const nb::object& obj) {
-    try {
-        return nb::cast<std::string>(obj.attr("dtype").attr("name"));
-    } catch (...) {
-        return "unknown";
-    }
-}
-
-// Helper to get array shape
-inline std::vector<size_t> get_array_shape(const nb::object& obj) {
-    try {
-        nb::object shape_tuple = obj.attr("shape");
-        std::vector<size_t> shape;
-        
-        // Convert to tuple first to avoid ambiguity
-        nb::tuple shape_tup = nb::cast<nb::tuple>(shape_tuple);
-        size_t size = shape_tup.size();
-        
-        for (size_t i = 0; i < size; ++i) {
-            shape.push_back(nb::cast<size_t>(shape_tup[i]));
-        }
-        return shape;
-    } catch (...) {
-        return {};
-    }
-}
-
 template <class SparseT>
 bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
-    if (obj.is_none())
+    if (obj.is_none()) [[unlikely]]
         return false;
     nb::object m = obj;
 
-    const char *want = kRowMajor<SparseT> ? "tocsr" : "tocsc";
+    constexpr const char *want = kRowMajor<SparseT> ? "tocsr" : "tocsc";
     if (!PyObject_HasAttrString(m.ptr(), "indptr") ||
         !PyObject_HasAttrString(m.ptr(), "indices") ||
         !PyObject_HasAttrString(m.ptr(), "data")) {
-        if (PyObject_HasAttrString(m.ptr(), want))
+        if (PyObject_HasAttrString(m.ptr(), want)) [[likely]]
             m = m.attr(want)();
         else
             return false;
@@ -246,7 +258,7 @@ bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
         // Check if they're array-like
         if (!is_numpy_array(indptr_obj) || 
             !is_numpy_array(indices_obj) || 
-            !is_numpy_array(data_obj)) {
+            !is_numpy_array(data_obj)) [[unlikely]] {
             return false;
         }
         
@@ -256,28 +268,30 @@ bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
         out.data = nb::cast<nb::ndarray<nb::numpy>>(data_obj);
 
         // Check data type and convert if needed
-        std::string data_dtype = get_array_dtype(data_obj);
-        if (data_dtype != "float64") {
-            nb::object numpy = nb::module_::import_("numpy");
+        const auto data_dtype = get_array_dtype(data_obj);
+        if (data_dtype != "float64") [[unlikely]] {
+            auto& numpy = get_numpy_module(); // Use cached module
             nb::object converted = numpy.attr("ascontiguousarray")(data_obj, nb::arg("dtype") = "float64");
-            out.data = nb::cast<nb::ndarray<nb::numpy>>(converted);
+            out.data = nb::cast<nb::ndarray<nb::numpy>>(std::move(converted));
         }
         
-        // Check integer types for indptr and indices
-        std::string indptr_dtype = get_array_dtype(indptr_obj);
-        std::string indices_dtype = get_array_dtype(indices_obj);
+        // Check integer types for indptr and indices - use constexpr set for lookup
+        const auto indptr_dtype = get_array_dtype(indptr_obj);
+        const auto indices_dtype = get_array_dtype(indices_obj);
         
-        bool indptr_ok = (indptr_dtype == "int32" || indptr_dtype == "uint32" ||
-                          indptr_dtype == "int64" || indptr_dtype == "uint64");
-        bool indices_ok = (indices_dtype == "int32" || indices_dtype == "uint32" ||
-                           indices_dtype == "int64" || indices_dtype == "uint64");
+        constexpr std::array valid_int_types{"int32", "uint32", "int64", "uint64"};
         
-        if (!indptr_ok || !indices_ok)
+        const bool indptr_ok = std::ranges::any_of(valid_int_types, 
+            [indptr_dtype](std::string_view type) { return type == indptr_dtype; });
+        const bool indices_ok = std::ranges::any_of(valid_int_types,
+            [indices_dtype](std::string_view type) { return type == indices_dtype; });
+        
+        if (!indptr_ok || !indices_ok) [[unlikely]]
             return false;
 
         // Get data size
-        auto data_shape = get_array_shape(data_obj);
-        if (data_shape.empty())
+        const auto data_shape = get_array_shape(data_obj);
+        if (data_shape.empty()) [[unlikely]]
             return false;
         out.nnz = static_cast<long long>(data_shape[0]);
         
@@ -306,25 +320,25 @@ template <class SparseT> struct PySparseView {
 };
 
 template <class SparseT>
-std::optional<PySparseView<SparseT>> to_sparse_view_any(const nb::object &o) {
+[[nodiscard]] std::optional<PySparseView<SparseT>> to_sparse_view_any(const nb::object &o) {
     SciPyCompressed s;
-    if (!extract_compressed_for<SparseT>(o, s))
+    if (!extract_compressed_for<SparseT>(o, s)) [[unlikely]]
         return std::nullopt;
     if (s.indptr.itemsize() != sizeof(SparseIndexT<SparseT>) ||
-        s.indices.itemsize() != sizeof(SparseIndexT<SparseT>))
+        s.indices.itemsize() != sizeof(SparseIndexT<SparseT>)) [[unlikely]]
         return std::nullopt;
     return PySparseView<SparseT>(std::move(s.mat), std::move(s.indptr),
                                  std::move(s.indices), std::move(s.data),
                                  s.rows, s.cols, s.nnz);
 }
 
-// Owning copy fallback (dense allowed)
+// Owning copy fallback (dense allowed) - optimized
 [[nodiscard]] inline spmat to_sparse(const nb::object &obj) {
-    if (obj.is_none())
-        return spmat();
+    if (obj.is_none()) [[unlikely]]
+        return spmat{};
 
     // Try SciPy compressed
-    if (auto view = to_sparse_view_any<spmat>(obj)) {
+    if (auto view = to_sparse_view_any<spmat>(obj)) [[likely]] {
         spmat A = view->map;
         A.makeCompressed();
         return A;
@@ -332,11 +346,11 @@ std::optional<PySparseView<SparseT>> to_sparse_view_any(const nb::object &o) {
 
     // Dense fallback - avoid NumPy C API
     try {
-        nb::object numpy = nb::module_::import_("numpy");
+        auto& numpy = get_numpy_module(); // Use cached module
         
         // Convert to numpy array and ensure it's 2D float64
         nb::object arr_obj;
-        if (is_numpy_array(obj)) {
+        if (is_numpy_array(obj)) [[likely]] {
             arr_obj = numpy.attr("ascontiguousarray")(obj, nb::arg("dtype") = "float64");
         } else {
             arr_obj = numpy.attr("array")(obj, nb::arg("dtype") = "float64");
@@ -344,8 +358,8 @@ std::optional<PySparseView<SparseT>> to_sparse_view_any(const nb::object &o) {
         }
         
         // Check dimensions using Python interface
-        auto shape = get_array_shape(arr_obj);
-        if (shape.size() != 2)
+        const auto shape = get_array_shape(arr_obj);
+        if (shape.size() != 2) [[unlikely]]
             throw std::runtime_error("to_sparse: expected 2-D array");
             
         const int rows = static_cast<int>(shape[0]);
@@ -1012,7 +1026,7 @@ private:
                           B.innerIndexPtr());
     }
 
-    bool matrices_equal(const spmat &A, const spmat &B, double tol = 1e-6) {
+    bool matrices_equal(const spmat &A, const spmat &B, double tol = 1e-4) {
         if (A.rows() != B.rows() || A.cols() != B.cols())
             return false;
         return (A - B).norm() < tol;
@@ -1041,7 +1055,7 @@ private:
         set_if_missing("ip_theta_clip", nb::float_(1e-2));
         set_if_missing("sigma_eps_abs", nb::float_(1e-8));
         set_if_missing("sigma_cap", nb::float_(1e8));
-        set_if_missing("ip_kkt_method", nb::str("hykkt"));
+        set_if_missing("ip_kkt_method", nb::str("hykkt_cholmod"));
         set_if_missing("tol", nb::float_(1e-6));
         set_if_missing("ls_backtrack", nb::float_(pyu::getattr_or<double>(
                                            cfg_, "ip_alpha_backtrack", 0.5)));
@@ -1177,8 +1191,8 @@ private:
         if (mE > 0)
             r2 = rpE ? (-(*rpE)).eval() : kkt::dvec::Zero(mE);
 
-        std::string method_cpp = (method_in == "hykkt") ? "hykkt" : "ldl";
-        if (mE == 0 && method_cpp == "hykkt")
+        std::string method_cpp = std::string(method_in);
+        if (mE == 0 && (method_cpp == "hykkt" || method_cpp == "hykkt_cholmod"))
             method_cpp = "ldl";
 
         const bool can_reuse = kkt_factorization_valid_ && cached_kkt_solver_ &&
@@ -1189,10 +1203,10 @@ private:
             return {std::move(dx), std::move(dy), cached_kkt_solver_};
         } else {
             kkt::ChompConfig conf;
-            conf.cg_tol = 1e-6;
-            conf.cg_maxit = 200;
-            conf.ip_hess_reg0 = 1e-8;
-            conf.schur_dense_cutoff = 0.25;
+            // conf.cg_tol = 1e-6;
+            // conf.cg_maxit = 200;
+            // conf.ip_hess_reg0 = 1e-8;
+            // conf.schur_dense_cutoff = 0.25;
 
             auto &reg = kkt::default_registry();
             auto strat = reg.get(method_cpp);

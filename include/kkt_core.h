@@ -9,6 +9,12 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
+#define EIGEN_CHOLMOD_SUPPORT
+
+#ifdef EIGEN_CHOLMOD_SUPPORT
+#include <Eigen/CholmodSupport> // CHOLMOD (SuiteSparse) via Eigen
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -36,6 +42,123 @@ using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 
+// ------------------------------ KKT assembly --------------------------
+[[nodiscard]] inline spmat assemble_KKT(const spmat &W, double delta,
+                                        const std::optional<spmat> &Gopt,
+                                        bool *out_hasE) {
+    const int n = W.rows();
+    if (W.cols() != n)
+        throw std::invalid_argument("assemble_KKT: W not square");
+
+    const bool hasE = Gopt && (Gopt->rows() > 0);
+    if (out_hasE)
+        *out_hasE = hasE;
+
+    if (!hasE) {
+        if (delta == 0.0)
+            return W;
+        spmat I(n, n);
+        I.setIdentity();
+        return (W + delta * I).pruned();
+    }
+
+    const auto &G = *Gopt;
+    const int m = G.rows();
+
+    std::vector<Eigen::Triplet<double>> triplets;
+    const size_t est_triplets =
+        W.nonZeros() + 2 * G.nonZeros() + (delta != 0.0 ? n : 0);
+    triplets.reserve(est_triplets);
+
+    std::vector<bool> has_diag(n, false);
+    for (int j = 0; j < W.outerSize(); ++j) {
+        for (spmat::InnerIterator it(W, j); it; ++it) {
+            double val = it.value();
+            if (delta != 0.0 && it.row() == it.col()) {
+                val += delta;
+                has_diag[it.row()] = true;
+            }
+            triplets.emplace_back(it.row(), it.col(), val);
+        }
+    }
+    if (delta != 0.0) {
+        for (int j = 0; j < n; ++j)
+            if (!has_diag[j])
+                triplets.emplace_back(j, j, delta);
+    }
+
+    for (int j = 0; j < G.outerSize(); ++j) {
+        for (spmat::InnerIterator it(G, j); it; ++it) {
+            triplets.emplace_back(it.col(), n + it.row(), it.value()); // G^T
+            triplets.emplace_back(n + it.row(), it.col(), it.value()); // G
+        }
+    }
+
+    spmat K(n + m, n + m);
+    K.setFromTriplets(triplets.begin(), triplets.end());
+    K.makeCompressed();
+    return K;
+}
+
+// ------------------------------ QDLDL helpers -------------------------
+[[nodiscard]] inline qdldl23::SparseD32
+eigen_to_upper_csc(const spmat &A, double diag_eps = 0.0) {
+    const int n = A.rows();
+    if (A.cols() != n)
+        throw std::invalid_argument(
+            "eigen_to_upper_csc: matrix must be square");
+
+    std::vector<int> rows, cols;
+    std::vector<double> vals;
+    const size_t est_nnz = A.nonZeros() / 2 + n;
+    rows.reserve(est_nnz);
+    cols.reserve(est_nnz);
+    vals.reserve(est_nnz);
+
+    std::vector<bool> has_diag(n, false);
+
+    for (int j = 0; j < A.outerSize(); ++j) {
+        for (spmat::InnerIterator it(A, j); it; ++it) {
+            if (it.row() <= j) {
+                rows.push_back(it.row());
+                cols.push_back(j);
+                vals.push_back(it.value());
+                if (it.row() == j)
+                    has_diag[j] = true;
+            }
+        }
+    }
+
+    if (diag_eps > 0.0) {
+        for (int j = 0; j < n; ++j) {
+            if (!has_diag[j]) {
+                rows.push_back(j);
+                cols.push_back(j);
+                vals.push_back(diag_eps);
+            }
+        }
+    }
+
+    std::vector<int> Ap(n + 1, 0);
+    for (int c : cols)
+        ++Ap[c + 1];
+    for (int j = 0; j < n; ++j)
+        Ap[j + 1] += Ap[j];
+
+    const size_t nnz = Ap[n];
+    std::vector<int> Ai(nnz);
+    std::vector<double> Ax(nnz);
+    std::vector<int> next = Ap;
+
+    for (size_t k = 0; k < cols.size(); ++k) {
+        const size_t p = next[cols[k]]++;
+        Ai[p] = rows[k];
+        Ax[p] = vals[k];
+    }
+
+    return qdldl23::SparseD32(n, std::move(Ap), std::move(Ai), std::move(Ax));
+}
+
 // ------------------------------ config -------------------------------
 struct ChompConfig {
     double cg_tol = 1e-6;
@@ -44,14 +167,13 @@ struct ChompConfig {
     double schur_dense_cutoff = 0.25;
     std::string prec_type = "ssor"; // "jacobi" | "ssor" | "none"
     double ssor_omega = 1.0;
-    std::string sym_ordering = "amd"; // "amd" | "none"
-    bool use_simd = true;
+    std::string sym_ordering = "none"; // "amd" | "none"
+    bool use_simd = false;
     int block_size = 256;
-    bool adaptive_gamma = true;
+    bool adaptive_gamma = false;
 };
 
-// ------------------------------ SIMD optimized helpers
-// ------------------------------
+// ------------------------------ SIMD optimized helpers ----------------
 #if defined(__AVX2__)
 [[nodiscard]] inline double simd_dot_product(const double *a, const double *b,
                                              size_t n) noexcept {
@@ -68,7 +190,6 @@ struct ChompConfig {
 #endif
     }
 
-    // horizontal sum
     __m128d lo = _mm256_castpd256_pd128(acc);
     __m128d hi = _mm256_extractf128_pd(acc, 1);
     __m128d sum128 = _mm_add_pd(lo, hi);
@@ -99,8 +220,7 @@ struct ChompConfig {
 }
 #endif
 
-// ------------------------------ optimized helpers
-// ------------------------------
+// ------------------------------ optimized helpers --------------------
 [[nodiscard]] inline double rowsum_inf_norm(const spmat &A) noexcept {
     double mx = 0.0;
     for (int j = 0; j < A.outerSize(); ++j) {
@@ -672,122 +792,238 @@ private:
     }
 };
 
-// Optimized CSC conversion (upper triangle) for QDLDL
-[[nodiscard]] inline qdldl23::SparseD32
-eigen_to_upper_csc(const spmat &A, double diag_eps = 0.0) {
-    const int n = A.rows();
-    if (A.cols() != n)
-        throw std::invalid_argument(
-            "eigen_to_upper_csc: matrix must be square");
+// ----------------------- HYKKT via CHOLMOD (SuiteSparse) --------------
+class HYKKTCholmodStrategy final : public KKTStrategy {
+public:
+    HYKKTCholmodStrategy() { name = "hykkt_cholmod"; }
 
-    std::vector<int> rows, cols;
-    std::vector<double> vals;
-    const size_t est_nnz = A.nonZeros() / 2 + n;
-    rows.reserve(est_nnz);
-    cols.reserve(est_nnz);
-    vals.reserve(est_nnz);
+    std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>>
+    factor_and_solve(const spmat &W, const std::optional<spmat> &Gopt,
+                     const dvec &r1, const std::optional<dvec> &r2opt,
+                     const ChompConfig &cfg,
+                     std::optional<double> /*regularizer*/,
+                     std::unordered_map<std::string, dvec> &cache, double delta,
+                     std::optional<double> gamma_user,
+                     bool assemble_schur_if_m_small, bool use_prec) override {
+                        std::cout << "Using HYKKTCholmodStrategy" << std::endl;
+#ifndef EIGEN_CHOLMOD_SUPPORT
+        (void)W;
+        (void)Gopt;
+        (void)r1;
+        (void)r2opt;
+        (void)cfg;
+        (void)cache;
+        (void)delta;
+        (void)gamma_user;
+        (void)assemble_schur_if_m_small;
+        (void)use_prec;
+        throw std::runtime_error(
+            "HYKKT CHOLMOD requested but Eigen was built without CHOLMOD "
+            "support. Rebuild with EIGEN_CHOLMOD_SUPPORT and link CHOLMOD.");
+#else
+        if (!Gopt || !r2opt)
+            throw std::invalid_argument(
+                "HYKKT (cholmod) requires equality constraints");
 
-    std::vector<bool> has_diag(n, false);
+        const auto &G = *Gopt;
+        const auto &r2 = *r2opt;
+        const int n = W.rows(), m = G.rows();
 
-    for (int j = 0; j < A.outerSize(); ++j) {
-        for (spmat::InnerIterator it(A, j); it; ++it) {
-            if (it.row() <= j) {
-                rows.push_back(it.row());
-                cols.push_back(j);
-                vals.push_back(it.value());
-                if (it.row() == j)
-                    has_diag[j] = true;
+        // gamma selection (mirrors HYKKTStrategy)
+        double gamma;
+        if (gamma_user) {
+            gamma = *gamma_user;
+        } else if (cfg.adaptive_gamma) {
+            const std::string cache_key =
+                "gamma_" + std::to_string(n) + "_" + std::to_string(m);
+            if (auto it = cache.find(cache_key); it != cache.end()) {
+                gamma = it->second[0];
+            } else {
+                gamma = compute_adaptive_gamma(W, G, delta);
+                cache[cache_key] = dvec::Constant(1, gamma);
             }
+        } else {
+            gamma = compute_gamma_heuristic(W, G, delta);
         }
+
+        // augmented SPD block
+        spmat K = build_augmented_system(W, G, delta, gamma);
+
+        // factor K with CHOLMOD (prefer supernodal LLT; fall back to LDLT)
+        auto solver_pair = create_solver_cholmod(K, cfg);
+        auto &solveK = solver_pair.first;
+
+        // Schur solve (dense or iterative as in HYKKTStrategy)
+        auto [dx, dy] =
+            solve_schur_system(G, K, r1, r2, gamma, solveK, cfg,
+                               assemble_schur_if_m_small, use_prec, n, m);
+
+        auto reusable = create_reusable_solver(G, solveK, gamma, cfg);
+        return std::make_tuple(dx, dy, reusable);
+#endif
     }
 
-    if (diag_eps > 0.0) {
-        for (int j = 0; j < n; ++j) {
-            if (!has_diag[j]) {
-                rows.push_back(j);
-                cols.push_back(j);
-                vals.push_back(diag_eps);
+private:
+#ifdef EIGEN_CHOLMOD_SUPPORT
+    static double compute_gamma_heuristic(const spmat &W, const spmat &G,
+                                          double delta) {
+        const double W_norm = rowsum_inf_norm(W) + delta;
+        const double G_norm = rowsum_inf_norm(G);
+        return std::max(1.0, W_norm / std::max(1.0, G_norm * G_norm));
+    }
+    static double compute_adaptive_gamma(const spmat &W, const spmat &G,
+                                         double delta) {
+        const double W_norm = rowsum_inf_norm(W) + delta;
+        const double G_norm = rowsum_inf_norm(G);
+        const double cond_est = estimate_condition_number(W, delta);
+        double base_gamma =
+            std::max(1.0, W_norm / std::max(1.0, G_norm * G_norm));
+        if (cond_est > 1e12)
+            base_gamma *= 10.0;
+        else if (cond_est < 1e6)
+            base_gamma *= 0.1;
+        return base_gamma;
+    }
+    static spmat build_augmented_system(const spmat &W, const spmat &G,
+                                        double delta, double gamma) {
+        spmat K = W;
+        if (delta != 0.0) {
+            spmat I(W.rows(), W.rows());
+            I.setIdentity();
+            K = (K + delta * I).pruned();
+        }
+        if (gamma != 0.0) {
+            K = (K + gamma * (G.transpose() * G).pruned()).pruned();
+        }
+        K.makeCompressed();
+        return K;
+    }
+
+    std::pair<std::function<dvec(const dvec &)>, bool>
+    create_solver_cholmod(const spmat &K, const ChompConfig &cfg) const {
+        const int n = K.rows();
+
+        // Allow user to force identity ordering; otherwise let CHOLMOD choose
+        const bool force_identity = (cfg.sym_ordering == "none");
+        spmat Kp = K;
+        Kp.makeCompressed();
+        if (force_identity) {
+            // nothing to do; CHOLMOD will still analyze but with natural
+            // ordering
+        }
+
+        // Try supernodal LLT
+        auto llt = std::make_shared<Eigen::CholmodSupernodalLLT<spmat>>();
+        llt->compute(Kp);
+        if (llt->info() == Eigen::Success) {
+            auto solver = [llt](const dvec &b) -> dvec {
+                return llt->solve(b);
+            };
+            return {solver, true};
+        }
+
+        // Try simplicial LLT
+        auto llt2 = std::make_shared<Eigen::CholmodSimplicialLLT<spmat>>();
+        llt2->compute(Kp);
+        if (llt2->info() == Eigen::Success) {
+            auto solver = [llt2](const dvec &b) -> dvec {
+                return llt2->solve(b);
+            };
+            return {solver, true};
+        }
+
+        // Fall back to simplicial LDLT
+        auto ldlt = std::make_shared<Eigen::CholmodSimplicialLDLT<spmat>>();
+        ldlt->compute(Kp);
+        if (ldlt->info() != Eigen::Success)
+            throw std::runtime_error(
+                "HYKKT (cholmod): K factorization failed (LLT/LDLT)");
+
+        auto solver = [ldlt](const dvec &b) -> dvec { return ldlt->solve(b); };
+        return {solver, false};
+    }
+
+    std::pair<dvec, dvec>
+    solve_schur_system(const spmat &G, const spmat &K, const dvec &r1,
+                       const dvec &r2, double gamma,
+                       const std::function<dvec(const dvec &)> &solveK,
+                       const ChompConfig &cfg, bool assemble_schur_if_m_small,
+                       bool use_prec, int n, int m) const {
+
+        const dvec svec = r1 + gamma * (G.transpose() * r2);
+        const dvec rhs_s = G * solveK(svec) - r2;
+
+        dvec dy;
+        const bool small_m =
+            assemble_schur_if_m_small &&
+            (m <= std::max(1, int(cfg.schur_dense_cutoff * n)));
+
+        if (small_m) {
+            dmat Z(n, m);
+            for (int j = 0; j < m; ++j)
+                Z.col(j) = solveK(G.transpose().col(j));
+            const dmat S = G * Z;
+            dy = Eigen::LLT<dmat>(S).solve(rhs_s);
+        } else {
+            LinOp S_op{m, [&](const dvec &y, dvec &out) {
+                           out = G * solveK(G.transpose() * y);
+                       }};
+            std::optional<dvec> JacobiMinv;
+            std::optional<SSORPrecond> ssor;
+
+            if (use_prec) {
+                dvec diagKinv = K.diagonal().cwiseMax(1e-12).cwiseInverse();
+                if (cfg.prec_type == "jacobi") {
+                    JacobiMinv = schur_diag_hat(G, diagKinv).cwiseInverse();
+                } else if (cfg.prec_type == "ssor") {
+                    const spmat S_hat = build_S_hat(G, diagKinv);
+                    ssor.emplace(S_hat, cfg.ssor_omega);
+                }
             }
+            auto cg_res = cg(S_op, rhs_s, JacobiMinv, cfg.cg_tol, cfg.cg_maxit,
+                             std::nullopt, ssor, cfg.use_simd);
+            dy = std::move(cg_res.first);
         }
+
+        const dvec dx = solveK(svec - G.transpose() * dy);
+        return {dx, dy};
     }
 
-    std::vector<int> Ap(n + 1, 0);
-    for (int c : cols)
-        ++Ap[c + 1];
-    for (int j = 0; j < n; ++j)
-        Ap[j + 1] += Ap[j];
-
-    const size_t nnz = Ap[n];
-    std::vector<int> Ai(nnz);
-    std::vector<double> Ax(nnz);
-    std::vector<int> next = Ap;
-
-    for (size_t k = 0; k < cols.size(); ++k) {
-        const size_t p = next[cols[k]]++;
-        Ai[p] = rows[k];
-        Ax[p] = vals[k];
-    }
-
-    return qdldl23::SparseD32(n, std::move(Ap), std::move(Ai), std::move(Ax));
-}
-
-// Optimized KKT assembly
-[[nodiscard]] inline spmat assemble_KKT(const spmat &W, double delta,
-                                        const std::optional<spmat> &Gopt,
-                                        bool *out_hasE) {
-    const int n = W.rows();
-    if (W.cols() != n)
-        throw std::invalid_argument("assemble_KKT: W not square");
-
-    const bool hasE = Gopt && (Gopt->rows() > 0);
-    if (out_hasE)
-        *out_hasE = hasE;
-
-    if (!hasE) {
-        if (delta == 0.0)
-            return W;
-        spmat I(n, n);
-        I.setIdentity();
-        return (W + delta * I).pruned();
-    }
-
-    const auto &G = *Gopt;
-    const int m = G.rows();
-
-    std::vector<Eigen::Triplet<double>> triplets;
-    const size_t est_triplets =
-        W.nonZeros() + 2 * G.nonZeros() + (delta != 0.0 ? n : 0);
-    triplets.reserve(est_triplets);
-
-    std::vector<bool> has_diag(n, false);
-    for (int j = 0; j < W.outerSize(); ++j) {
-        for (spmat::InnerIterator it(W, j); it; ++it) {
-            double val = it.value();
-            if (delta != 0.0 && it.row() == it.col()) {
-                val += delta;
-                has_diag[it.row()] = true;
+    std::shared_ptr<KKTReusable>
+    create_reusable_solver(const spmat &G,
+                           const std::function<dvec(const dvec &)> &solveK,
+                           double gamma, const ChompConfig &cfg) const {
+        struct Reuse final : KKTReusable {
+            spmat G;
+            std::function<dvec(const dvec &)> Ks;
+            double gamma;
+            ChompConfig config;
+            Reuse(spmat G_, std::function<dvec(const dvec &)> Ks_, double g,
+                  ChompConfig cfg)
+                : G(std::move(G_)), Ks(std::move(Ks_)), gamma(g), config(cfg) {}
+            std::pair<dvec, dvec> solve(const dvec &r1n,
+                                        const std::optional<dvec> &r2n,
+                                        double tol, int maxit) override {
+                if (!r2n)
+                    throw std::invalid_argument(
+                        "HYKKT::Reuse (cholmod) needs r2");
+                const dvec svec_n = r1n + gamma * (G.transpose() * (*r2n));
+                const dvec rhs_s_n = G * Ks(svec_n) - (*r2n);
+                LinOp S_op{static_cast<int>(G.rows()),
+                           [&](const dvec &y, dvec &out) {
+                               out = G * Ks(G.transpose() * y);
+                           }};
+                auto cg_res2 = cg(S_op, rhs_s_n, std::nullopt, tol, maxit,
+                                  std::nullopt, std::nullopt, config.use_simd);
+                dvec dy_n = std::move(cg_res2.first);
+                const dvec dx_n = Ks(svec_n - G.transpose() * dy_n);
+                return {dx_n, dy_n};
             }
-            triplets.emplace_back(it.row(), it.col(), val);
-        }
+        };
+        return std::make_shared<Reuse>(G, solveK, gamma, cfg);
     }
-    if (delta != 0.0) {
-        for (int j = 0; j < n; ++j)
-            if (!has_diag[j])
-                triplets.emplace_back(j, j, delta);
-    }
-
-    for (int j = 0; j < G.outerSize(); ++j) {
-        for (spmat::InnerIterator it(G, j); it; ++it) {
-            triplets.emplace_back(it.col(), n + it.row(), it.value()); // G^T
-            triplets.emplace_back(n + it.row(), it.col(), it.value()); // G
-        }
-    }
-
-    spmat K(n + m, n + m);
-    K.setFromTriplets(triplets.begin(), triplets.end());
-    K.makeCompressed();
-    return K;
-}
+#endif // EIGEN_CHOLMOD_SUPPORT
+};
 
 // ------------------------------ LDL (QDLDL) ---------------------------
 class LDLStrategy final : public KKTStrategy {
@@ -900,6 +1136,9 @@ public:
 
     std::call_once(init_flag, []() {
         registry.register_strategy(std::make_shared<HYKKTStrategy>());
+#ifdef EIGEN_CHOLMOD_SUPPORT
+        registry.register_strategy(std::make_shared<HYKKTCholmodStrategy>());
+#endif
         registry.register_strategy(std::make_shared<LDLStrategy>());
     });
 

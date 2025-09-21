@@ -23,6 +23,8 @@ struct SplitHyper {
     double min_child_weight = 1e-3;
     // 0=Learn, 1=AlwaysLeft, 2=AlwaysRight
     int missing_policy = 0;
+    double leaf_gain_eps = 0.0;
+    bool allow_zero_gain = false;
 };
 
 // ============================================================================
@@ -100,16 +102,16 @@ struct Candidate {
 };
 
 // ============================================================================
-// SplitContext: histogram views + optional exact/row-level views
+// UPDATED SplitContext: Enhanced for variable bin sizes per feature
 // ============================================================================
 struct SplitContext {
     // Histogram views (required for axis/k-way)
-    const std::vector<double> *G = nullptr; // size P*B
-    const std::vector<double> *H = nullptr; // size P*B
-    const std::vector<int> *C = nullptr;    // size P*B
+    const std::vector<double> *G = nullptr; // size depends on variable_bins flag
+    const std::vector<double> *H = nullptr; // size depends on variable_bins flag
+    const std::vector<int> *C = nullptr;    // size depends on variable_bins flag
 
     int P = 0;                 // #features
-    int B = 0;                 // #bins per feature (last is missing)
+    int B = 0;                 // #bins per feature (uniform mode only)
     double Gp = 0.0, Hp = 0.0; // parent aggregates
     int Cp = 0;
 
@@ -117,6 +119,14 @@ struct SplitContext {
     const std::vector<int8_t> *monotone = nullptr;
 
     SplitHyper hyp;
+
+    // NEW: Variable bin size support
+    bool variable_bins = false;                   // enable variable bin mode
+    const size_t* feature_offsets = nullptr;     // cumulative offsets [P+1]
+    const int* finite_bins_per_feat = nullptr;   // finite bins per feature [P]
+    const int* missing_ids_per_feat = nullptr;   // missing bin ID per feature [P]
+
+
 
     // --- exact-mode (optional) ---
     const float *row_g = nullptr; // size N_total (or N at node)
@@ -135,16 +145,42 @@ struct SplitContext {
     // --- binned-matrix path for oblique (histogram-based) ---
     const uint16_t *Xb = nullptr;   // prebinned matrix (row-major, N_total x P)
     const int *row_index = nullptr; // pointer to node's row indices (length N)
-    int miss_bin_id = -1;           // usually B-1
-    const double *bin_centers = nullptr; // size P*B; centers for finite bins
+    int miss_bin_id = -1;           // usually B-1 (uniform) or per-feature (variable)
+    const double *bin_centers = nullptr; // size varies based on variable_bins
     int Bz = 256;                        // #bins for projection z histogram
 
     // Helper accessor: choose whichever monotone vector is set
     const std::vector<int8_t> *mono_ptr() const { return monotone; }
+
+    
+    // NEW: Helper methods for variable bin access
+    size_t get_histogram_offset(int feature, int bin) const {
+        if (variable_bins) {
+            return feature_offsets[feature] + static_cast<size_t>(bin);
+        } else {
+            return static_cast<size_t>(feature) * static_cast<size_t>(B) + static_cast<size_t>(bin);
+        }
+    }
+
+    int get_feature_bins(int feature) const {
+        if (variable_bins) {
+            return finite_bins_per_feat[feature];
+        } else {
+            return B - 1; // B includes missing bin
+        }
+    }
+
+    int get_missing_bin_id(int feature) const {
+        if (variable_bins) {
+            return missing_ids_per_feat[feature];
+        } else {
+            return B - 1; // uniform: missing is last bin
+        }
+    }
 };
 
 // ============================================================================
-// 1) Axis (histogram) — compact & monotone-aware
+// 1) UPDATED Axis (histogram) — compact & monotone-aware with variable bins
 // ============================================================================
 class AxisSplitFinder {
 public:
@@ -154,11 +190,9 @@ public:
         best.gain = detail::NEG_INF;
 
         const int P = ctx.P;
-        const int B = ctx.B;
-        if (!ctx.G || !ctx.H || !ctx.C || P <= 0 || B <= 1)
+        if (!ctx.G || !ctx.H || !ctx.C || P <= 0)
             return best;
 
-        const int miss = B - 1; // last bin is reserved for missing
         const auto &G = *ctx.G;
         const auto &H = *ctx.H;
         const auto &C = *ctx.C;
@@ -168,10 +202,18 @@ public:
             leaf_obj(ctx.Gp, ctx.Hp, ctx.hyp.lambda_, ctx.hyp.alpha_);
 
         for (int f = 0; f < P; ++f) {
-            const size_t base = (size_t)f * (size_t)B;
-            const double Gm = G[base + (size_t)miss];
-            const double Hm = H[base + (size_t)miss];
-            const int Cm = C[base + (size_t)miss];
+            // NEW: Get per-feature bin information
+            const int finite_bins = ctx.get_feature_bins(f);
+            const int miss_id = ctx.get_missing_bin_id(f);
+            
+            if (finite_bins <= 0) continue;
+
+            // Get missing bin statistics
+            const size_t miss_offset = ctx.get_histogram_offset(f, miss_id);
+            const double Gm = (miss_offset < G.size()) ? G[miss_offset] : 0.0;
+            const double Hm = (miss_offset < H.size()) ? H[miss_offset] : 0.0;
+            const int Cm = (miss_offset < C.size()) ? C[miss_offset] : 0;
+            
             const int8_t mono =
                 (mono_vec && f < (int)mono_vec->size()) ? (*mono_vec)[f] : 0;
 
@@ -186,10 +228,13 @@ public:
                 double GL = 0.0, HL = 0.0;
                 int CL = 0;
 
-                for (int t = 0; t < miss; ++t) {
-                    GL += G[base + (size_t)t];
-                    HL += H[base + (size_t)t];
-                    CL += C[base + (size_t)t];
+                for (int t = 0; t < finite_bins; ++t) {
+                    const size_t bin_offset = ctx.get_histogram_offset(f, t);
+                    if (bin_offset >= G.size()) continue;
+                    
+                    GL += G[bin_offset];
+                    HL += H[bin_offset];
+                    CL += C[bin_offset];
 
                     // Left child: finite-left (+ missing if miss_left)
                     const double GLx = GL + (miss_left ? Gm : 0.0);
@@ -252,7 +297,7 @@ public:
 };
 
 // ============================================================================
-// 2) Categorical K-way from histograms (binary emulation)
+// 2) UPDATED Categorical K-way from histograms with variable bins
 // ============================================================================
 class CategoricalKWaySplitFinder {
 public:
@@ -263,10 +308,10 @@ public:
         best.kind = SplitKind::KWay;
         best.gain = detail::NEG_INF;
 
-        if (!ctx.G || !ctx.H || !ctx.C || ctx.P <= 0 || ctx.B <= 1)
+        if (!ctx.G || !ctx.H || !ctx.C || ctx.P <= 0)
             return best;
 
-        const int P = ctx.P, B = ctx.B, miss = B - 1;
+        const int P = ctx.P;
         const auto &G = *ctx.G;
         const auto &H = *ctx.H;
 
@@ -277,13 +322,20 @@ public:
         const double parent = (ctx.Gp * ctx.Gp) / (ctx.Hp + lam);
 
         for (int f = 0; f < P; ++f) {
-            const size_t base = (size_t)f * (size_t)B;
+            // NEW: Get per-feature bin information
+            const int finite_bins = ctx.get_feature_bins(f);
+            const int miss_id = ctx.get_missing_bin_id(f);
+            
+            if (finite_bins <= 1) continue;
 
             // count non-empty finite bins
             int non_empty = 0;
-            for (int t = 0; t < miss; ++t) {
-                const double g = G[base + (size_t)t];
-                const double h = H[base + (size_t)t];
+            for (int t = 0; t < finite_bins; ++t) {
+                const size_t bin_offset = ctx.get_histogram_offset(f, t);
+                if (bin_offset >= G.size()) continue;
+                
+                const double g = G[bin_offset];
+                const double h = H[bin_offset];
                 if (g != 0.0 || h > 0.0)
                     ++non_empty;
             }
@@ -291,15 +343,18 @@ public:
                 continue;
 
             // Heuristic: many active bins => likely continuous, skip
-            if (non_empty > 32 && non_empty > miss / 2)
+            if (non_empty > 32 && non_empty > finite_bins / 2)
                 continue;
 
             // Score bins by |G|/(H+lam)
             std::vector<std::pair<double, int>> scored;
-            scored.reserve((size_t)miss);
-            for (int t = 0; t < miss; ++t) {
-                const double g = G[base + (size_t)t];
-                const double h = H[base + (size_t)t];
+            scored.reserve(static_cast<size_t>(finite_bins));
+            for (int t = 0; t < finite_bins; ++t) {
+                const size_t bin_offset = ctx.get_histogram_offset(f, t);
+                if (bin_offset >= G.size()) continue;
+                
+                const double g = G[bin_offset];
+                const double h = H[bin_offset];
                 if (g != 0.0 || h > 0.0) {
                     const double s = std::abs(g) / (h + lam + detail::EPS);
                     scored.emplace_back(s, t);
@@ -335,8 +390,12 @@ public:
             std::vector<double> Hgroup(groups.size(), 0.0);
             for (size_t gi = 0; gi < groups.size(); ++gi) {
                 double hs = 0.0;
-                for (int t : groups[gi])
-                    hs += H[base + (size_t)t];
+                for (int t : groups[gi]) {
+                    const size_t bin_offset = ctx.get_histogram_offset(f, t);
+                    if (bin_offset < H.size()) {
+                        hs += H[bin_offset];
+                    }
+                }
                 Hgroup[gi] = hs;
             }
             const int mg = (int)std::distance(
@@ -346,11 +405,18 @@ public:
             // Compute aggregates
             double GL = 0.0, HL = 0.0;
             for (int t : left) {
-                GL += G[base + (size_t)t];
-                HL += H[base + (size_t)t];
+                const size_t bin_offset = ctx.get_histogram_offset(f, t);
+                if (bin_offset < G.size()) {
+                    GL += G[bin_offset];
+                    HL += H[bin_offset];
+                }
             }
-            const double Gm = G[base + (size_t)miss];
-            const double Hm = H[base + (size_t)miss];
+            
+            // Add missing bin statistics
+            const size_t miss_offset = ctx.get_histogram_offset(f, miss_id);
+            const double Gm = (miss_offset < G.size()) ? G[miss_offset] : 0.0;
+            const double Hm = (miss_offset < H.size()) ? H[miss_offset] : 0.0;
+            
             if (missing_left) {
                 GL += Gm;
                 HL += Hm;
@@ -380,8 +446,41 @@ public:
 };
 
 // ============================================================================
-// Tiny linear-algebra helpers for oblique (Cholesky SPD)
+// Helper function for variable bin centers in oblique splitting
 // ============================================================================
+inline double x_from_code_variable(int f, uint16_t code, const SplitContext &ctx) {
+    if (ctx.variable_bins) {
+        // Variable bin mode: use feature offsets to find correct bin center
+        const int finite_bins = ctx.get_feature_bins(f);
+        const int miss_id = ctx.get_missing_bin_id(f);
+        
+        if (code == static_cast<uint16_t>(miss_id)) {
+            // Missing value - caller should handle this
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        
+        if (code >= static_cast<uint16_t>(finite_bins)) {
+            // Invalid bin - treat as missing
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        
+        const size_t center_offset = ctx.feature_offsets[f] + static_cast<size_t>(code);
+        return ctx.bin_centers[center_offset];
+    } else {
+        // Uniform bin mode: original logic
+        if (code == static_cast<uint16_t>(ctx.B - 1)) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return ctx.bin_centers[static_cast<size_t>(f) * static_cast<size_t>(ctx.B) + static_cast<size_t>(code)];
+    }
+}
+
+// ============================================================================
+// Rest of the classes (Oblique, etc.) remain largely unchanged but should use
+// the new helper functions and SplitContext methods for bin access
+// ============================================================================
+
+// Tiny linear-algebra helpers for oblique (Cholesky SPD)
 inline bool cholesky_spd(std::vector<double> &A, int n) {
     // A is row-major, overwritten with lower-tri L
     for (int i = 0; i < n; ++i) {
@@ -422,10 +521,8 @@ inline void chol_solve_inplace(const std::vector<double> &L, int n,
     }
 }
 
-// ============================================================================
 // Build normal equations (X^T diag(h) X + (ridge+λ)I) w = - X^T g
 // XS is a list of column pointers for selected features
-// ============================================================================
 inline void build_normal_eq_cols(const std::vector<const double *> &XS,
                                  const float *g, const float *h, int N,
                                  double ridge_plus_lambda,
@@ -458,6 +555,55 @@ inline void build_normal_eq_cols(const std::vector<const double *> &XS,
                 if (std::isfinite(xic))
                     A[(size_t)r * (size_t)k + (size_t)c] += hrx * xic;
             }
+        }
+    }
+    // symmetrize + ridge
+    for (int r = 0; r < k; ++r) {
+        for (int c = r + 1; c < k; ++c)
+            A[(size_t)c * (size_t)k + (size_t)r] =
+                A[(size_t)r * (size_t)k + (size_t)c];
+        A[(size_t)r * (size_t)k + (size_t)r] += ridge_plus_lambda;
+    }
+}
+
+// ============================================================================
+// UPDATED: Build normal equations from binned matrix using variable bin centers
+// ============================================================================
+inline void build_normal_eq_from_codes(
+    const std::vector<int> &S, const uint16_t *Xb, const int *rows, int nrows,
+    int P, const SplitContext &ctx, const float *g, const float *h,
+    double ridge_plus_lambda, std::vector<double> &A, std::vector<double> &b) {
+    const int k = (int)S.size();
+    A.assign((size_t)k * (size_t)k, 0.0);
+    b.assign((size_t)k, 0.0);
+    std::vector<double> xi((size_t)k, 0.0);
+
+    // b = - X^T g  and A = X^T diag(h) X (upper)
+    for (int rr = 0; rr < nrows; ++rr) {
+        const int i = rows[rr];
+        bool miss = false;
+        for (int c = 0; c < k; ++c) {
+            const int f = S[c];
+            const uint16_t code = Xb[(size_t)i * (size_t)P + (size_t)f];
+            const double x_val = x_from_code_variable(f, code, ctx);
+            if (!std::isfinite(x_val)) {
+                miss = true;
+                break;
+            }
+            xi[(size_t)c] = x_val;
+        }
+        if (miss)
+            continue;
+
+        const double gi = (double)g[i];
+        for (int c = 0; c < k; ++c)
+            b[(size_t)c] -= xi[(size_t)c] * gi;
+
+        const double hi = (double)h[i];
+        for (int r = 0; r < k; ++r) {
+            const double hrx = hi * xi[(size_t)r];
+            for (int c = r; c < k; ++c)
+                A[(size_t)r * (size_t)k + (size_t)c] += hrx * xi[(size_t)c];
         }
     }
     // symmetrize + ridge
@@ -556,70 +702,19 @@ inline std::tuple<double, double, bool> best_split_on_projection(
     return {best_gain, best_thr, best_mleft};
 }
 
-inline double x_from_code(int f, uint16_t code, int B, const double *centers) {
-    // code == B-1 → missing; caller handles it
-    return centers[(size_t)f * (size_t)B + (size_t)code];
-}
-
 // ============================================================================
-// Build normal equations from binned matrix using bin centers (selected S)
-// ============================================================================
-inline void build_normal_eq_from_codes(
-    const std::vector<int> &S, const uint16_t *Xb, const int *rows, int nrows,
-    int P, int B, const double *centers, const float *g, const float *h,
-    double ridge_plus_lambda, std::vector<double> &A, std::vector<double> &b) {
-    const int k = (int)S.size();
-    A.assign((size_t)k * (size_t)k, 0.0);
-    b.assign((size_t)k, 0.0);
-    std::vector<double> xi((size_t)k, 0.0);
-
-    // b = - X^T g  and A = X^T diag(h) X (upper)
-    for (int rr = 0; rr < nrows; ++rr) {
-        const int i = rows[rr];
-        bool miss = false;
-        for (int c = 0; c < k; ++c) {
-            const int f = S[c];
-            const uint16_t code = Xb[(size_t)i * (size_t)P + (size_t)f];
-            if (code == (uint16_t)(B - 1)) {
-                miss = true;
-                break;
-            }
-            xi[(size_t)c] = x_from_code(f, code, B, centers);
-        }
-        if (miss)
-            continue;
-
-        const double gi = (double)g[i];
-        for (int c = 0; c < k; ++c)
-            b[(size_t)c] -= xi[(size_t)c] * gi;
-
-        const double hi = (double)h[i];
-        for (int r = 0; r < k; ++r) {
-            const double hrx = hi * xi[(size_t)r];
-            for (int c = r; c < k; ++c)
-                A[(size_t)r * (size_t)k + (size_t)c] += hrx * xi[(size_t)c];
-        }
-    }
-    // symmetrize + ridge
-    for (int r = 0; r < k; ++r) {
-        for (int c = r + 1; c < k; ++c)
-            A[(size_t)c * (size_t)k + (size_t)r] =
-                A[(size_t)r * (size_t)k + (size_t)c];
-        A[(size_t)r * (size_t)k + (size_t)r] += ridge_plus_lambda;
-    }
-}
-
-// ============================================================================
-// Build 1-D histogram on z = w^T x using codes. Also returns missing aggregates
+// UPDATED: Build 1-D histogram on z = w^T x using variable bin centers
 // ============================================================================
 inline void build_projection_hist_from_codes(
     const std::vector<int> &S, const std::vector<double> &w, const uint16_t *Xb,
-    const int *rows, int nrows, int P, int B, int Bz, const double *centers,
+    const int *rows, int nrows, int P, const SplitContext &ctx, 
     const float *g, const float *h, std::vector<double> &Gz,
     std::vector<double> &Hz, std::vector<int> &Cz, double &Gm, double &Hm,
     int &Cm, double &zmin, double &zmax) {
     Gm = Hm = 0.0;
     Cm = 0;
+    const int Bz = (ctx.Bz > 0) ? ctx.Bz : 256;
+    
     if (nrows <= 0 || S.empty()) {
         Gz.assign(Bz, 0.0);
         Hz.assign(Bz, 0.0);
@@ -642,11 +737,12 @@ inline void build_projection_hist_from_codes(
         for (size_t j = 0; j < S.size(); ++j) {
             const int f = S[j];
             const uint16_t code = Xb[(size_t)i * (size_t)P + (size_t)f];
-            if (code == (uint16_t)(B - 1)) {
+            const double x_val = x_from_code_variable(f, code, ctx);
+            if (!std::isfinite(x_val)) {
                 miss = true;
                 break;
             }
-            acc += w[j] * x_from_code(f, code, B, centers);
+            acc += w[j] * x_val;
         }
         if (miss) {
             finite[(size_t)rr] = 0u;
@@ -690,14 +786,14 @@ inline void build_projection_hist_from_codes(
 }
 
 // ============================================================================
-// 3) Oblique splitter (ridge WLS + 1D threshold search)
+// 3) UPDATED Oblique splitter with variable bin support
 // ============================================================================
 class ObliqueSplitFinder {
 public:
     int k_features = 6; // pick top-k by |corr(x,g)|
     double ridge = 1e-3;
 
-    // Row-wise (exact) oblique
+    // Row-wise (exact) oblique - unchanged since it doesn't use bins
     Candidate best_oblique(const SplitContext &ctx,
                            double axis_guard_gain = -1.0 /*optional*/) const {
         Candidate out;
@@ -804,7 +900,7 @@ public:
         return out;
     }
 
-    // Histogram-backed oblique (uses bin centers for fast approximation)
+    // UPDATED: Histogram-backed oblique with variable bin support
     Candidate best_oblique_hist(const SplitContext &ctx) const {
         Candidate out;
         out.kind = SplitKind::Oblique;
@@ -815,8 +911,8 @@ public:
             !ctx.row_h)
             return out;
 
-        const int P = ctx.P, B = ctx.B, Nn = ctx.N;
-        if (P <= 1 || B <= 1 || Nn <= 0)
+        const int P = ctx.P, Nn = ctx.N;
+        if (P <= 1 || Nn <= 0)
             return out;
 
         // 1) rank features by |corr(x, g)| approx using bin centers
@@ -827,9 +923,9 @@ public:
             for (int rr = 0; rr < Nn; ++rr) {
                 const int i = ctx.row_index[rr];
                 const uint16_t code = ctx.Xb[(size_t)i * (size_t)P + (size_t)f];
-                if (code == (uint16_t)(B - 1))
+                const double x = x_from_code_variable(f, code, ctx);
+                if (!std::isfinite(x))
                     continue;
-                const double x = x_from_code(f, code, B, ctx.bin_centers);
                 const double gi = (double)ctx.row_g[i];
                 sx += x;
                 sxx += x * x;
@@ -863,8 +959,8 @@ public:
 
         // 2) normal equations on codes (ridge includes lambda)
         std::vector<double> A, b, w;
-        build_normal_eq_from_codes(S, ctx.Xb, ctx.row_index, Nn, P, B,
-                                   ctx.bin_centers, ctx.row_g, ctx.row_h,
+        build_normal_eq_from_codes(S, ctx.Xb, ctx.row_index, Nn, P, ctx,
+                                   ctx.row_g, ctx.row_h,
                                    ridge + ctx.hyp.lambda_, A, b);
         if (!cholesky_spd(A, (int)S.size()))
             return out;
@@ -876,9 +972,9 @@ public:
         double Gm = 0.0, Hm = 0.0;
         int Cm = 0;
         double zmin = 0.0, zmax = 1.0;
-        const int Bz = (ctx.Bz > 0) ? ctx.Bz : std::max(64, std::min(512, B));
+        
         build_projection_hist_from_codes(
-            S, w, ctx.Xb, ctx.row_index, Nn, P, B, Bz, ctx.bin_centers,
+            S, w, ctx.Xb, ctx.row_index, Nn, P, ctx,
             ctx.row_g, ctx.row_h, Gz, Hz, Cz, Gm, Hm, Cm, zmin, zmax);
 
         // If no spread along z, bail
@@ -894,6 +990,7 @@ public:
         const double Htot = std::accumulate(Hz.begin(), Hz.end(), 0.0) + Hm;
         const int Ctot = std::accumulate(Cz.begin(), Cz.end(), 0);
         const double parent = (Gtot * Gtot) / (Htot + ctx.hyp.lambda_);
+        const int Bz = static_cast<int>(Gz.size());
 
         auto scan_dir = [&](bool miss_left) -> std::pair<double, int> {
             double GL = 0.0, HL = 0.0;
@@ -956,6 +1053,11 @@ public:
     }
 };
 
+// ============================================================================
+// Rest of the classes can remain largely unchanged since they use the same
+// helper functions and SplitContext methods
+// ============================================================================
+
 struct InteractionSeededConfig {
     int pairs = 5;               // max pairs to evaluate
     int max_top_features = 8;    // among corr-ranked features
@@ -968,7 +1070,8 @@ struct InteractionSeededConfig {
     bool use_axis_guard = true;
 };
 
-// --------------------------- small helpers -----------------------------------
+// The rest of the InteractionSeededObliqueFinder class remains unchanged
+// since it operates on row-level data and doesn't use histogram bins
 
 namespace detail {
 
@@ -1190,8 +1293,6 @@ best_split_on_projection(const std::vector<double> &z,
 }
 
 } // namespace detail
-
-// -------------------- Interaction-seeded oblique finder ----------------------
 
 class InteractionSeededObliqueFinder {
 public:

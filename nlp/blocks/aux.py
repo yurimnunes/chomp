@@ -297,8 +297,6 @@ class Model:
 
         self.cI_hess = [AD.sym_hess(ci, self.n) for ci in self.cI_funcs]
         self.cE_hess = [AD.sym_hess(ce, self.n) for ce in self.cE_funcs]
-        
-        print(f"Compiled derivatives: n={self.n}, m_ineq={self.m_ineq}, m_eq={self.m_eq}")
 
     # ---------- fused evaluation ----------
     def eval_all(
@@ -308,12 +306,12 @@ class Model:
         Returns any subset of {"f","g","H","cI","JI","cE","JE"} quickly.
         Fuses constraint value/grad loops, minimizes conversions, caches results at x.
         """
-        x = _as_float_array(x).ravel()
+        #x = _as_float_array(x).ravel()
         n = self.n
-        if x.shape[0] != n:
-            raise ValueError(f"Input x shape {x.shape} does not match n={n}")
-        if not np.isfinite(x).all():
-            raise ValueError("Non-finite values in x")
+        # if x.shape[0] != n:
+        #     raise ValueError(f"Input x shape {x.shape} does not match n={n}")
+        # if not np.isfinite(x).all():
+        #     raise ValueError("Non-finite values in x")
 
         want = components or ["f", "g", "H", "cI", "JI", "cE", "JE"]
         want_set = set(want)
@@ -346,7 +344,7 @@ class Model:
         if "g" in want_set:
             try:
                 g = self.f_grad(x)
-                g = g if isinstance(g, np.ndarray) and g.dtype == float else _as_float_array(g)
+                #g = g if isinstance(g, np.ndarray) and g.dtype == float else _as_float_array(g)
                 if not np.isfinite(g).all():
                     g = np.zeros(n, dtype=float)
             except Exception:
@@ -391,8 +389,7 @@ class Model:
                         cI_vals[i] = float(gi.value(x))
                     if JI_rows is not None:
                         row = gi(x)
-                        JI_rows[i, :] = row if (isinstance(row, np.ndarray) and row.dtype == float) \
-                                              else _as_float_array(row, (n,))
+                        JI_rows[i, :] = row
                 if cI_vals is not None:
                     res["cI"] = _finite_or_zero(cI_vals)
                 if JI_rows is not None:
@@ -430,8 +427,7 @@ class Model:
                         cE_vals[j] = float(ge.value(x))
                     if JE_rows is not None:
                         row = ge(x)
-                        JE_rows[j, :] = row if (isinstance(row, np.ndarray) and row.dtype == float) \
-                                              else _as_float_array(row, (n,))
+                        JE_rows[j, :] = row
                 if cE_vals is not None:
                     res["cE"] = _finite_or_zero(cE_vals)
                 if JE_rows is not None:
@@ -469,22 +465,7 @@ class Model:
 
         cfg = getattr(self, "cfg", None)
         multiplier_threshold = float(getattr(cfg, "multiplier_threshold", 1e-8)) if cfg else 1e-8
-        clip_max = float(getattr(cfg, "hess_clip_max", 1e12)) if cfg else 1e12
         use_sparse = self.use_sparse
-
-        def _sanitize_dense(A: np.ndarray) -> np.ndarray:
-            np.clip(A, -clip_max, clip_max, out=A)
-            A[~np.isfinite(A)] = 0.0
-            return A
-
-        def _sanitize_sparse(A: sp.spmatrix) -> sp.spmatrix:
-            A = A.tocsr(copy=True)
-            d = A.data
-            bad = ~np.isfinite(d)
-            if bad.any():
-                d[bad] = 0.0
-            np.clip(A.data, -clip_max, clip_max, out=A.data)
-            return A
 
         # Base Hessian directly from AD (avoid dict path)
         try:
@@ -496,14 +477,12 @@ class Model:
             H = sp.csr_matrix((n, n)) if use_sparse else np.zeros((n, n), dtype=float)
         elif sp.issparse(H):
             H = (H + H.T) * 0.5
-            H = _sanitize_sparse(H)
             if not use_sparse:
                 H = H.toarray()
         else:
             H = _as_float_array(H, (n, n))
             # Optional symmetry enforcement
             # H = 0.5*(H + H.T)
-            H = _sanitize_dense(H)
             if use_sparse:
                 H = sp.csr_matrix(H)
 
@@ -516,13 +495,8 @@ class Model:
                 return H_acc
 
             if sp.issparse(Hi):
-                Hi = (Hi + Hi.T) * 0.5
-                Hi = _sanitize_sparse(Hi)
                 return (H_acc + (w * Hi)) if use_sparse else (H_acc + (w * Hi.toarray()))
             else:
-                Hi = _as_float_array(Hi, (n, n))
-                Hi = 0.5 * (Hi + Hi.T)
-                Hi = _sanitize_dense(Hi)
                 return (H_acc + (w * sp.csr_matrix(Hi))) if use_sparse else (H_acc + (w * Hi))
 
         # Add constraint Hessians
@@ -532,12 +506,12 @@ class Model:
             H = _add_piece(H, float(w), Hi)
 
         # Final finite check
-        if use_sparse:
-            if not np.isfinite(H.data).all():
-                H = sp.eye(n, format="csr")
-        else:
-            if not np.isfinite(H).all():
-                H = np.eye(n, dtype=float)
+        # if use_sparse:
+        #     if not np.isfinite(H.data).all():
+        #         H = sp.eye(n, format="csr")
+        # else:
+        #     if not np.isfinite(H).all():
+        #         H = np.eye(n, dtype=float)
         return H
 
     # ---------- norms/diagnostics ----------
@@ -549,13 +523,13 @@ class Model:
         cI = _clean_vec(d.get("cI", None), mI) if mI > 0 else np.zeros(0, dtype=float)
         cE = _clean_vec(d.get("cE", None), mE) if mE > 0 else np.zeros(0, dtype=float)
 
-        scale = float(max(1, self.n, mI + mE))
+        scale = 1.0
         theta = 0.0
         if mI: theta += float(np.maximum(0.0, cI).sum()) / scale
         if mE: theta += float(np.abs(cE).sum()) / scale
-        if not np.isfinite(theta):
-            logging.warning("Non-finite constraint violation")
-            theta = float("inf")
+        # if not np.isfinite(theta):
+        #     logging.warning("Non-finite constraint violation")
+        #     theta = float("inf")
         return theta
 
     def kkt_residuals(self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray) -> dict[str, float]:

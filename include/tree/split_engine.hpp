@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 #include <cmath>
+#include <type_traits>
 
 #include "split_finder.hpp"  // AxisSplitFinder, CategoricalKWaySplitFinder, ObliqueSplitFinder
                              // SplitHyper, SplitContext, Candidate, SplitKind
@@ -22,12 +23,12 @@ struct SplitUtils {
     if (g < -alpha) return g + alpha;
     return 0.0;
   }
+  // match the objective used in split_finder.hpp (gain math):
   static inline double leaf_obj(double G, double H, double lambda, double alpha) {
     const double denom = H + lambda;
     if (!(denom > 0.0)) return 0.0;
     const double gs = soft(G, alpha);
-    const double w  = -gs / denom;
-    return 0.5 * denom * w * w + w * G + std::abs(w) * alpha;
+    return 0.5 * (gs * gs) / denom;
   }
   static inline double split_gain(double Gp, double Hp,
                                   double GL, double HL,
@@ -41,7 +42,7 @@ struct SplitUtils {
     const double Rpar = leaf_obj(Gp, Hp, hyp.lambda_, hyp.alpha_);
     const double Rl   = leaf_obj(GL, HL, hyp.lambda_, hyp.alpha_);
     const double Rr   = leaf_obj(Gp - GL, Hp - HL, hyp.lambda_, hyp.alpha_);
-    return (Rpar - (Rl + Rr)) - hyp.gamma_;
+    return (Rl + Rr - Rpar) - hyp.gamma_; // children minus parent, minus gamma
   }
   static inline bool monotone_ok(int8_t mono, double GL, double HL,
                                  double GR, double HR, const SplitHyper& hyp) {
@@ -55,17 +56,24 @@ struct SplitUtils {
       return -gs / (Hx + hyp.lambda_);
     };
     const double wL = wt(GL, HL), wR = wt(GR, HR);
-    if (mono > 0 && wL > wR) return false;
-    if (mono < 0 && wL < wR) return false;
+    if (mono > 0 && wL > wR) return false; // non-decreasing: wL <= wR
+    if (mono < 0 && wL < wR) return false; // non-increasing: wL >= wR
     return true;
   }
+};
+
+enum class ObliqueMode : uint8_t {
+  Off,               // never try oblique
+  Full,              // ObliqueSplitFinder (k-feature ridge WLS)
+  InteractionSeeded, // 2-feature interaction-seeded
+  Auto               // try both, keep the better (with axis guard)
 };
 
 // ------------------------- Config for extra modes -----------------------------
 struct SplitEngineConfig {
   bool enable_axis    = true;
   bool enable_kway    = false;   // histogram backend only
-  bool enable_oblique = false;
+  bool enable_oblique = false;   // set true to try oblique splits
 
   // Axis vs Oblique guard: if axis_gain * guard >= oblique_gain, keep axis
   double axis_vs_oblique_guard = 1.02;
@@ -76,11 +84,17 @@ struct SplitEngineConfig {
   // Oblique knobs
   int    oblique_k_features = 2;
   double oblique_ridge      = 1e-3;
+
+  // oblique mode
+  ObliqueMode oblique_mode = ObliqueMode::Off;
+
+  // interaction-seeded params
+  InteractionSeededConfig iseed; // from your file; default ctor is fine
 };
 
 // ============================ Backend Policies ===============================
 //
-// We use two tiny policy types exposing a uniform static API:
+// We use two policy types exposing a uniform static API:
 //
 //   struct Backend {
 //     static constexpr bool supports_kway    = ...;
@@ -102,13 +116,12 @@ struct SplitEngineConfig {
 //                                   const uint8_t* miss_mask = nullptr);
 //   }
 //
-// This avoids repetitive switch/if ladders in the high-level Splitter.
 // ============================================================================
 
 // --------------------------- Histogram backend --------------------------------
 struct HistogramBackend {
   static constexpr bool supports_kway    = true;
-  static constexpr bool supports_oblique = true;
+  static constexpr bool supports_oblique = true;  // histogram-backed oblique via bin centers
 
   static Candidate best_axis(const SplitContext& ctx) {
     AxisSplitFinder finder;
@@ -124,15 +137,15 @@ struct HistogramBackend {
   static Candidate best_oblique(const SplitContext& ctx,
                                 int k_features,
                                 double ridge,
-                                double axis_guard_gain = -1.0,
+                                double /*axis_guard_gain*/ = -1.0,
                                 const float* = nullptr, int = 0,
                                 const int* = nullptr,  int = 0,
                                 int = 0, const uint8_t* = nullptr) {
-    // Works if ctx.Xcols is set; otherwise ObliqueSplitFinder will no-op return
+    // Uses oblique trained on bin centers (fast approx).
     ObliqueSplitFinder finder;
     finder.k_features = std::max(2, k_features);
     finder.ridge      = ridge;
-    return finder.best_oblique(ctx, axis_guard_gain);
+    return finder.best_oblique_hist(ctx);
   }
 };
 
@@ -154,14 +167,17 @@ struct ExactBackend {
 
     for (int f = 0; f < P; ++f) {
       col.clear();
+      int Cm = 0; // total missing count at node for feature f
       for (int ii = 0; ii < nidx; ++ii) {
         const int r = node_idx[ii];
         const size_t off = (size_t)r*(size_t)P + (size_t)f;
         const bool miss = miss_mask ? (miss_mask[off] != 0)
                                     : !std::isfinite(Xraw[off]);
         if (!miss) col.emplace_back(Xraw[off], r);
+        else       ++Cm;
       }
       const int n_valid = (int)col.size();
+      const int n_total = n_valid + Cm;
       if (n_valid < ctx.hyp.min_samples_leaf || n_valid < 2) continue;
 
       std::sort(col.begin(), col.end(),
@@ -169,7 +185,6 @@ struct ExactBackend {
 
       const double Gm = (ctx.Gmiss ? ctx.Gmiss[f] : 0.0);
       const double Hm = (ctx.Hmiss ? ctx.Hmiss[f] : 0.0);
-      const int    Cm = (ctx.Cmiss ? ctx.Cmiss[f] : 0);
       const bool has_miss = ctx.has_missing && (Cm > 0);
 
       double GL = 0.0, HL = 0.0; int nL = 0;
@@ -183,14 +198,14 @@ struct ExactBackend {
 
         const float v  = col[k].first;
         const float vp = col[k+1].first;
-        if (!(v < vp)) continue;
+        if (!(v < vp)) continue; // need strict separation
 
         auto eval_dir = [&](bool miss_left){
           double GLL = GL, HLL = HL; int nLL = nL;
           if (miss_left && has_miss) { GLL += Gm; HLL += Hm; nLL += Cm; }
           const double GRR = ctx.Gp - GLL;
           const double HRR = ctx.Hp - HLL;
-          const int    nRR = (has_miss ? (n_valid + Cm) : n_valid) - nLL;
+          const int    nRR = n_total - nLL;
           if (!SplitUtils::monotone_ok(mono, GLL, HLL, GRR, HRR, ctx.hyp))
             return -std::numeric_limits<double>::infinity();
           return SplitUtils::split_gain(ctx.Gp, ctx.Hp, GLL, HLL, nLL, nRR, ctx.hyp);
@@ -211,12 +226,12 @@ struct ExactBackend {
         }
 
         if (gain > best.gain) {
-          best.gain     = gain;
-          best.kind     = SplitKind::Axis;
-          best.feat     = f;
-          best.thr      = k;           // rank in the sorted valid list
-          best.miss_left= miss_left_pick;
-          // Optionally: best.split_value = 0.5*(double(v)+double(vp));
+          best.gain      = gain;
+          best.kind      = SplitKind::Axis;
+          best.feat      = f;
+          best.thr       = k;           // rank among sorted valid samples
+          best.miss_left = miss_left_pick;
+          // Optional: best.split_value = 0.5*(double(v)+double(vp));
         }
       }
     }
@@ -227,16 +242,14 @@ struct ExactBackend {
                                 int k_features,
                                 double ridge,
                                 double axis_guard_gain = -1.0,
-                                const float* Xraw = nullptr, int /*P*/ = 0,
+                                const float* /*Xraw*/ = nullptr, int /*P*/ = 0,
                                 const int* /*node_idx*/ = nullptr, int /*nidx*/ = 0,
                                 int /*missing_policy*/ = 0, const uint8_t* /*miss*/ = nullptr) {
-    // Exact-oblique relies on ctx.Xcols/row access prepared by caller.
     if (!ctx.Xcols || !ctx.row_g || !ctx.row_h || ctx.N <= 0) {
       Candidate c; c.kind = SplitKind::Oblique;
       c.gain = -std::numeric_limits<double>::infinity();
       return c;
     }
-    (void)Xraw;
     ObliqueSplitFinder finder;
     finder.k_features = std::max(2, k_features);
     finder.ridge      = ridge;
@@ -248,7 +261,9 @@ struct ExactBackend {
 
 struct Splitter {
 
-  // --------------------- Minimal legacy APIs (axis-only) ---------------------
+  // --------------------- PRESERVE ALL EXISTING APIs -------------------------
+  
+  // Legacy API 1: Simple 2-parameter call
   static inline Candidate best_split(const SplitContext& ctx, SplitEngine eng) {
     if (eng == SplitEngine::Histogram) return HistogramBackend::best_axis(ctx);
     // For Exact legacy call we cannot run without the raw arrays; return invalid.
@@ -257,6 +272,7 @@ struct Splitter {
     return c;
   }
 
+  // Legacy API 2: Exact with full raw parameters (PRESERVE EXACTLY)
   static inline Candidate best_split(const SplitContext& ctx, SplitEngine eng,
                                      const float* Xraw, int P,
                                      const int* node_idx, int nidx,
@@ -265,7 +281,7 @@ struct Splitter {
     return ExactBackend::best_axis(ctx, Xraw, P, node_idx, nidx, missing_policy, miss_mask);
   }
 
-  // --------------------------- New unified API --------------------------------
+  // --------------------------- NEW Enhanced APIs --------------------------------
   template <class Backend>
   static Candidate best_split_with_backend(const SplitContext& ctx,
                                            const SplitEngineConfig& cfg,
@@ -295,7 +311,7 @@ struct Splitter {
       }
     }
 
-    // 3) Oblique (optional)
+    // 3) Oblique (optional; only if supported)
     Candidate obli; obli.gain = -std::numeric_limits<double>::infinity();
     if constexpr (Backend::supports_oblique) {
       if (cfg.enable_oblique) {
@@ -305,7 +321,7 @@ struct Splitter {
                                      cfg.oblique_ridge,
                                      guard,
                                      Xraw, P, node_idx, nidx, missing_policy, miss_mask);
-        // Optional guard: if axis clearly wins, prefer axis
+        // Prefer axis if gains are essentially tied (guard >= 1.0 keeps axis)
         if (axis.gain > 0.0 && obli.gain > 0.0 &&
             axis.gain * cfg.axis_vs_oblique_guard >= obli.gain) {
           obli.gain = -std::numeric_limits<double>::infinity();
@@ -325,7 +341,7 @@ struct Splitter {
     return best;
   }
 
-  // Convenience frontends mirroring your original signature set
+  // New API: Enhanced with config
   static Candidate best_split(const SplitContext& ctx,
                               SplitEngine backend,
                               const SplitEngineConfig& cfg,

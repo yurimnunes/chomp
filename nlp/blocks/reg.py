@@ -556,7 +556,7 @@ class Regularizer:
 
         # mode & floors
         self.cfg = cfg
-        self.mode = str(_cfg("reg_mode", "AUTO"))  # AUTO|EIGEN_MOD|INERTIA_FIX|SPECTRAL|TIKHONOV
+        self.mode = str(_cfg("reg_mode", "EIGEN_MOD"))  # AUTO|EIGEN_MOD|INERTIA_FIX|SPECTRAL|TIKHONOV
         self.sigma = float(_cfg("reg_sigma", 1e-8))
         self.sigma_min = float(_cfg("reg_sigma_min", 1e-12))
         self.sigma_max = float(_cfg("reg_sigma_max", 1e6))

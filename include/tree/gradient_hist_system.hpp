@@ -23,13 +23,24 @@ namespace foretree {
 // =============================== Config ======================================
 
 struct HistogramConfig {
-    std::string method = "grad_aware"; // "hist" | "quantile" | "grad_aware"
+    std::string method = "grad_aware"; // "hist" | "quantile" | "grad_aware" | "adaptive"
     int   max_bins = 256;
     bool  use_missing_bin = true;
 
     // quantile / grad-aware
     int   coarse_bins = 64;      // base for grad_aware auto-tuning
     bool  density_aware = true;  // reserved for future
+
+    // NEW: Adaptive binning parameters
+    int   min_bins = 8;          // minimum bins per feature
+    int   target_bins = 32;      // target bins for "normal" features
+    bool  adaptive_binning = true; // enable per-feature adaptive bin counts
+    double importance_threshold = 0.1; // features above this get more bins
+    double complexity_threshold = 0.7; // features above this get more bins
+    
+    // NEW: Feature importance weighting
+    bool  use_feature_importance = false;
+    std::vector<double> feature_importance_weights; // if provided, override auto-detection
 
     // sketch-ish knobs (reserved for future approximations)
     double subsample_ratio = 0.3;
@@ -49,14 +60,176 @@ struct HistogramConfig {
     int missing_bin_id() const { return use_missing_bin ? max_bins : -1; }
 };
 
+// =============================== Feature analysis ========================
+
+struct FeatureStats {
+    double variance = 0.0;
+    double gradient_variance = 0.0;
+    double gradient_range = 0.0;
+    double value_range = 0.0;
+    int unique_count = 0;
+    double complexity_score = 0.0;
+    double importance_score = 0.0;
+    bool is_categorical = false;
+    
+    // Computed bin allocation
+    int suggested_bins = 32;
+    std::string allocation_reason = "default";
+};
+
+// Analyze feature to determine optimal bin count
+inline FeatureStats analyze_feature_importance(const std::vector<double>& values,
+                                               const std::vector<double>& gradients,
+                                               const std::vector<double>& hessians,
+                                               const HistogramConfig& cfg) {
+    FeatureStats stats;
+    
+    if (values.empty()) {
+        stats.suggested_bins = cfg.min_bins;
+        stats.allocation_reason = "empty_feature";
+        return stats;
+    }
+    
+    // Basic statistics
+    double val_min = std::numeric_limits<double>::max();
+    double val_max = std::numeric_limits<double>::lowest();
+    double val_sum = 0.0, val_sq = 0.0;
+    double grad_sum = 0.0, grad_sq = 0.0;
+    double grad_min = std::numeric_limits<double>::max();
+    double grad_max = std::numeric_limits<double>::lowest();
+    
+    std::vector<double> unique_vals;
+    unique_vals.reserve(values.size());
+    
+    size_t finite_count = 0;
+    for (size_t i = 0; i < values.size(); ++i) {
+        const double v = values[i];
+        const double g = (i < gradients.size()) ? gradients[i] : 0.0;
+        
+        if (std::isfinite(v) && std::isfinite(g)) {
+            finite_count++;
+            val_min = std::min(val_min, v);
+            val_max = std::max(val_max, v);
+            val_sum += v;
+            val_sq += v * v;
+            
+            grad_min = std::min(grad_min, g);
+            grad_max = std::max(grad_max, g);
+            grad_sum += g;
+            grad_sq += g * g;
+            
+            unique_vals.push_back(v);
+        }
+    }
+    
+    if (finite_count == 0) {
+        stats.suggested_bins = cfg.min_bins;
+        stats.allocation_reason = "no_finite_values";
+        return stats;
+    }
+    
+    // Compute statistics
+    const double n = static_cast<double>(finite_count);
+    const double val_mean = val_sum / n;
+    const double grad_mean = grad_sum / n;
+    
+    stats.variance = (val_sq - val_sum * val_mean) / (n - 1);
+    stats.gradient_variance = (grad_sq - grad_sum * grad_mean) / (n - 1);
+    stats.value_range = val_max - val_min;
+    stats.gradient_range = grad_max - grad_min;
+    
+    // Count unique values
+    std::sort(unique_vals.begin(), unique_vals.end());
+    unique_vals.erase(std::unique(unique_vals.begin(), unique_vals.end()), unique_vals.end());
+    stats.unique_count = static_cast<int>(unique_vals.size());
+    
+    // Categorical check
+    stats.is_categorical = (stats.unique_count <= std::min(cfg.max_bins / 4, 32));
+    
+    // Compute complexity score (gradient variation)
+    if (finite_count >= 3) {
+        std::vector<size_t> order(values.size());
+        std::iota(order.begin(), order.end(), 0);
+        
+        // Sort by values to compute gradient complexity
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return values[a] < values[b];
+        });
+        
+        double complexity_sum = 0.0;
+        int complexity_count = 0;
+        for (size_t i = 2; i < order.size(); ++i) {
+            const double g_curr = gradients[order[i]];
+            const double g_prev = gradients[order[i-1]];
+            const double g_prev2 = gradients[order[i-2]];
+            
+            if (std::isfinite(g_curr) && std::isfinite(g_prev) && std::isfinite(g_prev2)) {
+                const double second_diff = g_curr - 2.0 * g_prev + g_prev2;
+                complexity_sum += std::abs(second_diff);
+                complexity_count++;
+            }
+        }
+        
+        if (complexity_count > 0) {
+            stats.complexity_score = complexity_sum / complexity_count;
+        }
+    }
+    
+    // Compute importance score (normalized gradient variance * value range)
+    const double norm_grad_var = stats.gradient_variance / (1.0 + std::abs(grad_mean));
+    const double norm_val_range = stats.value_range / (1.0 + std::abs(val_mean));
+    stats.importance_score = std::sqrt(norm_grad_var * norm_val_range);
+    
+    // Determine bin allocation
+    if (stats.is_categorical) {
+        stats.suggested_bins = std::min(stats.unique_count, cfg.max_bins);
+        stats.allocation_reason = "categorical";
+    } else if (stats.importance_score > cfg.importance_threshold && 
+               stats.complexity_score > cfg.complexity_threshold) {
+        // High importance + high complexity -> more bins
+        const double factor = 1.5 + 0.5 * stats.importance_score + 0.3 * stats.complexity_score;
+        stats.suggested_bins = std::min(cfg.max_bins, 
+                                       std::max(cfg.min_bins, 
+                                               static_cast<int>(cfg.target_bins * factor)));
+        stats.allocation_reason = "high_importance_complex";
+    } else if (stats.importance_score > cfg.importance_threshold) {
+        // High importance -> more bins
+        const double factor = 1.2 + 0.4 * stats.importance_score;
+        stats.suggested_bins = std::min(cfg.max_bins,
+                                       std::max(cfg.min_bins,
+                                               static_cast<int>(cfg.target_bins * factor)));
+        stats.allocation_reason = "high_importance";
+    } else if (stats.complexity_score > cfg.complexity_threshold) {
+        // High complexity -> more bins
+        const double factor = 1.1 + 0.3 * stats.complexity_score;
+        stats.suggested_bins = std::min(cfg.max_bins,
+                                       std::max(cfg.min_bins,
+                                               static_cast<int>(cfg.target_bins * factor)));
+        stats.allocation_reason = "high_complexity";
+    } else if (stats.unique_count < cfg.min_bins) {
+        // Very few unique values
+        stats.suggested_bins = std::max(2, stats.unique_count);
+        stats.allocation_reason = "few_unique_values";
+    } else {
+        // Normal feature
+        stats.suggested_bins = cfg.target_bins;
+        stats.allocation_reason = "normal";
+    }
+    
+    return stats;
+}
+
 // =============================== Feature bins =================================
 
 struct FeatureBins {
     std::vector<double> edges; // strictly increasing, size = nb+1
     bool   is_uniform = false;
-    std::string strategy = "uniform";  // "uniform"|"quantile"|"categorical"|"grad_aware"
+    std::string strategy = "uniform";  // "uniform"|"quantile"|"categorical"|"grad_aware"|"adaptive"
     double lo    = 0.0;  // for O(1) uniform binning
     double width = 1.0;  // for O(1) uniform binning
+    
+    // NEW: Analysis results
+    FeatureStats stats;
 
     int n_bins() const {
         return static_cast<int>(edges.empty() ? 0 : (edges.size() - 1));
@@ -125,7 +298,7 @@ inline std::vector<double> exact_quantile_edges(const std::vector<double>& vals,
 inline std::vector<double> weighted_quantile_edges(const std::vector<double>& vals,
                                                    const std::vector<double>& wts,
                                                    int nb) {
-    // Filter non-finite values and non-positive weights
+    nb = std::max(1, nb);
     struct Pair { double v, w; };
     std::vector<Pair> vw; vw.reserve(vals.size());
     for (size_t i = 0; i < vals.size(); ++i) {
@@ -136,21 +309,42 @@ inline std::vector<double> weighted_quantile_edges(const std::vector<double>& va
     if (vw.empty()) return {0.0, 1.0};
     std::sort(vw.begin(), vw.end(), [](const Pair& a, const Pair& b){ return a.v < b.v; });
 
-    const size_t n = vw.size();
-    std::vector<double> cdf(n);
-    cdf[0] = vw[0].w;
-    for (size_t i = 1; i < n; ++i) cdf[i] = cdf[i-1] + vw[i].w;
-    const double W = cdf.back();
-    if (!(W > 0.0)) return exact_quantile_edges(vals, nb);
-
-    nb = std::max(1, nb);
-    std::vector<double> e; e.reserve(nb + 1);
-    for (int i = 0; i <= nb; ++i) {
-        const double target = (double)i / (double)nb * W;
-        auto it = std::lower_bound(cdf.begin(), cdf.end(), target);
-        const size_t idx = (it == cdf.end() ? (n - 1) : (size_t)std::distance(cdf.begin(), it));
-        e.push_back(vw[idx].v); // stepwise weighted quantile (robust & simple)
+    // Compress duplicates: one row per unique value with summed weight
+    std::vector<double> uniq; uniq.reserve(vw.size());
+    std::vector<double> wuniq; wuniq.reserve(vw.size());
+    for (const auto& p : vw) {
+        if (uniq.empty() || p.v != uniq.back()) {
+            uniq.push_back(p.v);
+            wuniq.push_back(p.w);
+        } else {
+            wuniq.back() += p.w;
+        }
     }
+
+    const int U = (int)uniq.size();
+    if (U == 1) {
+        const double x = uniq[0];
+        return {x - 1e-12, x + 1e-12};
+    }
+
+    // CDF over uniques
+    std::vector<double> cdf(U);
+    cdf[0] = wuniq[0];
+    for (int i = 1; i < U; ++i) cdf[i] = cdf[i-1] + wuniq[i];
+    const double W = cdf.back();
+
+    std::vector<double> e(nb + 1);
+    e[0]     = uniq.front() - 1e-12;
+    e[nb]    = uniq.back()  + 1e-12;
+
+    // Internal edges at centered targets: (i-0.5)/nb
+    for (int i = 1; i < nb; ++i) {
+        const double target = ((double)i - 0.5) / (double)nb * W;
+        auto it = std::lower_bound(cdf.begin(), cdf.end(), target);
+        const int k = (it == cdf.end() ? (U - 1) : int(it - cdf.begin()));
+        e[i] = uniq[k];
+    }
+
     _strict_increasing(e);
     return e;
 }
@@ -305,6 +499,69 @@ struct GradientAwareBinner final : IBinningStrategy {
     }
 };
 
+// NEW: Adaptive binner that analyzes feature importance
+struct AdaptiveBinner final : IBinningStrategy {
+    FeatureBins create_bins(const std::vector<double>& values,
+                            const std::vector<double>& gradients,
+                            const std::vector<double>& hessians,
+                            const HistogramConfig& cfg) override {
+        // Clean data
+        std::vector<double> v, g, h;
+        v.reserve(values.size());
+        g.reserve(values.size());
+        h.reserve(values.size());
+        for (size_t i = 0; i < values.size(); ++i) {
+            const double vi = values[i];
+            const double gi = (i < gradients.size() ? gradients[i] : 0.0);
+            const double hi = (i < hessians.size() ? hessians[i] : 1.0);
+            if (std::isfinite(vi) && std::isfinite(gi) && std::isfinite(hi)) {
+                v.push_back(vi);
+                g.push_back(gi);
+                h.push_back(std::max(cfg.eps, hi));
+            }
+        }
+        
+        FeatureBins fb; 
+        fb.strategy = "adaptive";
+        
+        if (v.empty()) {
+            fb.edges = {0.0, 1.0};
+            fb.stats.suggested_bins = cfg.min_bins;
+            fb.stats.allocation_reason = "empty_feature";
+            _check_uniform(fb);
+            return fb;
+        }
+
+        // Analyze feature to determine optimal bin count
+        fb.stats = analyze_feature_importance(v, g, h, cfg);
+        const int target_bins = fb.stats.suggested_bins;
+
+        // Handle categorical features
+        if (fb.stats.is_categorical) {
+            std::vector<double> u = v;
+            std::sort(u.begin(), u.end());
+            u.erase(std::unique(u.begin(), u.end()), u.end());
+            fb.edges = _midpoint_edges_of_unique(u);
+            _check_uniform(fb);
+            return fb;
+        }
+
+        // Use weighted quantiles with adaptive bin count
+        std::vector<double> w(v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+            // Weight by hessian + gradient magnitude for important features
+            const double base_weight = h[i];
+            const double grad_weight = (fb.stats.importance_score > cfg.importance_threshold) 
+                                      ? (1.0 + std::abs(g[i])) : 1.0;
+            w[i] = base_weight * grad_weight;
+        }
+        
+        fb.edges = weighted_quantile_edges(v, w, target_bins);
+        _check_uniform(fb);
+        return fb;
+    }
+};
+
 // ============================ Histogram system =================================
 
 class GradientHistogramSystem {
@@ -312,7 +569,7 @@ public:
     explicit GradientHistogramSystem(HistogramConfig cfg)
         : cfg_(std::move(cfg)), rng_(cfg_.rng_seed), P_(0), N_(0) {}
 
-    // ---- Fit bins per feature using the chosen strategy (quantile/grad_aware) ----
+    // ---- Fit bins per feature using the chosen strategy (quantile/grad_aware/adaptive) ----
     // X: row-major (N x P); g/h length N
     void fit_bins(const double* X, int N, int P, const double* g, const double* h) {
         if (N <= 0 || P <= 0) throw std::invalid_argument("fit_bins: invalid N or P");
@@ -320,9 +577,10 @@ public:
         N_ = N; P_ = P;
 
         std::unique_ptr<IBinningStrategy> strat;
-        if (cfg_.method == "quantile")      strat = std::make_unique<QuantileBinner>();
-        else if (cfg_.method == "hist")     strat = std::make_unique<QuantileBinner>(); // baseline
-        else                                strat = std::make_unique<GradientAwareBinner>();
+        if (cfg_.method == "quantile")           strat = std::make_unique<QuantileBinner>();
+        else if (cfg_.method == "hist")          strat = std::make_unique<QuantileBinner>(); // baseline
+        else if (cfg_.method == "adaptive")      strat = std::make_unique<AdaptiveBinner>();
+        else                                     strat = std::make_unique<GradientAwareBinner>();
 
         feature_bins_.assign(P_, FeatureBins{});
 
@@ -337,10 +595,18 @@ public:
             }
             FeatureBins fb = strat->create_bins(col, gj, hj, cfg_);
 
-            // Enforce capacity (nb <= max_bins) by downsampling edges
+            // For adaptive strategy, use the suggested bin count directly
+            int max_bins_for_feature;
+            if (cfg_.method == "adaptive" && cfg_.adaptive_binning) {
+                max_bins_for_feature = fb.stats.suggested_bins;
+            } else {
+                max_bins_for_feature = cfg_.max_bins;
+            }
+
+            // Enforce capacity by downsampling edges if needed
             const int nb = fb.n_bins();
-            if (nb > cfg_.max_bins) {
-                fb.edges = downsample_edges(fb.edges, cfg_.max_bins);
+            if (nb > max_bins_for_feature) {
+                fb.edges = downsample_edges(fb.edges, max_bins_for_feature);
                 _check_uniform(fb);
             }
             return fb;
@@ -364,7 +630,7 @@ public:
 
         EdgeSet es;
         es.edges_per_feat = std::move(edges_per_feat);
-        // DataBinner::register_edges will recompute finite_bins/missing_bin_id
+        // DataBinner::register_edges will compute per-feature bin counts automatically
         binner_ = std::make_unique<DataBinner>(P_);
         binner_->register_edges("hist", std::move(es));
 
@@ -402,8 +668,6 @@ public:
         if (!codes_)  throw std::runtime_error("prebin_dataset must be called before build_histograms_fast");
         if (!binner_) throw std::runtime_error("fit_bins must be called before build_histograms_fast");
 
-        const int    tot_bins    = this->total_bins();      // <-- renamed to avoid shadow/call clash
-        const size_t feat_stride = (size_t)tot_bins;
         const uint16_t* CODES = codes_->data();
 
         auto accumulate_one = [&](int i){
@@ -412,8 +676,17 @@ public:
             const double hi = (double)h[i];
             for (int j = 0; j < P_; ++j) {
                 const uint16_t b = row[j];
-                if (b >= (uint16_t)tot_bins) continue; // safety
-                const size_t off = (size_t)j * feat_stride + b;
+                const int feat_total_bins = binner_->total_bins("hist", j);
+                if (b >= (uint16_t)feat_total_bins) continue; // safety per feature
+                
+                // Calculate offset in the histogram array
+                // We need to compute cumulative offset for variable bin sizes
+                size_t feat_offset = 0;
+                for (int k = 0; k < j; ++k) {
+                    feat_offset += (size_t)binner_->total_bins("hist", k);
+                }
+                const size_t off = feat_offset + b;
+                
                 Hg[off] += gi;
                 Hh[off] += hi;
                 if constexpr (WITH_COUNTS) { (*Cptr)[off] += 1; }
@@ -427,39 +700,130 @@ public:
         }
     }
 
-    // With counts (G/H/C)
+    // With counts (G/H/C) - now handles variable bin sizes
     template <class GFloat = float, class HFloat = float>
     std::tuple<std::vector<double>, std::vector<double>, std::vector<int>>
     build_histograms_fast_with_counts(const GFloat* g, const HFloat* h,
                                       const int* sample_indices = nullptr,
                                       int n_sub = 0) const {
-        const size_t stride = (size_t)this->total_bins();
-        std::vector<double> Hg((size_t)P_ * stride, 0.0);
-        std::vector<double> Hh((size_t)P_ * stride, 0.0);
-        std::vector<int>    C ((size_t)P_ * stride, 0);
+        // Calculate total histogram size for variable bin counts
+        size_t total_hist_size = 0;
+        for (int j = 0; j < P_; ++j) {
+            total_hist_size += (size_t)binner_->total_bins("hist", j);
+        }
+        
+        std::vector<double> Hg(total_hist_size, 0.0);
+        std::vector<double> Hh(total_hist_size, 0.0);
+        std::vector<int>    C (total_hist_size, 0);
         _accumulate_hist<true>(g, h, sample_indices, n_sub, Hg, Hh, &C);
         return {std::move(Hg), std::move(Hh), std::move(C)};
     }
 
-    // No counts (G/H)
+    // No counts (G/H) - now handles variable bin sizes
     template <class GFloat = float, class HFloat = float>
     std::pair<std::vector<double>, std::vector<double>>
     build_histograms_fast(const GFloat* g, const HFloat* h,
                           const int* sample_indices = nullptr,
                           int n_sub = 0) const {
-        const size_t stride = (size_t)this->total_bins();
-        std::vector<double> Hg((size_t)P_ * stride, 0.0);
-        std::vector<double> Hh((size_t)P_ * stride, 0.0);
+        // Calculate total histogram size for variable bin counts
+        size_t total_hist_size = 0;
+        for (int j = 0; j < P_; ++j) {
+            total_hist_size += (size_t)binner_->total_bins("hist", j);
+        }
+        
+        std::vector<double> Hg(total_hist_size, 0.0);
+        std::vector<double> Hh(total_hist_size, 0.0);
         _accumulate_hist<false>(g, h, sample_indices, n_sub, Hg, Hh, nullptr);
         return {std::move(Hg), std::move(Hh)};
+    }
+
+    // NEW: Helper to extract histogram for a specific feature from the packed format
+    std::tuple<std::vector<double>, std::vector<double>, std::vector<int>>
+    extract_feature_histogram(const std::vector<double>& Hg, 
+                             const std::vector<double>& Hh,
+                             const std::vector<int>& C,
+                             int feature) const {
+        if (!binner_ || feature < 0 || feature >= P_) {
+            throw std::invalid_argument("Invalid feature index");
+        }
+        
+        // Calculate offset for this feature
+        size_t feat_offset = 0;
+        for (int k = 0; k < feature; ++k) {
+            feat_offset += (size_t)binner_->total_bins("hist", k);
+        }
+        
+        const int feat_bins = binner_->total_bins("hist", feature);
+        
+        std::vector<double> feat_Hg(feat_bins);
+        std::vector<double> feat_Hh(feat_bins);
+        std::vector<int> feat_C(feat_bins);
+        
+        for (int b = 0; b < feat_bins; ++b) {
+            const size_t idx = feat_offset + b;
+            feat_Hg[b] = (idx < Hg.size()) ? Hg[idx] : 0.0;
+            feat_Hh[b] = (idx < Hh.size()) ? Hh[idx] : 0.0;
+            feat_C[b] = (idx < C.size()) ? C[idx] : 0;
+        }
+        
+        return {std::move(feat_Hg), std::move(feat_Hh), std::move(feat_C)};
+    }
+
+    // NEW: Get feature histogram offsets for manual indexing
+    std::vector<size_t> get_feature_offsets() const {
+        std::vector<size_t> offsets(P_ + 1, 0);
+        for (int j = 0; j < P_; ++j) {
+            offsets[j + 1] = offsets[j] + (size_t)binner_->total_bins("hist", j);
+        }
+        return offsets;
     }
 
     // ---- Accessors ------------------------------------------------------------
     int P() const { return P_; }
     int N() const { return N_; }
     int missing_bin_id() const { return miss_id_; }
+    
+    // NEW: Per-feature accessors
+    int finite_bins(int feature) const { 
+        return binner_ ? binner_->finite_bins("hist", feature) : cfg_.max_bins; 
+    }
+    int total_bins(int feature) const { 
+        return binner_ ? binner_->total_bins("hist", feature) : cfg_.total_bins(); 
+    }
+    int missing_bin_id(int feature) const {
+        return binner_ ? binner_->missing_bin_id("hist", feature) : cfg_.missing_bin_id();
+    }
+    
+    // Legacy accessors (return max across features for compatibility)
     int finite_bins() const { return binner_ ? binner_->finite_bins("hist") : cfg_.max_bins; }
     int total_bins()  const { return binner_ ? binner_->total_bins("hist")  : cfg_.total_bins(); }
+
+    // NEW: Get all bin counts at once
+    std::vector<int> all_finite_bins() const {
+        if (!binner_) return std::vector<int>(P_, cfg_.max_bins);
+        return binner_->finite_bins_per_feat("hist");
+    }
+    std::vector<int> all_total_bins() const {
+        std::vector<int> result(P_);
+        for (int j = 0; j < P_; ++j) {
+            result[j] = total_bins(j);
+        }
+        return result;
+    }
+
+    // NEW: Feature analysis results
+    const FeatureStats& feature_stats(int j) const { 
+        return feature_bins_.at(j).stats; 
+    }
+    
+    // NEW: Get summary of bin allocation decisions
+    std::vector<std::pair<int, std::string>> get_bin_allocation_summary() const {
+        std::vector<std::pair<int, std::string>> summary(P_);
+        for (int j = 0; j < P_; ++j) {
+            summary[j] = {finite_bins(j), feature_bins_[j].stats.allocation_reason};
+        }
+        return summary;
+    }
 
     const FeatureBins& feature_bins(int j) const { return feature_bins_.at(j); }
     const DataBinner*  binner() const { return binner_.get(); }
