@@ -80,7 +80,7 @@ class SQPConfig:
     use_watchdog: bool = False
     use_nonmonotone_ls: bool = False
     hessian_mode: str = "exact"  # {"exact","bfgs","lbfgs","hybrid","gn"}
-    
+
     # ---------------- Tolerances ----------------
     tol_feas: float = 1e-5
     tol_stat: float = 1e-5
@@ -176,13 +176,14 @@ class SQPConfig:
     max_crit_shrinks: int = 1  # at most this many back-to-back shrinks
 
     # -------- NEW: TR geometry --------
-    norm_type: str = "2"       # {"2", "ellip"}
-    metric_shift: float = 1e-8 # small ridge to make M ≻ 0 when built from H
+    norm_type: str = "2"  # {"2", "ellip"}
+    metric_shift: float = 1e-8  # small ridge to make M ≻ 0 when built from H
     tau_ftb: float = 0.995  # fraction-to-boundary safety factor for box feasibility
     history_length: int = 10  # for adaptive strategies
     non_monotone: bool = False  # use non-monotone TR radius update
     non_monotone_window: int = 5  # window size for non-monotone updates
     max_iter: int = 100  # max TR iterations (for safety)
+
 
 # ======================================
 # Small helpers
@@ -227,30 +228,53 @@ def _clean_vec(v, m: int) -> np.ndarray:
         return np.zeros(m, dtype=float)
     a = np.asarray(v, dtype=float).ravel()
     if a.size != m:
-        a = (a[:m] if a.size > m else np.pad(a, (0, m - a.size)))
+        a = a[:m] if a.size > m else np.pad(a, (0, m - a.size))
     return _finite_or_zero(a)
+
+
+import time
+
+# import spla
+import scipy.sparse.linalg as spla
 
 
 class Model:
     """
     Encapsulates objective, constraints, and derivatives for the SQP/IP stack.
-    Keeps identical behavior; faster by fusing evals and cutting Python overhead.
+    Now includes an internal HessianManager, and lagrangian_hessian() returns
+    the hybrid Hessian (exact early + quasi-Newton thereafter) per cfg.
     """
 
     __slots__ = (
-        "n", "f", "cI_funcs", "cE_funcs", "m_ineq", "m_eq",
-        "lb", "ub", "use_sparse",
-        "f_grad", "f_hess", "cI_grads", "cE_grads", "cI_hess", "cE_hess",
-        "_cache", "_cache_x",
-        "_dense_JI_cache", "_dense_JE_cache",
+        "n",
+        "f",
+        "cI_funcs",
+        "cE_funcs",
+        "m_ineq",
+        "m_eq",
+        "lb",
+        "ub",
+        "use_sparse",
+        "f_grad",
+        "f_hess",
+        "cI_grads",
+        "cE_grads",
+        "cI_hess",
+        "cE_hess",
+        "_cache",
+        "_cache_x",
+        "_dense_JI_cache",
+        "_dense_JE_cache",
         "cfg",
+        "lag_hessian",
+        "hess_manager",   # <-- NEW
     )
 
     def __init__(
         self,
-        f: Callable,
-        c_ineq: List[Callable] | None = None,
-        c_eq: List[Callable] | None = None,
+        f: "Callable",
+        c_ineq: "List[Callable]" | None = None,
+        c_eq: "List[Callable]" | None = None,
         n: int | None = None,
         lb: np.ndarray = np.array([]),
         ub: np.ndarray = np.array([]),
@@ -279,22 +303,24 @@ class Model:
 
         self._cache: Dict[str, object] = {}
         self._cache_x: Optional[Tuple[float, ...]] = None
-        self._dense_JI_cache: Optional[np.ndarray] = None  # cached dense view of JI at _cache_x
-        self._dense_JE_cache: Optional[np.ndarray] = None  # cached dense view of JE at _cache_x
+        self._dense_JI_cache: Optional[np.ndarray] = None
+        self._dense_JE_cache: Optional[np.ndarray] = None
 
         self.cfg = cfg
 
         self._compile_derivatives()
 
+        # --- NEW: attach HessianManager (regularizer can be supplied via cfg.regularizer) ---
+        regularizer = getattr(cfg, "regularizer", None) if cfg is not None else None
+        self.hess_manager = HessianManager(self.n, cfg, regularizer)  # uses cfg.hessian_mode etc.
+
     # ---------- derivative compilation ----------
     def _compile_derivatives(self) -> None:
-        self.f_grad = AD.sym_grad(self.f, self.n)   # returns grad; .value(x) gives scalar
-        self.f_hess = AD.sym_hess(self.f, self.n)   # returns Hessian
-
-        # Constraints: keep GradFn for values/gradients; Hessians if solver needs them.
+        self.f_grad = AD.sym_grad(self.f, self.n)
+        self.f_hess = AD.sym_hess(self.f, self.n)
+        self.lag_hessian = AD.sym_laghess(self.f, self.cI_funcs, self.cE_funcs, self.n)
         self.cI_grads = [AD.sym_grad(ci, self.n) for ci in self.cI_funcs]
         self.cE_grads = [AD.sym_grad(ce, self.n) for ce in self.cE_funcs]
-
         self.cI_hess = [AD.sym_hess(ci, self.n) for ci in self.cI_funcs]
         self.cE_hess = [AD.sym_hess(ce, self.n) for ce in self.cE_funcs]
 
@@ -306,7 +332,7 @@ class Model:
         Returns any subset of {"f","g","H","cI","JI","cE","JE"} quickly.
         Fuses constraint value/grad loops, minimizes conversions, caches results at x.
         """
-        #x = _as_float_array(x).ravel()
+        # x = _as_float_array(x).ravel()
         n = self.n
         # if x.shape[0] != n:
         #     raise ValueError(f"Input x shape {x.shape} does not match n={n}")
@@ -344,7 +370,7 @@ class Model:
         if "g" in want_set:
             try:
                 g = self.f_grad(x)
-                #g = g if isinstance(g, np.ndarray) and g.dtype == float else _as_float_array(g)
+                # g = g if isinstance(g, np.ndarray) and g.dtype == float else _as_float_array(g)
                 if not np.isfinite(g).all():
                     g = np.zeros(n, dtype=float)
             except Exception:
@@ -370,7 +396,9 @@ class Model:
                     else:
                         res["H"] = H
             except Exception:
-                res["H"] = sp.eye(n, format="csr") if use_sparse else np.eye(n, dtype=float)
+                res["H"] = (
+                    sp.eye(n, format="csr") if use_sparse else np.eye(n, dtype=float)
+                )
 
         # ---------- constraints: fused loops ----------
         # Inequalities
@@ -396,7 +424,9 @@ class Model:
                     if self.use_sparse:
                         JI = sp.csr_matrix(JI_rows)  # one conversion
                         res["JI"] = JI
-                        self._dense_JI_cache = JI_rows  # keep dense view for downstream use
+                        self._dense_JI_cache = (
+                            JI_rows  # keep dense view for downstream use
+                        )
                     else:
                         res["JI"] = _finite_or_zero(JI_rows)
                         self._dense_JI_cache = res["JI"]  # type: ignore[assignment]
@@ -404,12 +434,18 @@ class Model:
                 if "cI" in want_set:
                     res["cI"] = np.zeros(mI, dtype=float)
                 if "JI" in want_set:
-                    res["JI"] = sp.csr_matrix((mI, n)) if self.use_sparse else np.zeros((mI, n), dtype=float)
+                    res["JI"] = (
+                        sp.csr_matrix((mI, n))
+                        if self.use_sparse
+                        else np.zeros((mI, n), dtype=float)
+                    )
                 self._dense_JI_cache = None
 
         else:
-            if "cI" in want_set: res["cI"] = None
-            if "JI" in want_set: res["JI"] = None
+            if "cI" in want_set:
+                res["cI"] = None
+            if "JI" in want_set:
+                res["JI"] = None
             self._dense_JI_cache = None
 
         # Equalities
@@ -442,11 +478,17 @@ class Model:
                 if "cE" in want_set:
                     res["cE"] = np.zeros(self.m_eq, dtype=float)
                 if "JE" in want_set:
-                    res["JE"] = sp.csr_matrix((self.m_eq, n)) if self.use_sparse else np.zeros((self.m_eq, n), dtype=float)
+                    res["JE"] = (
+                        sp.csr_matrix((self.m_eq, n))
+                        if self.use_sparse
+                        else np.zeros((self.m_eq, n), dtype=float)
+                    )
                 self._dense_JE_cache = None
         else:
-            if "cE" in want_set: res["cE"] = None
-            if "JE" in want_set: res["JE"] = None
+            if "cE" in want_set:
+                res["cE"] = None
+            if "JE" in want_set:
+                res["JE"] = None
             self._dense_JE_cache = None
 
         # update cache & return
@@ -454,64 +496,54 @@ class Model:
         self._cache_x = x_key
         return {k: res.get(k, None) for k in want}
 
-    # ---------- Lagrangian Hessian ----------
-    def lagrangian_hessian(self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray) -> np.ndarray | sp.spmatrix:
+    # def lagrangian_hessian(
+    #     self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
+    # ) -> Union[np.ndarray, sp.spmatrix, spla.LinearOperator]:
+    #     """
+    #     Return ∇²L according to the currently configured hybrid policy.
+    #     May return a scipy.sparse.linalg.LinearOperator (e.g., L-BFGS).
+    #     """
+    #     n, mI, mE = self.n, self.m_ineq, self.m_eq
+    #     x = _as_float_array(x, (n,))
+    #     lam = _as_float_array(lam).ravel()[:mI]
+    #     nu  = _as_float_array(nu ).ravel()[:mE]
+    #     if not (np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()):
+    #         raise ValueError("Non-finite values in x, lam, or nu")
+
+    #     return self.hess_manager.get_hessian(self, x, lam, nu)
+
+    # ---------- optional helpers for the solver ----------
+    def hessian_update(self, s: np.ndarray, y: np.ndarray, *, accepted: bool = True) -> None:
+        """
+        Forward solver's step/grad-diff to the internal HessianManager.
+        Use Lagrangian gradient difference for y.
+        """
+        self.hess_manager.update(s, y, accepted=accepted)
+
+    def reset_hessian(self) -> None:
+        """Reset quasi-Newton state to identity & clear memory."""
+        self.hess_manager.reset()
+    def lagrangian_hessian(
+        self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
+    ) -> np.ndarray | sp.spmatrix:
         n, mI, mE = self.n, self.m_ineq, self.m_eq
         x = _as_float_array(x, (n,))
         lam = _as_float_array(lam).ravel()[:mI]
-        nu  = _as_float_array(nu ).ravel()[:mE]
-        if not (np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()):
+        nu = _as_float_array(nu).ravel()[:mE]
+        if not (
+            np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()
+        ):
             raise ValueError("Non-finite values in x, lam, or nu")
-
         cfg = getattr(self, "cfg", None)
-        multiplier_threshold = float(getattr(cfg, "multiplier_threshold", 1e-8)) if cfg else 1e-8
         use_sparse = self.use_sparse
 
         # Base Hessian directly from AD (avoid dict path)
-        try:
-            H = self.f_hess(x)
-        except Exception:
-            H = None
+        start_time = time.time()
+        H = self.lag_hessian.hess(x, lam, nu)
+        end_time = time.time()
+        print(f"Hessian eval time: {end_time - start_time:.6f} seconds")
+        
 
-        if H is None:
-            H = sp.csr_matrix((n, n)) if use_sparse else np.zeros((n, n), dtype=float)
-        elif sp.issparse(H):
-            H = (H + H.T) * 0.5
-            if not use_sparse:
-                H = H.toarray()
-        else:
-            H = _as_float_array(H, (n, n))
-            # Optional symmetry enforcement
-            # H = 0.5*(H + H.T)
-            if use_sparse:
-                H = sp.csr_matrix(H)
-
-        def _add_piece(H_acc, w: float, Hi_fun):
-            if Hi_fun is None or abs(w) <= multiplier_threshold:
-                return H_acc
-            try:
-                Hi = Hi_fun(x)
-            except Exception:
-                return H_acc
-
-            if sp.issparse(Hi):
-                return (H_acc + (w * Hi)) if use_sparse else (H_acc + (w * Hi.toarray()))
-            else:
-                return (H_acc + (w * sp.csr_matrix(Hi))) if use_sparse else (H_acc + (w * Hi))
-
-        # Add constraint Hessians
-        for w, Hi in zip(lam, self.cI_hess):
-            H = _add_piece(H, float(w), Hi)
-        for w, Hi in zip(nu, self.cE_hess):
-            H = _add_piece(H, float(w), Hi)
-
-        # Final finite check
-        # if use_sparse:
-        #     if not np.isfinite(H.data).all():
-        #         H = sp.eye(n, format="csr")
-        # else:
-        #     if not np.isfinite(H).all():
-        #         H = np.eye(n, dtype=float)
         return H
 
     # ---------- norms/diagnostics ----------
@@ -525,24 +557,32 @@ class Model:
 
         scale = 1.0
         theta = 0.0
-        if mI: theta += float(np.maximum(0.0, cI).sum()) / scale
-        if mE: theta += float(np.abs(cE).sum()) / scale
+        if mI:
+            theta += float(np.maximum(0.0, cI).sum()) / scale
+        if mE:
+            theta += float(np.abs(cE).sum()) / scale
         # if not np.isfinite(theta):
         #     logging.warning("Non-finite constraint violation")
         #     theta = float("inf")
         return theta
 
-    def kkt_residuals(self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray) -> dict[str, float]:
+    def kkt_residuals(
+        self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
+    ) -> dict[str, float]:
         n, mI, mE = self.n, self.m_ineq, self.m_eq
-        x  = _as_float_array(x, (n,))
+        x = _as_float_array(x, (n,))
         lam = _as_float_array(lam).ravel()[:mI]
-        nu  = _as_float_array(nu ).ravel()[:mE]
-        if not (np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()):
+        nu = _as_float_array(nu).ravel()[:mE]
+        if not (
+            np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()
+        ):
             raise ValueError("Non-finite values in x, lam, or nu")
 
         need = ["g"]
-        if mI: need += ["JI", "cI"]
-        if mE: need += ["JE", "cE"]
+        if mI:
+            need += ["JI", "cI"]
+        if mE:
+            need += ["JE", "cE"]
         d = self.eval_all(x, components=need)
 
         g = _as_float_array(d.get("g", np.zeros(n, dtype=float)), (n,))
@@ -553,13 +593,17 @@ class Model:
             JI = d.get("JI", None)
             lam_p = np.maximum(lam, 0.0)
             if JI is not None:
-                if sp.issparse(JI): rL += JI.T @ lam_p
-                else:               rL += _as_float_array(JI) .T @ lam_p
+                if sp.issparse(JI):
+                    rL += JI.T @ lam_p
+                else:
+                    rL += _as_float_array(JI).T @ lam_p
         if mE:
             JE = d.get("JE", None)
             if JE is not None:
-                if sp.issparse(JE): rL += JE.T @ nu
-                else:               rL += _as_float_array(JE).T @ nu
+                if sp.issparse(JE):
+                    rL += JE.T @ nu
+                else:
+                    rL += _as_float_array(JE).T @ nu
 
         stat_inf = float(np.linalg.norm(rL, ord=np.inf)) / scale_g
 
@@ -604,8 +648,16 @@ class Model:
         n, mE, mI = self.n, self.m_eq, self.m_ineq
 
         # normalize residuals
-        rE = None if (rE is None or (hasattr(rE, "__len__") and len(rE) == 0)) else _as_float_array(rE).ravel()
-        rI = None if (rI is None or (hasattr(rI, "__len__") and len(rI) == 0)) else _as_float_array(rI).ravel()
+        rE = (
+            None
+            if (rE is None or (hasattr(rE, "__len__") and len(rE) == 0))
+            else _as_float_array(rE).ravel()
+        )
+        rI = (
+            None
+            if (rI is None or (hasattr(rI, "__len__") and len(rI) == 0))
+            else _as_float_array(rI).ravel()
+        )
 
         # Grab JE/JI from cache (eval_all should have been called at base point)
         JE = self._cache.get("JE", None)
@@ -615,7 +667,9 @@ class Model:
         if (JE is None and mE > 0) or (JI is None and mI > 0):
             if self._cache_x is not None:
                 x_arr = np.asarray(self._cache_x, dtype=float)
-                need = (["JE"] if (JE is None and mE > 0) else []) + (["JI"] if (JI is None and mI > 0) else [])
+                need = (["JE"] if (JE is None and mE > 0) else []) + (
+                    ["JI"] if (JI is None and mI > 0) else []
+                )
                 d = self.eval_all(x_arr, components=need)
                 JE = d.get("JE", JE)
                 JI = d.get("JI", JI)
@@ -642,7 +696,9 @@ class Model:
             blocks.append((w_ineq, JI_d, rI, W))
 
         if not blocks:
-            return np.zeros(n, dtype=float), (np.zeros(mI, dtype=float) if mI > 0 else np.zeros(0, dtype=float))
+            return np.zeros(n, dtype=float), (
+                np.zeros(mI, dtype=float) if mI > 0 else np.zeros(0, dtype=float)
+            )
 
         # Normal equations: (A^T A + gamma I) dx = -A^T b
         AtA = np.eye(n, dtype=float) * float(gamma)
@@ -682,6 +738,7 @@ class Model:
             ds_cor = _finite_or_zero(ds_cor)
 
         return dx_cor, ds_cor
+
 
 # ======================================
 # Restoration (weighted L1 feasibility)
@@ -884,154 +941,245 @@ class RestorationManager:
 # ======================================
 class HessianManager:
     """
-    Manage Hessian approximations for SQP: exact, BFGS, L-BFGS, and hybrid.
-    Supports sparse matrices and efficient L-BFGS matvecs.
+    Quasi-Newton manager for SQP/IP:
+      Modes: "exact", "bfgs", "lbfgs", "hybrid"
+      - hybrid = exact for warmup & periodic refresh, otherwise BFGS/L-BFGS
+      - supports sparse or dense storage
+      - optional LinearOperator for L-BFGS (matvec-only)
+      - optional symmetry fix and regularizer hook
     """
 
-    def __init__(
-        self, n: int, cfg: "SQPConfig", regularizer: Optional["Regularizer"] = None
-    ):
+    def __init__(self, n: int, cfg: "SQPConfig", regularizer: Optional["Regularizer"] = None):
+        self.n = int(n)
         self.cfg = cfg
-        self.n = n
         self.regularizer = regularizer
-        self.use_sparse = getattr(cfg, "use_sparse_hessian", False)
+
+        # Config with fallbacks
+        self.mode = getattr(cfg, "hessian_mode", "hybrid")  # "exact"|"bfgs"|"lbfgs"|"hybrid"
+        self.hybrid_quasi_mode = getattr(cfg, "hybrid_quasi_mode", "lbfgs")  # "bfgs"|"lbfgs"
+        self.use_sparse = bool(getattr(cfg, "use_sparse_hessian", False))
+        self.lbfgs_memory = int(getattr(cfg, "lbfgs_memory", 10))
+        self.curv_thresh = float(getattr(cfg, "bfgs_curvature_threshold", 1e-8))
+        self.powell_damping = bool(getattr(cfg, "bfgs_powell_damping", True))
+        self.exact_warmup = int(getattr(cfg, "hessian_exact_warmup", 2))
+        self.refresh_period = int(getattr(cfg, "hessian_refresh_period", 10))
+        self.symmetrize = bool(getattr(cfg, "symmetrize_hessian", True))
+        self.profile = bool(getattr(cfg, "profile_hessian_eval", False))
+        self.return_operator = bool(getattr(cfg, "hessian_return_operator", True))  # only used for "lbfgs"
+
+        # State
+        self.iteration = 0
+        self.last_exact_iter = -1
         self.H = sp.eye(n, format="csr") if self.use_sparse else np.eye(n)
         self.memory: List[Tuple[np.ndarray, np.ndarray, float]] = []  # (s, y, rho)
-        self.curvature_threshold = getattr(cfg, "bfgs_curvature_threshold", 1e-8)
-        self.lbfgs_memory = getattr(cfg, "lbfgs_memory", 10)
 
+    # ------------------------------- main API ---------------------------------
     def get_hessian(
         self, model: "Model", x: np.ndarray, lam: np.ndarray, nu: np.ndarray
-    ) -> Union[np.ndarray, sp.spmatrix]:
-        """
-        Return the Hessian according to cfg.hessian_mode, applying regularization if set.
-        """
-        if not (
-            x.shape[0] == self.n
-            and lam.shape[0] == model.m_ineq
-            and nu.shape[0] == model.m_eq
-        ):
-            raise ValueError(
-                f"Incompatible shapes: x={x.shape}, lam={lam.shape}, nu={nu.shape}, expected ({self.n}, {model.m_ineq}, {model.m_eq})"
-            )
-        if not (
-            np.all(np.isfinite(x))
-            and np.all(np.isfinite(lam))
-            and np.all(np.isfinite(nu))
-        ):
-            raise ValueError("Non-finite values in x, lam, or nu")
+    ) -> Union[np.ndarray, sp.spmatrix, spla.LinearOperator]:
+        """Return Hessian (materialized or operator) according to the current mode."""
+        # Track iteration if solver publishes it on cfg
+        self.iteration = int(getattr(self.cfg, "iteration", self.iteration))
 
-        mode = self.cfg.hessian_mode
+        mode = self.mode
+        if mode == "hybrid":
+            if self._want_exact():
+                H = self._eval_exact(model, x, lam, nu)
+                self.last_exact_iter = self.iteration
+                return self._maybe_regularize(model, x, H)
+            mode = self.hybrid_quasi_mode  # fallthrough
+
         if mode == "exact":
-            H = model.lagrangian_hessian(x, lam, nu)
-            H = sp.csr_matrix(H) if self.use_sparse and not sp.issparse(H) else H
-        elif mode in ("bfgs", "hybrid"):
-            H = self.H
-        elif mode == "lbfgs":
-            # L-BFGS Hessian is implicit; return identity (used for matvec only)
-            H = sp.eye(self.n, format="csr") if self.use_sparse else np.eye(self.n)
-        else:
-            raise ValueError(f"Unknown hessian_mode {mode}")
-
-        # Ensure symmetry
-        if sp.issparse(H):
-            diff = H - H.T
-            if diff.nnz > 0 and not np.allclose(diff.data, 0, rtol=1e-10, atol=1e-10):
-                logging.warning("Hessian is not symmetric; symmetrizing")
-                H = 0.5 * (H + H.T)
-        else:
-            if not np.allclose(H, H.T, rtol=1e-10, atol=1e-10):
-                logging.warning("Hessian is not symmetric; symmetrizing")
-                H = 0.5 * (H + H.T)
-
-        # Apply regularizer if provided
-        if self.regularizer is not None:
-            H, _ = self.regularizer.regularize(
-                H,
-                iteration=getattr(self.cfg, "iteration", 0),
-                model_quality=getattr(self.cfg, "model_quality", None),
-                constraint_count=model.m_eq,
-                grad_norm=np.linalg.norm(model.eval_all(x)["g"]),
-            )
-        return H
-
-    def update(self, s: np.ndarray, y: np.ndarray):
-        """Update approximation (BFGS/L-BFGS/hybrid)."""
-        if s.shape[0] != self.n or y.shape[0] != self.n:
-            raise ValueError(
-                f"Incompatible shapes: s={s.shape}, y={y.shape}, expected ({self.n},)"
-            )
-        if not (np.all(np.isfinite(s)) and np.all(np.isfinite(y))):
-            logging.warning("Non-finite values in s or y; skipping update")
-            return
-
-        mode = self.cfg.hessian_mode
-        sy = np.dot(s, y)
-        if sy <= self.curvature_threshold:
-            logging.warning(
-                f"Curvature s^T y = {sy} <= {self.curvature_threshold}; skipping update"
-            )
-            return
+            H = self._eval_exact(model, x, lam, nu)
+            self.last_exact_iter = self.iteration
+            return self._maybe_regularize(model, x, H)
 
         if mode == "bfgs":
-            self._bfgs_update(s, y)
-        elif mode == "lbfgs":
-            self._lbfgs_update(s, y)
-        elif mode == "hybrid":
-            self._bfgs_update(s, y)
+            return self._maybe_regularize(model, x, self.H)
 
-    def _bfgs_update(self, s: np.ndarray, y: np.ndarray):
-        """BFGS update: H_{k+1} = Vᵀ H_k V + ρ s sᵀ,  with V = I - ρ s yᵀ, ρ = 1/(sᵀy)."""
-        s, y = np.asarray(s), np.asarray(y)
-        rho = 1.0 / max(np.dot(s, y), self.curvature_threshold)
-        if self.use_sparse:
-            I = sp.eye(self.n, format="csr")
-            s = s.reshape(-1, 1)
-            y = y.reshape(-1, 1)
-            V = I - rho * (s @ y.T)
-            ssT = rho * (s @ s.T)
-            H_dense = V.T @ self.H @ V + ssT
-            self.H = sp.csr_matrix(H_dense) if sp.issparse(self.H) else H_dense
-        else:
-            V = np.eye(self.n) - rho * np.outer(s, y)
-            self.H = V.T @ self.H @ V + rho * np.outer(s, s)
+        if mode == "lbfgs":
+            # Prefer operator form; optionally materialize identity if users want a matrix
+            if self.return_operator:
+                return self._lbfgs_operator(model, x)
+            else:
+                return sp.eye(self.n, format="csr") if self.use_sparse else np.eye(self.n)
 
-    def _lbfgs_update(self, s: np.ndarray, y: np.ndarray):
-        """Store (s, y, ρ) pair for L-BFGS two-loop recursion."""
-        s, y = np.asarray(s), np.asarray(y)
-        rho = 1.0 / max(np.dot(s, y), self.curvature_threshold)
-        self.memory.append((s.copy(), y.copy(), rho))
-        if len(self.memory) > self.lbfgs_memory:
-            self.memory.pop(0)
+        raise ValueError(f"Unknown hessian_mode: {self.mode}")
+
+    def update(self, s: np.ndarray, y: np.ndarray, *, accepted: bool = True):
+        """
+        Quasi-Newton update after a solver step.
+        s = x_{k+1}-x_k, y = ∇L_{k+1}-∇L_k (use Lagrangian gradient!)
+        """
+        n = self.n
+        if s.shape != (n,) or y.shape != (n,):
+            raise ValueError(f"Bad shapes for update: s={s.shape}, y={y.shape}, expected {(n,)}")
+
+        if not (np.all(np.isfinite(s)) and np.all(np.isfinite(y))):
+            logging.debug("Skipping Hessian update: non-finite s or y")
+            return
+
+        # Optional: skip on rejected steps
+        if not accepted and getattr(self.cfg, "skip_update_when_rejected", True):
+            return
+
+        # Ensure curvature; Powell damping if needed
+        sy = float(np.dot(s, y))
+        if sy <= self.curv_thresh:
+            if self.powell_damping:
+                # Powell-damped y := θ y + (1-θ) H s, with θ ∈ [0,1] chosen to enforce curvature
+                y = self._powell_damped_y(s, y)
+                sy = float(np.dot(s, y))
+            if sy <= self.curv_thresh:
+                logging.debug(f"Skipping update: s^T y={sy:.3e} ≤ {self.curv_thresh:.3e}")
+                return
+
+        eff_mode = self.mode if self.mode != "hybrid" else self.hybrid_quasi_mode
+        if eff_mode == "bfgs":
+            self._bfgs_inplace(s, y)
+        elif eff_mode == "lbfgs":
+            self._lbfgs_store(s, y)
+        # exact mode: no update
 
     def lbfgs_matvec(self, v: np.ndarray) -> np.ndarray:
-        """Return (approx) Hv via standard two-loop recursion."""
-        if v.shape[0] != self.n:
-            raise ValueError(f"Incompatible shape: v={v.shape}, expected ({self.n},)")
-        if not np.all(np.isfinite(v)):
-            raise ValueError("Non-finite values in v")
+        """Two-loop recursion for L-BFGS: returns approx H v."""
+        v = np.asarray(v)
+        if v.shape != (self.n,):
+            raise ValueError(f"v has shape {v.shape}, expected {(self.n,)}")
+        if not self.memory:
+            return v.copy()
 
         q = v.copy()
-        alpha = np.zeros(len(self.memory))
-        # First loop: backward
+        alpha = np.empty(len(self.memory), dtype=float)
+
+        # backward
         for i in range(len(self.memory) - 1, -1, -1):
             s, y, rho = self.memory[i]
             alpha[i] = rho * np.dot(s, q)
             q -= alpha[i] * y
-        # Initial Hessian scaling
-        gamma = getattr(self.cfg, "lbfgs_gamma", 1.0)
-        if len(self.memory) > 0:
-            s_last, y_last, _ = self.memory[-1]
-            gamma = np.dot(s_last, y_last) / max(np.dot(y_last, y_last), 1e-16)
+
+        # H0 scaling γ I
+        sL, yL, _ = self.memory[-1]
+        yy = float(np.dot(yL, yL))
+        sy = float(np.dot(sL, yL))
+        gamma = sy / max(yy, 1e-16)
         r = gamma * q
-        # Second loop: forward
+
+        # forward
         for i in range(len(self.memory)):
             s, y, rho = self.memory[i]
             beta = rho * np.dot(y, r)
             r += s * (alpha[i] - beta)
+
         return r
 
     def reset(self):
-        """Reset Hessian and memory."""
+        """Reset to identity and clear memory."""
         self.H = sp.eye(self.n, format="csr") if self.use_sparse else np.eye(self.n)
         self.memory.clear()
+        self.last_exact_iter = -1
+
+    # ------------------------------- internals --------------------------------
+    def _want_exact(self) -> bool:
+        if self.iteration < self.exact_warmup:
+            return True
+        if self.refresh_period > 0 and (self.iteration - self.last_exact_iter) >= self.refresh_period:
+            return True
+        return False
+
+    def _eval_exact(self, model: "Model", x: np.ndarray, lam: np.ndarray, nu: np.ndarray):
+        t0 = time.time()
+        H = model.lag_hessian.hess(x, lam, nu)  # uses your AD-backed lag_hessian
+        if self.profile:
+            print(f"[HessianManager] exact ∇²L time: {time.time() - t0:.6f}s")
+
+        # symmetry (cheap & safe)
+        if self.symmetrize:
+            H = 0.5 * (H + H.T) if not sp.issparse(H) else 0.5 * (H + H.T)
+
+        # conform to storage preference
+        if self.use_sparse and not sp.issparse(H):
+            H = sp.csr_matrix(H)
+        if (not self.use_sparse) and sp.issparse(H):
+            H = H.toarray()
+
+        # keep explicit H available for BFGS warm start in hybrid
+        if self.mode in ("bfgs", "hybrid"):
+            self.H = H
+        return H
+
+    def _maybe_regularize(self, model: "Model", x: np.ndarray, H):
+        if self.regularizer is None:
+            return H
+        try:
+            # get grad norm if cheaply available
+            try:
+                g = model.eval_all(x, components=["g"]).get("g", None)
+                g = None if g is None else np.asarray(g).ravel()
+                gnorm = float(np.linalg.norm(g)) if (g is not None and g.size) else None
+            except Exception:
+                gnorm = None
+            Hreg, _ = self.regularizer.regularize(
+                H,
+                iteration=self.iteration,
+                model_quality=getattr(self.cfg, "model_quality", None),
+                constraint_count=getattr(model, "m_eq", 0),
+                grad_norm=gnorm,
+            )
+            return Hreg
+        except Exception as e:
+            logging.debug(f"Regularizer failed; using raw H. Reason: {e}")
+            return H
+
+    def _bfgs_inplace(self, s: np.ndarray, y: np.ndarray):
+        n = self.n
+        rho = 1.0 / max(float(np.dot(s, y)), self.curv_thresh)
+        if sp.issparse(self.H):
+            H = self.H.toarray()
+            V = np.eye(n) - rho * np.outer(s, y)
+            H = V.T @ H @ V + rho * np.outer(s, s)
+            self.H = sp.csr_matrix(H) if self.use_sparse else H
+        else:
+            V = np.eye(n) - rho * np.outer(s, y)
+            self.H = V.T @ self.H @ V + rho * np.outer(s, s)
+
+    def _lbfgs_store(self, s: np.ndarray, y: np.ndarray):
+        rho = 1.0 / max(float(np.dot(s, y)), self.curv_thresh)
+        self.memory.append((s.copy(), y.copy(), rho))
+        if len(self.memory) > self.lbfgs_memory:
+            self.memory.pop(0)
+
+    def _lbfgs_operator(self, model: "Model", x: np.ndarray) -> spla.LinearOperator:
+        n = self.n
+
+        def mv(v):
+            return self.lbfgs_matvec(np.asarray(v))
+
+        def rmv(v):
+            # symmetric; same as mv
+            return self.lbfgs_matvec(np.asarray(v))
+
+        return spla.LinearOperator((n, n), matvec=mv, rmatvec=rmv, dtype=float)
+
+    def _powell_damped_y(self, s: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Powell damping: ỹ = θ y + (1-θ) H s to enforce sᵀỹ >= τ sᵀH s."""
+        # τ = 0.2 is a common choice; if no H available, fall back to simple damping
+        tau = float(getattr(self.cfg, "bfgs_powell_tau", 0.2))
+        if sp.issparse(self.H):
+            Hs = self.H @ s
+            Hs = np.asarray(Hs).ravel()
+        elif isinstance(self.H, np.ndarray):
+            Hs = self.H @ s
+        else:
+            # If H is not materialized (e.g., pure lbfgs), approximate with identity
+            Hs = s
+
+        sHs = float(np.dot(s, Hs))
+        sy = float(np.dot(s, y))
+        if sHs <= 0.0:
+            return y  # fall back; let curvature check handle skipping
+        theta = 1.0
+        if sy < tau * sHs:
+            theta = (1.0 - tau) * sHs / (sHs - sy + 1e-16)
+            theta = max(0.0, min(1.0, theta))
+        return theta * y + (1.0 - theta) * Hs

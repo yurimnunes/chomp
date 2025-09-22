@@ -9,7 +9,6 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
-#define EIGEN_CHOLMOD_SUPPORT
 
 #ifdef EIGEN_CHOLMOD_SUPPORT
 #include <Eigen/CholmodSupport> // CHOLMOD (SuiteSparse) via Eigen

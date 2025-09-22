@@ -14,7 +14,6 @@ using VariablePtr = std::shared_ptr<Variable>;
 struct ADNode;
 using ADNodePtr = std::shared_ptr<ADNode>;
 
-
 // Input validation helpers
 inline bool validate_unary_inputs(const std::vector<ADNodePtr> &inputs,
                                   const std::string &op_name) {
@@ -32,7 +31,6 @@ inline bool validate_unary_inputs(const std::vector<ADNodePtr> &inputs,
     return true;
 }
 
-
 inline bool validate_binary_inputs(const std::vector<ADNodePtr> &inputs,
                                    const std::string &op_name) {
     if (inputs.size() != 2) {
@@ -48,7 +46,6 @@ inline bool validate_binary_inputs(const std::vector<ADNodePtr> &inputs,
     }
     return true;
 }
-
 
 // Reset-on-epoch-change (for accumulators like gradients)
 static inline double &ensure_epoch_zero(double &x, unsigned &e, unsigned cur) {
@@ -74,7 +71,6 @@ static inline double &set_epoch_value(double &x, unsigned &e, unsigned cur,
 }
 
 #include "../../third_party/robin_map.h"
-
 
 struct ADNode {
     Operator type = Operator::NA;
@@ -111,6 +107,8 @@ struct ADGraph;
 using ADGraphPtr = std::shared_ptr<ADGraph>;
 
 struct ADGraph {
+    bool hvp_add_first_order_ = true; // default for single-lane path
+
     // ---- Construction / maintenance
     void deleteNode(const ADNodePtr &node);
     void addNode(const ADNodePtr &node);
@@ -132,7 +130,7 @@ struct ADGraph {
     void resetGradients();
 
     // ---- Public Gradient API
-tsl::robin_map<std::string, double>
+    tsl::robin_map<std::string, double>
     computePartialDerivatives(const ADNodePtr &expr);
 
     ADNodePtr getNode(const std::string &name);
@@ -154,6 +152,7 @@ tsl::robin_map<std::string, double>
     void resetGradDot();
     void computeForwardPassWithDot();
     void initiateBackwardPassHVP();
+    void initiateBackwardPassFused();
     std::vector<double> hessianVectorProduct(const ADNodePtr &outputNode,
                                              const std::vector<double> &v);
     std::vector<std::vector<double>> computeHessianDense(const ADNodePtr &y);
@@ -171,16 +170,22 @@ tsl::robin_map<std::string, double>
     unsigned cur_dot_epoch_ = 1;
     unsigned cur_gdot_epoch_ = 1;
 
+    void computeForwardPassWithDotFused() ;
+
 private:
     // ===== Cached topology (rebuilt only when graph mutates) =====
     struct Cache {
-        std::vector<ADNode *> topo;              // forward order
-        std::vector<std::vector<ADNode *>> out;  // children (by index)
-        //std::unordered_map<ADNode *, int> id_of; // raw* -> id
-        tsl::robin_map<ADNode*, int> id_of; // or as a member
+        std::vector<ADNode *> topo;             // forward order
+        std::vector<std::vector<ADNode *>> out; // children (by index)
+        // std::unordered_map<ADNode *, int> id_of; // raw* -> id
+        tsl::robin_map<ADNode *, int> id_of; // or as a member
+    std::vector<std::vector<ADNode*>> levels; // NEW: levelized topological layers
 
         bool dirty = true;
     } cache_;
+
+    void fused_forward_dot_kernel_(ADNode* u);
+    void fused_backward_kernel_(ADNode* u);
 
     void markDirty_();
     void rebuildCache_();

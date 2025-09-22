@@ -34,6 +34,58 @@
 #include "linesearch.h"
 #include "regularizer.h"
 
+#include <chrono>
+#include <iomanip> // std::setprecision
+
+#ifndef IP_PROFILE
+#define IP_PROFILE 1
+#endif
+
+#if IP_PROFILE
+struct ScopedTimer {
+    using clock = std::chrono::high_resolution_clock;
+    std::string name;
+    clock::time_point t0, last;
+    bool print_on_destroy;
+
+    explicit ScopedTimer(std::string n, bool print_total = true)
+        : name(std::move(n)), t0(clock::now()), last(t0),
+          print_on_destroy(print_total) {
+        std::cout << "[IP] >>> " << name << " begin\n";
+    }
+    ~ScopedTimer() {
+        if (print_on_destroy) {
+            auto dt =
+                std::chrono::duration<double, std::milli>(clock::now() - t0)
+                    .count();
+            std::cout << "[IP] <<< " << name << " end  (total: " << std::fixed
+                      << std::setprecision(3) << dt << " ms)\n";
+        }
+    }
+    void lap(const char *label) {
+        auto now = clock::now();
+        auto dt = std::chrono::duration<double, std::milli>(now - last).count();
+        std::cout << "      [lap] " << label << ": " << std::fixed
+                  << std::setprecision(3) << dt << " ms\n";
+        last = now;
+    }
+};
+#define IP_TIMER(name) ScopedTimer __ip_timer__(name)
+#define IP_LAP(label) __ip_timer__.lap(label)
+#define IP_LOG(msg) std::cout << "[IP] " << msg << "\n"
+#else
+#define IP_TIMER(name)                                                         \
+    struct {                                                                   \
+        void lap(const char *) {}                                              \
+    } __ip_timer__(name)
+#define IP_LAP(label)                                                          \
+    do {                                                                       \
+    } while (0)
+#define IP_LOG(msg)                                                            \
+    do {                                                                       \
+    } while (0)
+#endif
+
 // ---------- External structs expected from your headers ----------
 struct StepResult {
     dvec x;   // new primal iterate
@@ -75,13 +127,11 @@ template <class T> [[nodiscard]] constexpr T clamp01(T v) noexcept {
     return (v.size() == 0) ? 0.0 : v.cwiseAbs().maxCoeff();
 }
 
-
 // nanobind alias
 namespace nb = nanobind;
 
-
 // Safe: return d[k] if present, else nb::none()
-static inline nb::object nb_dict_get(const nb::dict& d, const nb::handle& k) {
+static inline nb::object nb_dict_get(const nb::dict &d, const nb::handle &k) {
     return d.contains(k) ? d[k] : nb::none();
 }
 // ---------- Python attribute helpers ----------
@@ -108,7 +158,7 @@ template <class T>
 namespace pyconv {
 
 // Cache frequently used numpy module
-inline nb::object& get_numpy_module() {
+inline nb::object &get_numpy_module() {
     static nb::object numpy = nb::module_::import_("numpy");
     return numpy;
 }
@@ -126,13 +176,14 @@ inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
 }
 
 // Helper function to check if object is numpy array (avoid template issues)
-[[nodiscard]] inline bool is_numpy_array(const nb::object& obj) noexcept {
-    return PyObject_HasAttrString(obj.ptr(), "__array_interface__") || 
+[[nodiscard]] inline bool is_numpy_array(const nb::object &obj) noexcept {
+    return PyObject_HasAttrString(obj.ptr(), "__array_interface__") ||
            PyObject_HasAttrString(obj.ptr(), "__array__");
 }
 
 // Helper to get array dtype as string - optimized with string_view
-[[nodiscard]] inline std::string_view get_array_dtype(const nb::object& obj) noexcept {
+[[nodiscard]] inline std::string_view
+get_array_dtype(const nb::object &obj) noexcept {
     try {
         static thread_local std::string dtype_str;
         dtype_str = nb::cast<std::string>(obj.attr("dtype").attr("name"));
@@ -143,15 +194,16 @@ inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
 }
 
 // Helper to get array shape - optimized with span-like interface
-[[nodiscard]] inline std::vector<size_t> get_array_shape(const nb::object& obj) {
+[[nodiscard]] inline std::vector<size_t>
+get_array_shape(const nb::object &obj) {
     try {
         nb::object shape_tuple = obj.attr("shape");
         nb::tuple shape_tup = nb::cast<nb::tuple>(shape_tuple);
         const size_t size = shape_tup.size();
-        
+
         std::vector<size_t> shape;
         shape.reserve(size); // Pre-allocate
-        
+
         for (size_t i = 0; i < size; ++i) {
             shape.emplace_back(nb::cast<size_t>(shape_tup[i]));
         }
@@ -165,26 +217,29 @@ inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
 [[nodiscard]] inline dvec to_vec_safe(const nb::object &obj) {
     if (!obj.is_valid() || obj.is_none()) [[unlikely]]
         return dvec{};
-    
+
     // Fast path: Direct numpy array conversion (most common case)
     if (is_numpy_array(obj)) [[likely]] {
         try {
-            auto& numpy = get_numpy_module();
+            auto &numpy = get_numpy_module();
             // Force contiguous double array in one call
-            nb::object arr = numpy.attr("ascontiguousarray")(obj, nb::arg("dtype") = "float64");
+            nb::object arr = numpy.attr("ascontiguousarray")(
+                obj, nb::arg("dtype") = "float64");
             auto a = nb::cast<nb::ndarray<nb::numpy>>(arr);
-            
+
             if (a.ndim() == 0) [[unlikely]] {
                 // Scalar case
-                return dvec::Constant(1, *static_cast<const double*>(a.data()));
+                return dvec::Constant(1,
+                                      *static_cast<const double *>(a.data()));
             }
-            
+
             if (a.ndim() != 1) [[unlikely]]
                 throw std::runtime_error("Expected 1-D array");
-            
+
             const size_t n = a.shape(0);
-            if (n == 0) [[unlikely]] return dvec{};
-            
+            if (n == 0) [[unlikely]]
+                return dvec{};
+
             // Direct memory copy - fastest possible
             dvec v(n);
             std::memcpy(v.data(), a.data(), n * sizeof(double));
@@ -193,18 +248,20 @@ inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
             // Fall through to slower methods
         }
     }
-    
+
     // Medium speed path: Direct sequence access (lists, tuples)
     if (PySequence_Check(obj.ptr()) && !PyUnicode_Check(obj.ptr())) [[likely]] {
-        const Py_ssize_t size = PySequence_Fast_GET_SIZE(PySequence_Fast(obj.ptr(), ""));
-        if (size <= 0) [[unlikely]] return dvec{};
-        
+        const Py_ssize_t size =
+            PySequence_Fast_GET_SIZE(PySequence_Fast(obj.ptr(), ""));
+        if (size <= 0) [[unlikely]]
+            return dvec{};
+
         dvec v(size);
-        PyObject* fast_seq = PySequence_Fast(obj.ptr(), "");
+        PyObject *fast_seq = PySequence_Fast(obj.ptr(), "");
         if (fast_seq) [[likely]] {
             // Use fast sequence access
             for (Py_ssize_t i = 0; i < size; ++i) {
-                PyObject* item = PySequence_Fast_GET_ITEM(fast_seq, i);
+                PyObject *item = PySequence_Fast_GET_ITEM(fast_seq, i);
                 // Skip error checking for speed - assume valid doubles
                 v[i] = PyFloat_AsDouble(item);
             }
@@ -214,6 +271,7 @@ inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
     }
 
     std::runtime_error("Unable to convert to vector");
+    return dvec{};
 }
 // ---------- Zero-copy sparse views (CSR for RowMajor / CSC for ColMajor)
 // ----------
@@ -254,14 +312,13 @@ bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
         nb::object indptr_obj = m.attr("indptr");
         nb::object indices_obj = m.attr("indices");
         nb::object data_obj = m.attr("data");
-        
+
         // Check if they're array-like
-        if (!is_numpy_array(indptr_obj) || 
-            !is_numpy_array(indices_obj) || 
+        if (!is_numpy_array(indptr_obj) || !is_numpy_array(indices_obj) ||
             !is_numpy_array(data_obj)) [[unlikely]] {
             return false;
         }
-        
+
         // Get as generic arrays
         out.indptr = nb::cast<nb::ndarray<nb::numpy>>(indptr_obj);
         out.indices = nb::cast<nb::ndarray<nb::numpy>>(indices_obj);
@@ -270,22 +327,29 @@ bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
         // Check data type and convert if needed
         const auto data_dtype = get_array_dtype(data_obj);
         if (data_dtype != "float64") [[unlikely]] {
-            auto& numpy = get_numpy_module(); // Use cached module
-            nb::object converted = numpy.attr("ascontiguousarray")(data_obj, nb::arg("dtype") = "float64");
+            auto &numpy = get_numpy_module(); // Use cached module
+            nb::object converted = numpy.attr("ascontiguousarray")(
+                data_obj, nb::arg("dtype") = "float64");
             out.data = nb::cast<nb::ndarray<nb::numpy>>(std::move(converted));
         }
-        
-        // Check integer types for indptr and indices - use constexpr set for lookup
+
+        // Check integer types for indptr and indices - use constexpr set for
+        // lookup
         const auto indptr_dtype = get_array_dtype(indptr_obj);
         const auto indices_dtype = get_array_dtype(indices_obj);
-        
-        constexpr std::array valid_int_types{"int32", "uint32", "int64", "uint64"};
-        
-        const bool indptr_ok = std::ranges::any_of(valid_int_types, 
-            [indptr_dtype](std::string_view type) { return type == indptr_dtype; });
-        const bool indices_ok = std::ranges::any_of(valid_int_types,
-            [indices_dtype](std::string_view type) { return type == indices_dtype; });
-        
+
+        constexpr std::array valid_int_types{"int32", "uint32", "int64",
+                                             "uint64"};
+
+        const bool indptr_ok = std::ranges::any_of(
+            valid_int_types, [indptr_dtype](std::string_view type) {
+                return type == indptr_dtype;
+            });
+        const bool indices_ok = std::ranges::any_of(
+            valid_int_types, [indices_dtype](std::string_view type) {
+                return type == indices_dtype;
+            });
+
         if (!indptr_ok || !indices_ok) [[unlikely]]
             return false;
 
@@ -294,10 +358,10 @@ bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
         if (data_shape.empty()) [[unlikely]]
             return false;
         out.nnz = static_cast<long long>(data_shape[0]);
-        
+
         out.mat = std::move(m);
         return true;
-        
+
     } catch (...) {
         return false;
     }
@@ -308,9 +372,10 @@ template <class SparseT> struct PySparseView {
     nb::object owner;
     nb::ndarray<nb::numpy> indptr, indices, data;
     MapT map;
-    
-    PySparseView(nb::object o, nb::ndarray<nb::numpy> ip, nb::ndarray<nb::numpy> idx, 
-                 nb::ndarray<nb::numpy> d, int r, int c, long long nnz)
+
+    PySparseView(nb::object o, nb::ndarray<nb::numpy> ip,
+                 nb::ndarray<nb::numpy> idx, nb::ndarray<nb::numpy> d, int r,
+                 int c, long long nnz)
         : owner(std::move(o)), indptr(std::move(ip)), indices(std::move(idx)),
           data(std::move(d)),
           map(r, c, static_cast<SparseIndexT<SparseT>>(nnz),
@@ -320,7 +385,8 @@ template <class SparseT> struct PySparseView {
 };
 
 template <class SparseT>
-[[nodiscard]] std::optional<PySparseView<SparseT>> to_sparse_view_any(const nb::object &o) {
+[[nodiscard]] std::optional<PySparseView<SparseT>>
+to_sparse_view_any(const nb::object &o) {
     SciPyCompressed s;
     if (!extract_compressed_for<SparseT>(o, s)) [[unlikely]]
         return std::nullopt;
@@ -346,37 +412,39 @@ template <class SparseT>
 
     // Dense fallback - avoid NumPy C API
     try {
-        auto& numpy = get_numpy_module(); // Use cached module
-        
+        auto &numpy = get_numpy_module(); // Use cached module
+
         // Convert to numpy array and ensure it's 2D float64
         nb::object arr_obj;
         if (is_numpy_array(obj)) [[likely]] {
-            arr_obj = numpy.attr("ascontiguousarray")(obj, nb::arg("dtype") = "float64");
+            arr_obj = numpy.attr("ascontiguousarray")(obj, nb::arg("dtype") =
+                                                               "float64");
         } else {
             arr_obj = numpy.attr("array")(obj, nb::arg("dtype") = "float64");
             arr_obj = numpy.attr("ascontiguousarray")(arr_obj);
         }
-        
+
         // Check dimensions using Python interface
         const auto shape = get_array_shape(arr_obj);
         if (shape.size() != 2) [[unlikely]]
             throw std::runtime_error("to_sparse: expected 2-D array");
-            
+
         const int rows = static_cast<int>(shape[0]);
         const int cols = static_cast<int>(shape[1]);
-        
+
         // Get raw data pointer through nanobind
         auto a = nb::cast<nb::ndarray<nb::numpy>>(arr_obj);
-        
+
         Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
                                        Eigen::RowMajor>>
-            M(static_cast<const double*>(a.data()), rows, cols);
+            M(static_cast<const double *>(a.data()), rows, cols);
         spmat S = M.sparseView(0.0, 1.0);
         S.makeCompressed();
         return S;
-        
-    } catch (const std::exception& e) {
-        throw std::runtime_error("to_sparse conversion failed: " + std::string(e.what()));
+
+    } catch (const std::exception &e) {
+        throw std::runtime_error("to_sparse conversion failed: " +
+                                 std::string(e.what()));
     }
 }
 
@@ -657,356 +725,462 @@ public:
     nb::str s_f{"f"}, s_g{"g"}, s_cI{"cI"}, s_cE{"cE"}, s_JI{"JI"}, s_JE{"JE"};
     nb::tuple comps_all{nb::make_tuple(s_f, s_g, s_cI, s_JI, s_cE, s_JE)};
     nb::tuple comps_new{nb::make_tuple(s_f, s_g, s_cI, s_cE, s_JI, s_JE)};
-   
-   
-   std::tuple<dvec, dvec, dvec, SolverInfo>
-step(nb::object model, const dvec &x, const dvec &lam, const dvec &nu,
-     int it, std::optional<IPState> /*ip_state_opt*/ = std::nullopt) {
 
-    if (!st.initialized) {
-    // std::cout << "Warning: IPState not initialized; using internal state.\n";
-        st = state_from_model_(model, x);
-    }
-    // std::cout << "IP iteration " << it << ", mu = " << st.mu << "\n";
+    std::tuple<dvec, dvec, dvec, SolverInfo>
+    step(nb::object model, const dvec &x, const dvec &lam, const dvec &nu,
+         int it, std::optional<IPState> /*ip_state_opt*/ = std::nullopt) {
 
-    const int n  = static_cast<int>(x.size());
-    const int mI = st.mI;
-    const int mE = st.mE;
+#if IP_PROFILE
+        IP_TIMER("step()");
+#endif
 
-    dvec s   = st.s;
-    dvec lmb = st.lam;
-    dvec nuv = st.nu;
-    dvec zL  = st.zL;
-    dvec zU  = st.zU;
-    double mu = st.mu;
-
-    const bool use_shifted =
-        pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", false);
-    double tau_shift = use_shifted ? st.tau_shift : 0.0;
-    const bool shift_adapt =
-        pyu::getattr_or<bool>(cfg_, "ip_shift_adaptive", true);
-
-    // -------- Evaluate model (tuple-based components) --------
-    nb::dict d0 = nb::cast<nb::dict>( model.attr("eval_all")(x, comps_all) );
-
-    const double f = nb::cast<double>( d0[s_f] );
-    dvec g = pyconv::to_vec_safe( d0[s_g] );
-    // std::cout << "  part 1 ok "<< std::endl;
-
-    // cI / cE
-    nb::object cI_o = nb_dict_get(d0, s_cI);
-    nb::object cE_o = nb_dict_get(d0, s_cE);
-    dvec cI = (mI > 0 && !cI_o.is_none()) ? pyconv::to_vec_safe(cI_o) : dvec::Zero(mI);
-    dvec cE = (mE > 0 && !cE_o.is_none()) ? pyconv::to_vec_safe(cE_o) : dvec::Zero(mE);
-    // std::cout << "  part 2 ok "<< std::endl;
-
-    // JI / JE (try zero-copy view first)
-    spmat JI, JE;
-    nb::object JI_o = nb_dict_get(d0, s_JI);
-    nb::object JE_o = nb_dict_get(d0, s_JE);
-
-    if (mI > 0 && !JI_o.is_none()) {
-        if (auto v = pyconv::to_sparse_view_any<spmat>(JI_o)) {
-            JI = v->map; JI.makeCompressed();
-        } else {
-            JI = pyconv::to_sparse(JI_o);
+        // -------------------- Init / state --------------------
+        if (!st.initialized) {
+            st = state_from_model_(model, x);
         }
-        if (JI.rows() != mI || JI.cols() != n)
-            throw std::runtime_error("JI dimension mismatch");
-    }
-    if (mE > 0 && !JE_o.is_none()) {
-        if (auto v = pyconv::to_sparse_view_any<spmat>(JE_o)) {
-            JE = v->map; JE.makeCompressed();
-        } else {
-            JE = pyconv::to_sparse(JE_o);
+        const int n = static_cast<int>(x.size());
+        const int mI = st.mI;
+        const int mE = st.mE;
+
+        dvec s = st.s;
+        dvec lmb = st.lam;
+        dvec nuv = st.nu;
+        dvec zL = st.zL;
+        dvec zU = st.zU;
+        double mu = st.mu;
+
+        const bool use_shifted =
+            pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", false);
+        double tau_shift = use_shifted ? st.tau_shift : 0.0;
+        const bool shift_adapt =
+            pyu::getattr_or<bool>(cfg_, "ip_shift_adaptive", true);
+
+        IP_LAP("init/state");
+
+        // -------------------- Evaluate model --------------------
+        nb::dict d0 = nb::cast<nb::dict>(model.attr("eval_all")(x, comps_all));
+        IP_LAP("eval_all(x)");
+
+        const double f = nb::cast<double>(d0[s_f]);
+        dvec g = pyconv::to_vec_safe(d0[s_g]);
+
+        nb::object cI_o = nb_dict_get(d0, s_cI);
+        nb::object cE_o = nb_dict_get(d0, s_cE);
+        dvec cI = (mI > 0 && !cI_o.is_none()) ? pyconv::to_vec_safe(cI_o)
+                                              : dvec::Zero(mI);
+        dvec cE = (mE > 0 && !cE_o.is_none()) ? pyconv::to_vec_safe(cE_o)
+                                              : dvec::Zero(mE);
+        IP_LAP("extract f,g,cI,cE");
+
+        // JI / JE (prefer zero-copy view)
+        spmat JI, JE;
+        nb::object JI_o = nb_dict_get(d0, s_JI);
+        nb::object JE_o = nb_dict_get(d0, s_JE);
+
+        if (mI > 0 && !JI_o.is_none()) {
+            if (auto v = pyconv::to_sparse_view_any<spmat>(JI_o)) {
+                JI = v->map;
+                JI.makeCompressed();
+            } else {
+                JI = pyconv::to_sparse(JI_o);
+            }
+            if (JI.rows() != mI || JI.cols() != n)
+                throw std::runtime_error("JI dimension mismatch");
         }
-        if (JE.rows() != mE || JE.cols() != n)
-            throw std::runtime_error("JE dimension mismatch");
-    }
-    // θ via Python routine (same as before)
-    double theta = nb::cast<double>( model.attr("constraint_violation")(x) );
+        if (mE > 0 && !JE_o.is_none()) {
+            if (auto v = pyconv::to_sparse_view_any<spmat>(JE_o)) {
+                JE = v->map;
+                JE.makeCompressed();
+            } else {
+                JE = pyconv::to_sparse(JE_o);
+            }
+            if (JE.rows() != mE || JE.cols() != n)
+                throw std::runtime_error("JE dimension mismatch");
+        }
+        IP_LAP("build JI/JE");
 
-    // -------- Bounds & adaptive shifts --------
-    Bounds B = detail::get_bounds(model, x);
-    if (use_shifted && shift_adapt) {
-        tau_shift = adaptive_shift_slack_(s, cI, it);
-        st.tau_shift = tau_shift;
-    }
-    double bound_shift =
-        use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0) : 0.0;
-    if (use_shifted && shift_adapt)
-        bound_shift = adaptive_shift_bounds_(x, B, it);
+        double theta = nb::cast<double>(model.attr("constraint_violation")(x));
+        IP_LAP("constraint_violation(x)");
 
-    // -------- Quick convergence check --------
-    const double tol = pyu::getattr_or<double>(cfg_, "tol", 1e-8);
+        // -------------------- Bounds & adaptive shifts --------------------
+        Bounds B = detail::get_bounds(model, x);
+        if (use_shifted && shift_adapt) {
+            tau_shift = adaptive_shift_slack_(s, cI, it);
+            st.tau_shift = tau_shift;
+        }
+        double bound_shift =
+            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0)
+                        : 0.0;
+        if (use_shifted && shift_adapt)
+            bound_shift = adaptive_shift_bounds_(x, B, it);
+        IP_LAP("bounds & shifts");
 
-    auto compute_error_ =
-        [&](const dvec &g_in, const spmat &JI_in, const spmat &JE_in,
-            const dvec &cI_in, const dvec &cE_in, const dvec &x_in,
-            const dvec &lam_in, const dvec &nu_in, const dvec &zL_in,
-            const dvec &zU_in, double mu_in, const dvec &s_in) -> double {
+        // -------------------- Quick convergence check --------------------
+        const double tol = pyu::getattr_or<double>(cfg_, "tol", 1e-8);
+
+        auto compute_error_ =
+            [&](const dvec &g_in, const spmat &JI_in, const spmat &JE_in,
+                const dvec &cI_in, const dvec &cE_in, const dvec &x_in,
+                const dvec &lam_in, const dvec &nu_in, const dvec &zL_in,
+                const dvec &zU_in, double mu_in, const dvec &s_in) -> double {
             dvec r_d = g_in;
-            if (JI_in.nonZeros()) r_d.noalias() += JI_in.transpose() * lam_in;
-            if (JE_in.nonZeros()) r_d.noalias() += JE_in.transpose() * nu_in;
+            if (JI_in.nonZeros())
+                r_d.noalias() += JI_in.transpose() * lam_in;
+            if (JE_in.nonZeros())
+                r_d.noalias() += JE_in.transpose() * nu_in;
             r_d -= zL_in;
             r_d += zU_in;
 
-            const double s_max = pyu::getattr_or<double>(cfg_, "ip_s_max", 100.0);
+            const double s_max =
+                pyu::getattr_or<double>(cfg_, "ip_s_max", 100.0);
             const int denom_ct = static_cast<int>(s_in.size()) + mE + n;
-            const double sum_mults = lam_in.lpNorm<1>() + nu_in.lpNorm<1>()
-                                   + zL_in.lpNorm<1>() + zU_in.lpNorm<1>();
-            const double s_d = clamp_min(sum_mults / clamp_min(denom_ct, 1), s_max) / s_max;
-            const double s_c = clamp_min((zL_in.lpNorm<1>() + zU_in.lpNorm<1>()) /
-                                         clamp_min(n, 1), s_max) / s_max;
+            const double sum_mults = lam_in.lpNorm<1>() + nu_in.lpNorm<1>() +
+                                     zL_in.lpNorm<1>() + zU_in.lpNorm<1>();
+            const double s_d =
+                clamp_min(sum_mults / clamp_min(denom_ct, 1), s_max) / s_max;
+            const double s_c =
+                clamp_min((zL_in.lpNorm<1>() + zU_in.lpNorm<1>()) /
+                              clamp_min(n, 1),
+                          s_max) /
+                s_max;
 
             const double comp_box =
                 detail::comp_inf_norm(s_in, lam_in, zL_in, zU_in, B, mu_in,
                                       use_shifted, tau_shift, bound_shift);
 
-            return std::max({ safe_inf_norm(r_d) / s_d,
-                              (mE > 0) ? safe_inf_norm(cE_in) : 0.0,
-                              (mI > 0) ? safe_inf_norm(cI_in) : 0.0,
-                              comp_box / s_c });
+            return std::max({safe_inf_norm(r_d) / s_d,
+                             (mE > 0) ? safe_inf_norm(cE_in) : 0.0,
+                             (mI > 0) ? safe_inf_norm(cI_in) : 0.0,
+                             comp_box / s_c});
         };
 
-    const double err_0 = compute_error_(g, JI, JE, cI, cE, x, lmb, nuv, zL, zU, mu, s);
-    if (err_0 <= tol) {
-        SolverInfo info;
-        info.mode = "ip";
-        info.step_norm = 0.0;
-        info.accepted = true;
-        info.converged = true;
-        info.f = f;
-        info.theta = theta;
-        info.stat = safe_inf_norm(g);
-        info.ineq = (mI > 0) ? safe_inf_norm((cI.array().max(0.0)).matrix()) : 0.0;
-        info.eq   = (mE > 0) ? safe_inf_norm(cE) : 0.0;
-        info.comp = detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
-        info.ls_iters = 0;
-        info.alpha = 0.0;
-        info.rho = 0.0;
-        info.tr_radius = 0.0;
-        info.mu = mu;
-        return { x, lmb, nuv, info };
-    }
+        const double err_0 =
+            compute_error_(g, JI, JE, cI, cE, x, lmb, nuv, zL, zU, mu, s);
+        IP_LAP("compute_error_(x)");
 
-    // -------- Diagonal regularization --------
-    const double eps_abs = pyu::getattr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
-    const double cap     = pyu::getattr_or<double>(cfg_, "sigma_cap", 1e8);
-    Sigmas Sg = detail::build_sigmas(zL, zU, B, lmb, s, cI, tau_shift, bound_shift,
-                                     use_shifted, eps_abs, cap);
-
-    // -------- Hessian + reg (exact or approx) --------
-    nb::object H_obj = pyu::getattr_or<bool>(cfg_, "ip_exact_hessian", true)
-                           ? model.attr("lagrangian_hessian")(x, nb::cast(lmb), nb::cast(nuv))
-                           : hess_.attr("get_hessian")(model, x, nb::cast(lmb), nb::cast(nuv));
-
-    spmat H0 = pyconv::to_sparse(H_obj);
-    auto [H, reg_info] = regularizer_->regularize(H0, it);
-    H.makeCompressed();
-
-    // --- assemble W = H + diag(Sigma_x) + JIᵀ diag(Sigma_s) JI
-    auto assemble_W = [&](const spmat &H_in, const dvec &Sigma_x,
-                          const std::optional<spmat> &JI_opt,
-                          const dvec &Sigma_s_opt) -> spmat {
-        spmat W = H_in;
-        if (Sigma_x.size())
-            W.diagonal().array() += Sigma_x.array();
-        if (JI_opt && JI_opt->rows() > 0 && Sigma_s_opt.size() == JI_opt->rows()) {
-            spmat JIc = *JI_opt; JIc.makeCompressed();
-            W += JIc.transpose() * Sigma_s_opt.asDiagonal() * JIc;
-            W.makeCompressed();
+        if (err_0 <= tol) {
+            SolverInfo info;
+            info.mode = "ip";
+            info.step_norm = 0.0;
+            info.accepted = true;
+            info.converged = true;
+            info.f = f;
+            info.theta = theta;
+            info.stat = safe_inf_norm(g);
+            info.ineq =
+                (mI > 0) ? safe_inf_norm((cI.array().max(0.0)).matrix()) : 0.0;
+            info.eq = (mE > 0) ? safe_inf_norm(cE) : 0.0;
+            info.comp =
+                detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
+            info.ls_iters = 0;
+            info.alpha = 0.0;
+            info.rho = 0.0;
+            info.tr_radius = 0.0;
+            info.mu = mu;
+            IP_LAP("early-exit pack");
+            return {x, lmb, nuv, info};
         }
-        return W;
-    };
-    std::optional<spmat> JI_opt = (mI > 0 && JI.nonZeros()) ? std::optional<spmat>(JI) : std::nullopt;
-    spmat W = assemble_W(H, Sg.Sigma_x, JI_opt, Sg.Sigma_s);
 
-    // -------- Residuals --------
-    dvec r_d = g;
-    if (mI > 0 && JI.nonZeros()) r_d.noalias() += JI.transpose() * lmb;
-    if (mE > 0 && JE.nonZeros()) r_d.noalias() += JE.transpose() * nuv;
-    r_d -= zL;
-    r_d += zU;
+        // -------------------- Sigmas & Hessian --------------------
+        const double eps_abs =
+            pyu::getattr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
+        const double cap = pyu::getattr_or<double>(cfg_, "sigma_cap", 1e8);
 
-    dvec r_pE = (mE > 0) ? cE : dvec();
-    dvec r_pI = (mI > 0) ? (cI + s) : dvec();
+        Sigmas Sg =
+            detail::build_sigmas(zL, zU, B, lmb, s, cI, tau_shift, bound_shift,
+                                 use_shifted, eps_abs, cap);
+        IP_LAP("build_sigmas");
 
-    // -------- Mehrotra + Gondzio corrected step --------
-    const auto [alpha_aff, mu_aff, sigma, gondzio_step] =
-        mehrotra_with_gondzio_corrections_(
-            W, r_d,
-            (mE > 0 && JE.nonZeros()) ? std::optional<spmat>(JE) : std::nullopt,
-            (mE > 0 && r_pE.size())    ? std::optional<dvec>(r_pE) : std::nullopt,
-            (mI > 0 && JI.nonZeros()) ? std::optional<spmat>(JI) : std::nullopt,
-            (mI > 0 && r_pI.size())    ? std::optional<dvec>(r_pI) : std::nullopt,
-            s, lmb, zL, zU, B, use_shifted, tau_shift, bound_shift, mu, theta, Sg);
+        nb::object H_obj = pyu::getattr_or<bool>(cfg_, "ip_exact_hessian", true)
+                               ? model.attr("lagrangian_hessian")(
+                                     x, nb::cast(lmb), nb::cast(nuv))
+                               : hess_.attr("get_hessian")(
+                                     model, x, nb::cast(lmb), nb::cast(nuv));
+        IP_LAP("get Hessian");
 
-    dvec dx   = gondzio_step.dx;
-    dvec dnu  = (mE > 0 && gondzio_step.dnu.size()  == mE) ? gondzio_step.dnu  : dvec::Zero(mE);
-    dvec ds   = gondzio_step.ds;
-    dvec dlam = gondzio_step.dlam;
-    dvec dzL  = gondzio_step.dzL;
-    dvec dzU  = gondzio_step.dzU;
+        spmat H0 = pyconv::to_sparse(H_obj);
+        auto [H, reg_info] = regularizer_->regularize(H0, it);
+        H.makeCompressed();
+        IP_LAP("regularize(H)");
 
-    // Barrier update heuristic (same semantics)
-    const double comp_now = detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
-    if (comp_now * clamp_min(mI, 1) > 10.0 * mu)
-        mu = std::min(comp_now * clamp_min(mI, 1), 10.0);
-    mu = clamp_min(sigma * mu_aff, pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12));
+        auto assemble_W = [&](const spmat &H_in, const dvec &Sigma_x,
+                              const std::optional<spmat> &JI_opt,
+                              const dvec &Sigma_s_opt) -> spmat {
+            spmat W = H_in;
+            if (Sigma_x.size())
+                W.diagonal().array() += Sigma_x.array();
+            if (JI_opt && JI_opt->rows() > 0 &&
+                Sigma_s_opt.size() == JI_opt->rows()) {
+                spmat JIc = *JI_opt;
+                JIc.makeCompressed();
+                W += JIc.transpose() * Sigma_s_opt.asDiagonal() * JIc;
+                W.makeCompressed();
+            }
+            return W;
+        };
+        std::optional<spmat> JI_opt =
+            (mI > 0 && JI.nonZeros()) ? std::optional<spmat>(JI) : std::nullopt;
+        spmat W = assemble_W(H, Sg.Sigma_x, JI_opt, Sg.Sigma_s);
+        IP_LAP("assemble W");
 
-    // Trust region clipping
-    const double dx_cap = pyu::getattr_or<double>(cfg_, "ip_dx_max", 1e3);
-    const double nx = dx.norm();
-    if (nx > dx_cap && nx > 0.0) {
-        const double sc = dx_cap / nx;
-        dx  *= sc; dzL *= sc; dzU *= sc;
-        if (mI > 0) { ds *= sc; dlam *= sc; }
-    }
+        // -------------------- Residuals --------------------
+        dvec r_d = g;
+        if (mI > 0 && JI.nonZeros())
+            r_d.noalias() += JI.transpose() * lmb;
+        if (mE > 0 && JE.nonZeros())
+            r_d.noalias() += JE.transpose() * nuv;
+        r_d -= zL;
+        r_d += zU;
 
-    // -------- Fraction-to-boundary + LS --------
-    const double tau_pri  = pyu::getattr_or<double>(cfg_, "ip_tau_pri",
-                             pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
-    const double tau_dual = pyu::getattr_or<double>(cfg_, "ip_tau_dual",
-                             pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
-    const double a_ftb = detail::alpha_ftb_vec(
-        x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), lmb, (mI ? dlam : dvec()),
-        B, tau_pri, tau_dual);
-    const double alpha_max =
-        std::min(a_ftb, pyu::getattr_or<double>(cfg_, "ip_alpha_max", 1.0));
+        dvec r_pE = (mE > 0) ? cE : dvec();
+        dvec r_pI = (mI > 0) ? (cI + s) : dvec();
+        IP_LAP("build residuals");
 
-    double alpha = std::min(1.0, alpha_max);
-    int ls_iters = 0;
-    bool needs_restoration = false;
+        // -------------------- Mehrotra + Gondzio --------------------
+        const auto [alpha_aff, mu_aff, sigma, gondzio_step] =
+            mehrotra_with_gondzio_corrections_(
+                W, r_d,
+                (mE > 0 && JE.nonZeros()) ? std::optional<spmat>(JE)
+                                          : std::nullopt,
+                (mE > 0 && r_pE.size()) ? std::optional<dvec>(r_pE)
+                                        : std::nullopt,
+                (mI > 0 && JI.nonZeros()) ? std::optional<spmat>(JI)
+                                          : std::nullopt,
+                (mI > 0 && r_pI.size()) ? std::optional<dvec>(r_pI)
+                                        : std::nullopt,
+                s, lmb, zL, zU, B, use_shifted, tau_shift, bound_shift, mu,
+                theta, Sg);
+        IP_LAP("mehrotra+gondzio");
 
-    auto [refined_dx, error_est, converged_rich] =
-        compute_enhanced_step(dx, x, alpha, safe_inf_norm(g), it);
-    dx = refined_dx;
+        dvec dx = gondzio_step.dx;
+        dvec dnu = (mE > 0 && gondzio_step.dnu.size() == mE) ? gondzio_step.dnu
+                                                             : dvec::Zero(mE);
+        dvec ds = gondzio_step.ds;
+        dvec dlam = gondzio_step.dlam;
+        dvec dzL = gondzio_step.dzL;
+        dvec dzU = gondzio_step.dzU;
 
-    auto ls_res = ls_->search(model, x, dx,
-                              (mI ? s  : dvec()),
-                              (mI ? ds : dvec()),
-                              mu, g.dot(dx), theta, alpha_max);
-    alpha             = std::get<0>(ls_res);
-    ls_iters          = std::get<1>(ls_res);
-    needs_restoration = std::get<2>(ls_res);
+        // Barrier update heuristic
+        const double comp_now =
+            detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
+        if (comp_now * clamp_min(mI, 1) > 10.0 * mu)
+            mu = std::min(comp_now * clamp_min(mI, 1), 10.0);
+        mu = clamp_min(sigma * mu_aff,
+                       pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12));
 
-    // -------- Restoration if needed --------
-    const double ls_min_alpha = pyu::getattr_or<double>(cfg_, "ls_min_alpha",
-                              pyu::getattr_or<double>(cfg_, "ip_alpha_min", 1e-10));
-    if (alpha <= ls_min_alpha && needs_restoration) {
-        dvec dxf = -g; const double ng = dxf.norm(); if (ng > 0) dxf /= ng;
-        const double a_safe = std::min(alpha_max, 1e-2);
-        dvec x_new = x + a_safe * dxf;
+        // Trust region clipping
+        const double dx_cap = pyu::getattr_or<double>(cfg_, "ip_dx_max", 1e3);
+        const double nx = dx.norm();
+        if (nx > dx_cap && nx > 0.0) {
+            const double sc = dx_cap / nx;
+            dx *= sc;
+            dzL *= sc;
+            dzU *= sc;
+            if (mI > 0) {
+                ds *= sc;
+                dlam *= sc;
+            }
+        }
+        IP_LAP("barrier & TR clip");
 
+        // -------------------- Fraction-to-boundary + LS --------------------
+        const double tau_pri = pyu::getattr_or<double>(
+            cfg_, "ip_tau_pri", pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
+        const double tau_dual = pyu::getattr_or<double>(
+            cfg_, "ip_tau_dual",
+            pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
+        const double a_ftb = detail::alpha_ftb_vec(
+            x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), lmb,
+            (mI ? dlam : dvec()), B, tau_pri, tau_dual);
+        const double alpha_max =
+            std::min(a_ftb, pyu::getattr_or<double>(cfg_, "ip_alpha_max", 1.0));
+
+        double alpha = std::min(1.0, alpha_max);
+        int ls_iters = 0;
+        bool needs_restoration = false;
+
+        auto [refined_dx, error_est, converged_rich] =
+            compute_enhanced_step(dx, x, alpha, safe_inf_norm(g), it);
+        dx = refined_dx;
+        IP_LAP("richardson refine");
+
+        auto ls_res =
+            ls_->search(model, x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), mu,
+                        g.dot(dx), theta, alpha_max);
+        alpha = std::get<0>(ls_res);
+        ls_iters = std::get<1>(ls_res);
+        needs_restoration = std::get<2>(ls_res);
+        IP_LAP("line search");
+
+        // -------------------- Restoration path --------------------
+        const double ls_min_alpha = pyu::getattr_or<double>(
+            cfg_, "ls_min_alpha",
+            pyu::getattr_or<double>(cfg_, "ip_alpha_min", 1e-10));
+        if (alpha <= ls_min_alpha && needs_restoration) {
+            dvec dxf = -g;
+            const double ng = dxf.norm();
+            if (ng > 0)
+                dxf /= ng;
+            const double a_safe = std::min(alpha_max, 1e-2);
+            dvec x_new = x + a_safe * dxf;
+
+            SolverInfo info;
+            info.mode = "ip";
+            info.step_norm = (x_new - x).norm();
+            info.accepted = true;
+            info.converged = false;
+            double f_new =
+                nb::cast<double>(model.attr("eval_all")(x_new, comps_all)[s_f]);
+            info.f = f_new;
+            info.theta =
+                nb::cast<double>(model.attr("constraint_violation")(x_new));
+            info.stat = 0.0;
+            info.ineq = 0.0;
+            info.eq = 0.0;
+            info.comp = 0.0;
+            info.ls_iters = ls_iters;
+            info.alpha = 0.0;
+            info.rho = 0.0;
+            info.tr_radius = 0.0;
+            info.mu = mu;
+            IP_LAP("restoration accept");
+            return {x_new, lmb, nuv, info};
+        }
+
+        // -------------------- Accept step & evaluate new point
+        // --------------------
+        dvec x_new = x + alpha * dx;
+        dvec s_new = mI ? (s + alpha * ds) : s;
+        dvec lmb_new = mI ? (lmb + alpha * dlam) : lmb;
+        dvec nu_new = mE ? (nuv + alpha * dnu) : nuv;
+        dvec zL_new = zL + alpha * dzL;
+        dvec zU_new = zU + alpha * dzU;
+
+        Bounds Bn = detail::get_bounds(model, x_new);
+        detail::cap_bound_duals_sigma_box(zL_new, zU_new, Bn, use_shifted,
+                                          bound_shift, mu, 1e10);
+        IP_LAP("apply step & cap");
+
+        nb::dict dN =
+            nb::cast<nb::dict>(model.attr("eval_all")(x_new, comps_new));
+        double f_new = nb::cast<double>(dN[s_f]);
+        dvec g_new = pyconv::to_vec_safe(dN[s_g]);
+
+        nb::object cI_n_o = nb_dict_get(dN, s_cI);
+        nb::object cE_n_o = nb_dict_get(dN, s_cE);
+        dvec cI_new = (mI > 0 && !cI_n_o.is_none())
+                          ? pyconv::to_vec_safe(cI_n_o)
+                          : dvec::Zero(mI);
+        dvec cE_new = (mE > 0 && !cE_n_o.is_none())
+                          ? pyconv::to_vec_safe(cE_n_o)
+                          : dvec::Zero(mE);
+
+        spmat JI_new, JE_new;
+        nb::object JI_n_o = nb_dict_get(dN, s_JI);
+        nb::object JE_n_o = nb_dict_get(dN, s_JE);
+        if (mI > 0 && !JI_n_o.is_none())
+            JI_new = pyconv::to_sparse(JI_n_o);
+        if (mE > 0 && !JE_n_o.is_none())
+            JE_new = pyconv::to_sparse(JE_n_o);
+
+        double theta_new =
+            nb::cast<double>(model.attr("constraint_violation")(x_new));
+        IP_LAP("eval_all(x_new)");
+
+        // -------------------- KKT residuals (new) --------------------
+        dvec r_d_new = g_new;
+        if (mI > 0 && JI_new.nonZeros())
+            r_d_new.noalias() += JI_new.transpose() * lmb_new;
+        if (mE > 0 && JE_new.nonZeros())
+            r_d_new.noalias() += JE_new.transpose() * nu_new;
+        r_d_new -= zL_new;
+        r_d_new += zU_new;
+
+        KKT kkt_new;
+        kkt_new.stat = safe_inf_norm(r_d_new);
+        kkt_new.ineq =
+            (mI > 0) ? safe_inf_norm((cI_new.array().max(0.0)).matrix()) : 0.0;
+        kkt_new.eq = (mE > 0) ? safe_inf_norm(cE_new) : 0.0;
+        kkt_new.comp =
+            detail::comp_inf_norm(s_new, lmb_new, zL_new, zU_new, Bn, mu,
+                                  use_shifted, tau_shift, bound_shift);
+        const bool converged =
+            (kkt_new.stat <= tol && kkt_new.ineq <= tol && kkt_new.eq <= tol &&
+             kkt_new.comp <= tol && mu <= tol / 10.0);
+        IP_LAP("KKT new");
+
+        // -------------------- Barrier manager update --------------------
+        auto complementarity =
+            detail::complementarity(s_new, lmb_new, mu, tau_shift, use_shifted);
+        auto feasibility_error = std::max(kkt_new.ineq, kkt_new.eq);
+        bool step_accepted = true;
+        double alpha_step = alpha;
+        auto mu_up = barrier_manager_.update_barrier_parameter(
+            mu, kkt_new.stat, complementarity, feasibility_error, alpha_step,
+            step_accepted, it);
+        mu = mu_up.mu_new;
+        IP_LAP("barrier manager");
+
+        // s = x_{k+1} - x_k  (use a different name to avoid clashing with slack
+        // vector 's')
+        // dvec sx = x_new - x;
+
+        // // y = ∇L(x_{k+1},λ_{k+1},ν_{k+1}) − ∇L(x_k,λ_k,ν_k)
+        // // recall: r_d = ∇L − zL + zU  ⇒  ∇L = r_d + zL − zU
+        // dvec gradL_old = r_d + zL - zU;
+        // dvec gradL_new = r_d_new + zL_new - zU_new;
+        // dvec yL = gradL_new - gradL_old;
+
+        // try {
+        //     // `accepted` is keyword-only in Python, so:
+        //     if (step_accepted) {
+        //         // default accepted=True, so just pass (sx, yL)
+        //         model.attr("hessian_update")(nb::cast(sx), nb::cast(yL));
+        //     } else {
+        //         // explicitly pass accepted=False
+        //         nb::dict kw;
+        //         kw["accepted"] = nb::bool_(false);
+        //         // nanobind allows kwargs via the call operator with **kw:
+        //         model.attr("hessian_update")(nb::cast(sx), nb::cast(yL), **kw);
+        //     }
+        // } catch (const nb::python_error &e) {
+        //     // Optional: log and continue without killing the IP iteration
+        //     // std::cerr << "hessian_update failed: " << e.what() << "\n";
+        // }
+        // IP_LAP("hessian_update");
+
+        // -------------------- Pack & update state --------------------
         SolverInfo info;
         info.mode = "ip";
         info.step_norm = (x_new - x).norm();
-        info.accepted  = true;
-        info.converged = false;
-        // small eval just for f; still pass a tuple
-        double f_new = nb::cast<double>(
-            model.attr("eval_all")(x_new, comps_all)[s_f]
-        );
-        info.f     = f_new;
-        info.theta = nb::cast<double>( model.attr("constraint_violation")(x_new) );
-        info.stat = 0.0; info.ineq = 0.0; info.eq = 0.0; info.comp = 0.0;
-        info.ls_iters = ls_iters; info.alpha = 0.0; info.rho = 0.0; info.tr_radius = 0.0;
+        info.accepted = true;
+        info.converged = converged;
+        info.f = f_new;
+        info.theta = theta_new;
+        info.stat = kkt_new.stat;
+        info.ineq = kkt_new.ineq;
+        info.eq = kkt_new.eq;
+        info.comp = kkt_new.comp;
+        info.ls_iters = ls_iters;
+        info.alpha = alpha;
+        info.rho = 0.0;
+        info.tr_radius = 0.0;
         info.mu = mu;
-        return { x_new, lmb, nuv, info };
+        info.shifted_barrier = use_shifted;
+        info.tau_shift = tau_shift;
+        info.bound_shift = bound_shift;
+
+        st.s = std::move(s_new);
+        st.lam = std::move(lmb_new);
+        st.nu = std::move(nu_new);
+        st.zL = std::move(zL_new);
+        st.zU = std::move(zU_new);
+        st.mu = mu;
+        st.tau_shift = tau_shift;
+        IP_LAP("pack & update state");
+
+        return {x_new, st.lam, st.nu, info};
     }
-
-    // -------- Accept step --------
-    dvec x_new   = x   + alpha * dx;
-    dvec s_new   = mI ? (s   + alpha * ds)   : s;
-    dvec lmb_new = mI ? (lmb + alpha * dlam) : lmb;
-    dvec nu_new  = mE ? (nuv + alpha * dnu)  : nuv;
-    dvec zL_new  = zL + alpha * dzL;
-    dvec zU_new  = zU + alpha * dzU;
-
-    // Update bounds and cap
-    Bounds Bn = detail::get_bounds(model, x_new);
-    detail::cap_bound_duals_sigma_box(zL_new, zU_new, Bn, use_shifted,
-                                      bound_shift, mu, 1e10);
-
-    // Evaluate at new point
-    nb::dict dN = nb::cast<nb::dict>( model.attr("eval_all")(x_new, comps_new) );
-    double f_new = nb::cast<double>( dN[s_f] );
-    dvec g_new   = pyconv::to_vec_safe( dN[s_g] );
-
-    nb::object cI_n_o = nb_dict_get(dN, s_cI);
-    nb::object cE_n_o = nb_dict_get(dN, s_cE);
-    dvec cI_new = (mI > 0 && !cI_n_o.is_none()) ? pyconv::to_vec_safe(cI_n_o) : dvec::Zero(mI);
-    dvec cE_new = (mE > 0 && !cE_n_o.is_none()) ? pyconv::to_vec_safe(cE_n_o) : dvec::Zero(mE);
-
-    spmat JI_new, JE_new;
-    nb::object JI_n_o = nb_dict_get(dN, s_JI);
-    nb::object JE_n_o = nb_dict_get(dN, s_JE);
-    if (mI > 0 && !JI_n_o.is_none()) JI_new = pyconv::to_sparse(JI_n_o);
-    if (mE > 0 && !JE_n_o.is_none()) JE_new = pyconv::to_sparse(JE_n_o);
-
-    double theta_new = nb::cast<double>( model.attr("constraint_violation")(x_new) );
-
-    // KKT residuals (new)
-    dvec r_d_new = g_new;
-    if (mI > 0 && JI_new.nonZeros()) r_d_new.noalias() += JI_new.transpose() * lmb_new;
-    if (mE > 0 && JE_new.nonZeros()) r_d_new.noalias() += JE_new.transpose() * nu_new;
-    r_d_new -= zL_new;
-    r_d_new += zU_new;
-
-    KKT kkt_new;
-    kkt_new.stat = safe_inf_norm(r_d_new);
-    kkt_new.ineq = (mI > 0) ? safe_inf_norm((cI_new.array().max(0.0)).matrix()) : 0.0;
-    kkt_new.eq   = (mE > 0) ? safe_inf_norm(cE_new) : 0.0;
-    kkt_new.comp =
-        detail::comp_inf_norm(s_new, lmb_new, zL_new, zU_new, Bn, mu,
-                              use_shifted, tau_shift, bound_shift);
-
-    const bool converged =
-        (kkt_new.stat <= tol && kkt_new.ineq <= tol && kkt_new.eq <= tol &&
-         kkt_new.comp <= tol && mu <= tol / 10.0);
-
-    // Barrier update via manager
-    auto complementarity = detail::complementarity(s_new, lmb_new, mu, tau_shift, use_shifted);
-    auto feasibility_error = std::max(kkt_new.ineq, kkt_new.eq);
-    bool step_accepted = true;
-    double alpha_step = alpha;
-    auto mu_up = barrier_manager_.update_barrier_parameter(
-        mu, kkt_new.stat, complementarity, feasibility_error, alpha_step, step_accepted, it);
-    mu = mu_up.mu_new;
-
-    // Pack info
-    SolverInfo info;
-    info.mode = "ip";
-    info.step_norm = (x_new - x).norm();
-    info.accepted = true;
-    info.converged = converged;
-    info.f = f_new;
-    info.theta = theta_new;
-    info.stat = kkt_new.stat;
-    info.ineq = kkt_new.ineq;
-    info.eq = kkt_new.eq;
-    info.comp = kkt_new.comp;
-    info.ls_iters = ls_iters;
-    info.alpha = alpha;
-    info.rho = 0.0;
-    info.tr_radius = 0.0;
-    info.mu = mu;
-    info.shifted_barrier = use_shifted;
-    info.tau_shift = tau_shift;
-    info.bound_shift = bound_shift;
-
-    // Update state
-    st.s = std::move(s_new);
-    st.lam = std::move(lmb_new);
-    st.nu  = std::move(nu_new);
-    st.zL  = std::move(zL_new);
-    st.zU  = std::move(zU_new);
-    st.mu  = mu;
-    st.tau_shift = tau_shift;
-
-    return { x_new, st.lam, st.nu, info };
-}
 
 private:
     nb::object cfg_, hess_;
@@ -1055,7 +1229,7 @@ private:
         set_if_missing("ip_theta_clip", nb::float_(1e-2));
         set_if_missing("sigma_eps_abs", nb::float_(1e-8));
         set_if_missing("sigma_cap", nb::float_(1e8));
-        set_if_missing("ip_kkt_method", nb::str("hykkt_cholmod"));
+        set_if_missing("ip_kkt_method", nb::str("hykkt"));
         set_if_missing("tol", nb::float_(1e-6));
         set_if_missing("ls_backtrack", nb::float_(pyu::getattr_or<double>(
                                            cfg_, "ip_alpha_backtrack", 0.5)));
@@ -1067,78 +1241,80 @@ private:
                                            cfg_, "ip_alpha_min", 1e-10)));
     }
 
-  [[nodiscard]] IPState state_from_model_(const nb::object &model,
-                                        const dvec &x) {
-    IPState s{};
-    s.mI = pyu::getattr_or<int>(model, "m_ineq", 0);
-    s.mE = pyu::getattr_or<int>(model, "m_eq", 0);
-    
-    // eval_all -> dict (use nb::getattr + nb::cast)
-    nb::object d_obj = model.attr("eval_all")(x, nb::make_tuple("cI", "cE"));
+    [[nodiscard]] IPState state_from_model_(const nb::object &model,
+                                            const dvec &x) {
+        IPState s{};
+        s.mI = pyu::getattr_or<int>(model, "m_ineq", 0);
+        s.mE = pyu::getattr_or<int>(model, "m_eq", 0);
 
-    // Try to cast to dict - this might be where the bad cast occurs
-    nb::dict d;
-    try {
-        d = nb::cast<nb::dict>(d_obj);
-    } catch (const std::exception& e) {
-        // If direct cast fails, try accessing as dict-like object
-        if (PyDict_Check(d_obj.ptr())) {
-            d = nb::borrow<nb::dict>(d_obj);
+        // eval_all -> dict (use nb::getattr + nb::cast)
+        nb::object d_obj =
+            model.attr("eval_all")(x, nb::make_tuple("cI", "cE"));
+
+        // Try to cast to dict - this might be where the bad cast occurs
+        nb::dict d;
+        try {
+            d = nb::cast<nb::dict>(d_obj);
+        } catch (const std::exception &e) {
+            // If direct cast fails, try accessing as dict-like object
+            if (PyDict_Check(d_obj.ptr())) {
+                d = nb::borrow<nb::dict>(d_obj);
+            } else {
+                throw std::runtime_error(
+                    "eval_all did not return a dict-like object");
+            }
+        }
+
+        // cI from dict (wrap accessor into nb::object before checks/casts)
+        nb::object cI_obj = nb_dict_get(d, s_cI);
+
+        dvec cI = (s.mI > 0 && !cI_obj.is_none()) ? pyconv::to_vec_safe(cI_obj)
+                                                  : dvec::Zero(s.mI);
+        const double mu0 =
+            clamp_min(pyu::getattr_or<double>(cfg_, "ip_mu_init", 1e-2), 1e-12);
+        const bool use_shifted =
+            pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", true);
+        const double tau_shift =
+            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_tau", 0.1)
+                        : 0.0;
+        const double bound_shift =
+            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.1)
+                        : 0.0;
+
+        if (s.mI > 0) {
+            s.s = dvec(s.mI);
+            s.lam = dvec(s.mI);
+            for (int i = 0; i < s.mI; ++i) {
+                s.s[i] = clamp_min(-cI[i] + 1e-3, 1.0);
+                const double denom =
+                    (tau_shift > 0.0) ? (s.s[i] + tau_shift) : s.s[i];
+                s.lam[i] = clamp_min(mu0 / clamp_min(denom, 1e-12), 1e-8);
+            }
         } else {
-            throw std::runtime_error("eval_all did not return a dict-like object");
+            s.s.resize(0);
+            s.lam.resize(0);
         }
-    }
-    
-    // cI from dict (wrap accessor into nb::object before checks/casts)
-    nb::object cI_obj = nb_dict_get(d, s_cI);
 
-    dvec cI = (s.mI > 0 && !cI_obj.is_none()) ? pyconv::to_vec_safe(cI_obj)
-                                              : dvec::Zero(s.mI);
-    const double mu0 =
-        clamp_min(pyu::getattr_or<double>(cfg_, "ip_mu_init", 1e-2), 1e-12);
-    const bool use_shifted =
-        pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", true);
-    const double tau_shift =
-        use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_tau", 0.1)
-                    : 0.0;
-    const double bound_shift =
-        use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.1)
-                    : 0.0;
-    
-    if (s.mI > 0) {
-        s.s = dvec(s.mI);
-        s.lam = dvec(s.mI);
-        for (int i = 0; i < s.mI; ++i) {
-            s.s[i] = clamp_min(-cI[i] + 1e-3, 1.0);
-            const double denom =
-                (tau_shift > 0.0) ? (s.s[i] + tau_shift) : s.s[i];
-            s.lam[i] = clamp_min(mu0 / clamp_min(denom, 1e-12), 1e-8);
+        s.nu = (s.mE > 0) ? dvec::Zero(s.mE) : dvec();
+
+        Bounds B = detail::get_bounds(model, x);
+        s.zL = dvec::Zero(x.size());
+        s.zU = dvec::Zero(x.size());
+
+        for (int i = 0; i < (int)x.size(); ++i) {
+            if (B.hasL[i])
+                s.zL[i] = clamp_min(
+                    mu0 / clamp_min(B.sL[i] + bound_shift, 1e-12), 1e-8);
+            if (B.hasU[i])
+                s.zU[i] = clamp_min(
+                    mu0 / clamp_min(B.sU[i] + bound_shift, 1e-12), 1e-8);
         }
-    } else {
-        s.s.resize(0);
-        s.lam.resize(0);
+
+        s.mu = mu0;
+        s.tau_shift = tau_shift;
+        s.initialized = true;
+        return s;
     }
-    
-    s.nu = (s.mE > 0) ? dvec::Zero(s.mE) : dvec();
-    
-    Bounds B = detail::get_bounds(model, x);
-    s.zL = dvec::Zero(x.size());
-    s.zU = dvec::Zero(x.size());
-    
-    for (int i = 0; i < (int)x.size(); ++i) {
-        if (B.hasL[i])
-            s.zL[i] = clamp_min(
-                mu0 / clamp_min(B.sL[i] + bound_shift, 1e-12), 1e-8);
-        if (B.hasU[i])
-            s.zU[i] = clamp_min(
-                mu0 / clamp_min(B.sU[i] + bound_shift, 1e-12), 1e-8);
-    }
-    
-    s.mu = mu0;
-    s.tau_shift = tau_shift;
-    s.initialized = true;
-    return s;
-}
 
     [[nodiscard]] double adaptive_shift_slack_(const dvec &s, const dvec &cI,
                                                int it) const {

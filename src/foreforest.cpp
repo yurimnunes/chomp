@@ -1,44 +1,42 @@
-// foreforest_bindings.cpp
-#include <nanobind/nanobind.h>
-#include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
-#include <nanobind/ndarray.h>
+// foreforest_pybind.cpp
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+#include <cstdint>
+#include <cstring>   // std::memcpy
+#include <stdexcept> // std::invalid_argument
+#include <string>
+#include <vector>
 
 #include "../include/tree/gradient_hist_system.hpp"
 #include "../include/tree/unified_tree.hpp"
-#include "../include/tree/forest.hpp"   // the header from the previous turn (ForeForest + ForeForestConfig)
+#include "../include/tree/forest.h"   // ForeForest + ForeForestConfig
 
-namespace nb = nanobind;
-using nb::ndarray;
-using nb::dtype;
+namespace py = pybind11;
 
 using foretree::HistogramConfig;
 using foretree::TreeConfig;
 using foretree::ForeForestConfig;
 using foretree::ForeForest;
 
-template <class T>
-static inline void ensure_contig_2d(const ndarray<T>& a, const char* name) {
+// ---- Small helpers ----------------------------------------------------------
+// Accept base py::array to avoid template-flag mismatches (c_style/forcecast).
+static inline void ensure_2d(const py::array &a, const char* name) {
     if (a.ndim() != 2)
         throw std::invalid_argument(std::string(name) + ": expected 2D array");
-    if (!a.is_c_contiguous())
-        throw std::invalid_argument(std::string(name) + ": expected C-contiguous row-major");
 }
-
-template <class T>
-static inline void ensure_1d(const ndarray<T>& a, const char* name) {
+static inline void ensure_1d(const py::array &a, const char* name) {
     if (a.ndim() != 1)
         throw std::invalid_argument(std::string(name) + ": expected 1D array");
-    if (!a.is_c_contiguous())
-        throw std::invalid_argument(std::string(name) + ": expected contiguous array");
 }
 
-NB_MODULE(foreforest, m) {
-    m.doc() = "ForeForest — bagging/GBDT with DART, nanobind bindings";
+PYBIND11_MODULE(foreforest, m) {
+    m.doc() = "ForeForest — bagging/GBDT with DART, pybind11 bindings";
 
     // --------------------- HistogramConfig ---------------------
-    nb::class_<HistogramConfig>(m, "HistogramConfig")
-        .def(nb::init<>())
+    py::class_<HistogramConfig>(m, "HistogramConfig")
+        .def(py::init<>())
         .def_readwrite("method", &HistogramConfig::method)
         .def_readwrite("max_bins", &HistogramConfig::max_bins)
         .def_readwrite("use_missing_bin", &HistogramConfig::use_missing_bin)
@@ -60,9 +58,10 @@ NB_MODULE(foreforest, m) {
         .def("total_bins", &HistogramConfig::total_bins)
         .def("missing_bin_id", &HistogramConfig::missing_bin_id);
 
-    // --------------------- TreeConfig --------------------------
-    nb::class_<TreeConfig>(m, "TreeConfig")
-        .def(nb::init<>())
+    // --------------------- TreeConfig + enums ------------------
+    py::class_<TreeConfig> pyTreeCfg(m, "TreeConfig");
+    pyTreeCfg
+        .def(py::init<>())
         .def_readwrite("max_depth", &TreeConfig::max_depth)
         .def_readwrite("max_leaves", &TreeConfig::max_leaves)
         .def_readwrite("min_samples_split", &TreeConfig::min_samples_split)
@@ -90,40 +89,38 @@ NB_MODULE(foreforest, m) {
         .def_readwrite("subsample_bynode", &TreeConfig::subsample_bynode)
         .def_readwrite("subsample_with_replacement", &TreeConfig::subsample_with_replacement)
         .def_readwrite("subsample_importance_scale", &TreeConfig::subsample_importance_scale)
-        // enums
         .def_readwrite("growth", &TreeConfig::growth)
         .def_readwrite("missing_policy", &TreeConfig::missing_policy)
         .def_readwrite("split_mode", &TreeConfig::split_mode);
 
-    nb::enum_<TreeConfig::Growth>(m, "Growth")
+    py::enum_<TreeConfig::Growth>(m, "Growth")
         .value("LeafWise", TreeConfig::Growth::LeafWise)
         .value("LevelWise", TreeConfig::Growth::LevelWise);
 
-    nb::enum_<TreeConfig::MissingPolicy>(m, "MissingPolicy")
+    py::enum_<TreeConfig::MissingPolicy>(m, "MissingPolicy")
         .value("Learn", TreeConfig::MissingPolicy::Learn)
         .value("AlwaysLeft", TreeConfig::MissingPolicy::AlwaysLeft)
         .value("AlwaysRight", TreeConfig::MissingPolicy::AlwaysRight);
 
-    nb::enum_<TreeConfig::SplitMode>(m, "SplitMode")
+    py::enum_<TreeConfig::SplitMode>(m, "SplitMode")
         .value("Histogram", TreeConfig::SplitMode::Histogram)
         .value("Exact", TreeConfig::SplitMode::Exact)
         .value("Hybrid", TreeConfig::SplitMode::Hybrid);
 
-    // GOSS nested struct
-    nb::class_<TreeConfig::GOSS>(m, "GOSS")
-        .def(nb::init<>())
+    // GOSS nested struct + member on TreeConfig
+    py::class_<TreeConfig::GOSS>(m, "GOSS")
+        .def(py::init<>())
         .def_readwrite("enabled", &TreeConfig::GOSS::enabled)
         .def_readwrite("top_rate", &TreeConfig::GOSS::top_rate)
         .def_readwrite("other_rate", &TreeConfig::GOSS::other_rate)
         .def_readwrite("scale_hessian", &TreeConfig::GOSS::scale_hessian)
         .def_readwrite("min_node_size", &TreeConfig::GOSS::min_node_size);
-    // Allow access via TreeConfig.goss
-    nb::detail::get_class<TreeConfig>(m, "TreeConfig")
-        .def_readwrite("goss", &TreeConfig::goss);
+    pyTreeCfg.def_readwrite("goss", &TreeConfig::goss);
 
-    // --------------------- ForeForestConfig --------------------
-    nb::class_<ForeForestConfig>(m, "ForeForestConfig")
-        .def(nb::init<>())
+    // --------------------- ForeForestConfig + enums -------------
+    py::class_<ForeForestConfig> pyFFCfg(m, "ForeForestConfig");
+    pyFFCfg
+        .def(py::init<>())
         .def_readwrite("mode", &ForeForestConfig::mode)
         .def_readwrite("n_estimators", &ForeForestConfig::n_estimators)
         .def_readwrite("learning_rate", &ForeForestConfig::learning_rate)
@@ -141,76 +138,84 @@ NB_MODULE(foreforest, m) {
         .def_readwrite("dart_max_drop", &ForeForestConfig::dart_max_drop)
         .def_readwrite("dart_normalize", &ForeForestConfig::dart_normalize);
 
-    nb::enum_<ForeForestConfig::Mode>(m, "Mode")
+    py::enum_<ForeForestConfig::Mode>(m, "Mode")
         .value("Bagging", ForeForestConfig::Mode::Bagging)
-        .value("GBDT", ForeForestConfig::Mode::GBDT);
+        .value("GBDT",   ForeForestConfig::Mode::GBDT);
 
-    // --------------------- ForeForest (Python-facing) -----------------
-    nb::class_<ForeForest>(m, "ForeForest")
-        .def(nb::init<ForeForestConfig>(), nb::arg("config"))
+    // --------------------- ForeForest (Python-facing) ----------
+    py::class_<ForeForest>(m, "ForeForest")
+        .def(py::init<ForeForestConfig>(), py::arg("config"))
 
         // set_raw_matrix: float32 (N x P) + optional uint8 mask (N x P)
         .def("set_raw_matrix",
             [](ForeForest& self,
-               ndarray<float> Xraw,
-               nb::object miss_mask /* None or ndarray<uint8> */) {
-                nb::scoped_interpreter_guard gil; // ensure GIL
-                ensure_contig_2d(Xraw, "Xraw");
+               py::array_t<float,  py::array::c_style | py::array::forcecast> Xraw,
+               py::object miss_mask /* None or array_t<uint8> */) {
+                ensure_2d(Xraw, "Xraw");
+                const py::ssize_t N = Xraw.shape(0);
+                const py::ssize_t P = Xraw.shape(1);
                 const float* ptr = Xraw.data();
-                const uint8_t* mptr = nullptr;
 
-                ndarray<uint8_t> mask;
+                const uint8_t* mptr = nullptr;
+                py::array_t<uint8_t, py::array::c_style | py::array::forcecast> mask;
+
                 if (!miss_mask.is_none()) {
-                    mask = nb::cast<ndarray<uint8_t>>(miss_mask);
-                    ensure_contig_2d(mask, "miss_mask");
-                    if (mask.shape(0) != Xraw.shape(0) || mask.shape(1) != Xraw.shape(1))
+                    mask = miss_mask.cast<py::array_t<uint8_t, py::array::c_style | py::array::forcecast>>();
+                    ensure_2d(mask, "miss_mask");
+                    if (mask.shape(0) != N || mask.shape(1) != P)
                         throw std::invalid_argument("miss_mask: shape must match Xraw");
                     mptr = mask.data();
                 }
+                // ForeForest stores/uses the raw pointer & its own strides/views internally.
+                (void)N; (void)P;
                 self.set_raw_matrix(ptr, mptr);
             },
-            nb::arg("Xraw"), nb::arg("miss_mask") = nb::none())
+            py::arg("Xraw"), py::arg("miss_mask") = py::none())
 
         // fit_complete: X float64 (N x P), y float64 (N)
         .def("fit_complete",
-            [](ForeForest& self, ndarray<double> X, ndarray<double> y) {
-                nb::scoped_interpreter_guard gil;
-                ensure_contig_2d(X, "X");
+            [](ForeForest& self,
+               py::array_t<double, py::array::c_style | py::array::forcecast> X,
+               py::array_t<double, py::array::c_style | py::array::forcecast> y) {
+                ensure_2d(X, "X");
                 ensure_1d(y, "y");
-                const int N = (int) X.shape(0);
-                const int P = (int) X.shape(1);
-                if ((int) y.shape(0) != N)
+                const py::ssize_t N = X.shape(0);
+                const py::ssize_t P = X.shape(1);
+                if (y.shape(0) != N)
                     throw std::invalid_argument("y length must equal X.shape[0]");
-                self.fit_complete(X.data(), N, P, y.data());
+                self.fit_complete(X.data(), static_cast<int>(N), static_cast<int>(P), y.data());
             },
-            nb::arg("X"), nb::arg("y"))
+            py::arg("X"), py::arg("y"))
 
         // predict: X float64 (N x P) -> float64 (N)
         .def("predict",
-            [](const ForeForest& self, ndarray<double> X) {
-                nb::scoped_interpreter_guard gil;
-                ensure_contig_2d(X, "X");
-                const int N = (int) X.shape(0);
-                const int P = (int) X.shape(1);
-                std::vector<double> out = self.predict(X.data(), N, P);
-
-                // Return as a NumPy array without extra copy
-                auto arr = ndarray<double>::from_shape({(size_t)N});
-                std::memcpy(arr.data(), out.data(), sizeof(double) * (size_t)N);
+            [](const ForeForest& self,
+               py::array_t<double, py::array::c_style | py::array::forcecast> X) {
+                ensure_2d(X, "X");
+                const py::ssize_t N = X.shape(0);
+                const py::ssize_t P = X.shape(1);
+                std::vector<double> out = self.predict(X.data(),
+                                                       static_cast<int>(N),
+                                                       static_cast<int>(P));
+                py::array_t<double> arr({N});
+                if (!out.empty()) {
+                    std::memcpy(arr.mutable_data(), out.data(),
+                                sizeof(double) * static_cast<size_t>(N));
+                }
                 return arr;
             },
-            nb::arg("X"))
+            py::arg("X"))
 
         .def("feature_importance_gain",
             [](const ForeForest& self) {
                 std::vector<double> v = self.feature_importance_gain();
-                auto arr = ndarray<double>::from_shape({(size_t)v.size()});
+                py::array_t<double> arr({static_cast<py::ssize_t>(v.size())});
                 if (!v.empty())
-                    std::memcpy(arr.data(), v.data(), sizeof(double) * v.size());
+                    std::memcpy(arr.mutable_data(), v.data(),
+                                sizeof(double) * v.size());
                 return arr;
             })
 
-        .def("size", &ForeForest::size)
-        .def("clear", &ForeForest::clear)
-        ;
+        .def("size",   &ForeForest::size)
+        .def("clear",  &ForeForest::clear);
 }

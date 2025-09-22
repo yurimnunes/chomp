@@ -3,10 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ------------------------------------------------------------------
 # Project
 # ------------------------------------------------------------------
-project(ad
-  VERSION 0.1.0
-  LANGUAGES CXX C
-)
+project(ad VERSION 0.1.0 LANGUAGES CXX C)
 
 # C++ standard (use features without GNU extensions)
 set(CMAKE_CXX_STANDARD 23)
@@ -17,120 +14,118 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build options
-option(AD_ENABLE_OPENMP   "Enable OpenMP"                    OFF)
-option(AD_ENABLE_PIQP     "Build piqp_cpp Python bindings"   ON)
-option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"   ON)
-option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"  ON)
-option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"     ON)
-option(AD_ENABLE_L1CORE   "Build l1core Python bindings"     ON)
+option(AD_ENABLE_OPENMP   "Enable OpenMP"                     ON)
+option(AD_ENABLE_PIQP     "Build piqp_cpp Python bindings"    ON)
+option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"    ON)
+option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"   ON)
+option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"       ON)
+option(AD_ENABLE_L1CORE   "Build l1core Python bindings"      ON)
+option(AD_ENABLE_CHOLMOD  "Enable HYKKT via SuiteSparse"      ON)
+option(AD_ENABLE_SPECTRA  "Fetch and enable Spectra via CPM"  ON)
+option(AD_ENABLE_GUROBI   "Enable GUROBI linkage"             OFF)
 
 # ------------------------------------------------------------------
-# Dependencies via CPM or system packages
+# CPM bootstrap (before any CPMAddPackage)
 # ------------------------------------------------------------------
-# First try to include CPM if present in the repo
-# ---- CPM bootstrap (before any CPMAddPackage) ----
 include(cmake/CPM.cmake OPTIONAL)
-# Check if CPM was included, if not, fetch and include CPM
 if(NOT COMMAND CPMAddPackage)
-  # Include FetchContent module
   include(FetchContent)
-  # Declare CPM.cmake as a FetchContent
   FetchContent_Declare(
     CPM
     GIT_REPOSITORY https://github.com/cpm-cmake/CPM.cmake.git
-    GIT_TAG v0.42.0 # You can specify a specific version of CPM.cmake
+    GIT_TAG v0.42.0
   )
-  # Fetch CPM
   FetchContent_MakeAvailable(CPM)
-  # Include CPM.cmake after it has been fetched
   include(${cpm_SOURCE_DIR}/cmake/CPM.cmake)
 endif()
 
+# ------------------------------------------------------------------
+# Dependencies
+# ------------------------------------------------------------------
 
-# fmt (header-only/targets)
+# fmt
 find_package(fmt CONFIG QUIET)
-if (NOT fmt_FOUND)
-  message(STATUS "fmt not found via find_package; will use CPM to fetch it.")
-CPMAddPackage(
-  NAME fmt
-  GITHUB_REPOSITORY fmtlib/fmt
-  GIT_TAG 11.2.0
-)
+if(NOT fmt_FOUND)
+  message(STATUS "fmt not found; fetching via CPM")
+  CPMAddPackage(NAME fmt GITHUB_REPOSITORY fmtlib/fmt GIT_TAG 11.2.0)
 endif()
 
-# pybind11 (preferred via package config; fall back to CPM)
+# pybind11
 find_package(pybind11 CONFIG QUIET)
 if(NOT pybind11_FOUND)
-  CPMAddPackage(
-    NAME pybind11
-    GITHUB_REPOSITORY pybind/pybind11
-    GIT_TAG v2.13.6
-  )
+  message(STATUS "pybind11 not found; fetching via CPM")
+  CPMAddPackage(NAME pybind11 GITHUB_REPOSITORY pybind/pybind11 GIT_TAG v2.13.6)
 endif()
 
+# Eigen3
 find_package(Eigen3 3.3 CONFIG QUIET)
 if(NOT Eigen3_FOUND)
-# Eigen setup
-CPMAddPackage(
-  NAME Eigen
-  GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-  GIT_TAG master # Specify the version of Eigen you want to use
-)
+  message(STATUS "Eigen3 not found; fetching via CPM")
+  CPMAddPackage(
+    NAME Eigen3
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG 3.4.0
+  )
+  # Some CPM recipes export 'eigen' target; create alias if needed.
+  if(TARGET eigen)
+    add_library(Eigen3::Eigen ALIAS eigen)
+  elseif(NOT TARGET Eigen3::Eigen)
+    # Header-only fallback
+    add_library(Eigen3::Eigen INTERFACE IMPORTED)
+    set(_eigen_inc "${Eigen3_SOURCE_DIR}")
+    if(EXISTS "${Eigen3_SOURCE_DIR}/Eigen")
+      set(_eigen_inc "${Eigen3_SOURCE_DIR}")
+    elseif(EXISTS "${Eigen3_SOURCE_DIR}/include/eigen3")
+      set(_eigen_inc "${Eigen3_SOURCE_DIR}/include/eigen3")
+    endif()
+    set_target_properties(Eigen3::Eigen PROPERTIES
+      INTERFACE_INCLUDE_DIRECTORIES "${_eigen_inc}"
+    )
+  endif()
 endif()
 
-# Python 3 — Interpreter + Development
-find_package(Python3 3.13 COMPONENTS Interpreter Development REQUIRED)
+# Python 3 — Interpreter + Development.Module (for nanobind) + Development
+find_package(Python3 3.13
+  COMPONENTS Interpreter Development Development.Module
+  REQUIRED
+)
 
+# nanobind (always via CPM is fine; it uses Python3 variables)
+set(NANOBIND_TAG v2.9.2 CACHE STRING "nanobind version/tag to fetch via CPM")
+CPMAddPackage(
+  NAME nanobind
+  GITHUB_REPOSITORY wjakob/nanobind
+  GIT_TAG ${NANOBIND_TAG}
+)
+# nanobind provides nanobind_add_module()
 
-    message(STATUS "nanobind not found via find_package; will use CPM to fetch it.")
-    
-    # CRITICAL: Set Python variables BEFORE CPMAddPackage
-    # This ensures nanobind's CMake configuration uses the correct Python
-    set(Python_EXECUTABLE ${Python3_EXECUTABLE} CACHE FILEPATH "" FORCE)
-    set(Python3_EXECUTABLE ${Python3_EXECUTABLE} CACHE FILEPATH "" FORCE)
-    set(Python_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
-    set(Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
-    set(Python_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
-    set(Python3_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
-    
-    # Also set the specific variables nanobind looks for
-    set(Python_INCLUDE_DIR ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
-    set(PYTHON_INCLUDE_DIRS ${Python3_INCLUDE_DIRS} CACHE PATH "" FORCE)
-    set(PYTHON_LIBRARIES ${Python3_LIBRARIES} CACHE FILEPATH "" FORCE)
-
-    # allow overriding the tag on the command line if desired
-    set(NANOBIND_TAG v2.9.2 CACHE STRING "nanobind version/tag to fetch via CPM")
-    
-    CPMAddPackage(
-        NAME nanobind
-        GITHUB_REPOSITORY wjakob/nanobind
-        GIT_TAG ${NANOBIND_TAG}
-        OPTIONS
-            "Python_EXECUTABLE ${Python3_EXECUTABLE}"
-            "Python3_EXECUTABLE ${Python3_EXECUTABLE}"
-            "Python_INCLUDE_DIRS ${Python3_INCLUDE_DIRS}"
-            "Python3_INCLUDE_DIRS ${Python3_INCLUDE_DIRS}"
-            "Python_LIBRARIES ${Python3_LIBRARIES}"
-            "Python3_LIBRARIES ${Python3_LIBRARIES}"
-    )
-    
-    # Verify that nanobind found Python correctly
-    if(TARGET nanobind-static)
-        get_target_property(NB_INCLUDES nanobind-static INCLUDE_DIRECTORIES)
-        message(STATUS "nanobind-static include directories: ${NB_INCLUDES}")
-        
-        # Force Python include dirs on nanobind-static if they're missing
-        if(Python3_INCLUDE_DIRS AND NOT "${NB_INCLUDES}" MATCHES "Python")
-            message(STATUS "Force-adding Python includes to nanobind-static")
-            target_include_directories(nanobind-static PRIVATE ${Python3_INCLUDE_DIRS})
-        endif()
+# Spectra (header-only; CPM + INTERFACE target alias)
+if(AD_ENABLE_SPECTRA)
+  CPMAddPackage(
+    NAME Spectra
+    GITHUB_REPOSITORY yixuan/spectra
+    GIT_TAG v1.2.0
+    DOWNLOAD_ONLY NO
+  )
+  # Ensure an imported/alias target exists: Spectra::Spectra
+  if(NOT TARGET Spectra::Spectra)
+    if(TARGET Spectra) # some recipes create 'Spectra'
+      add_library(Spectra::Spectra INTERFACE IMPORTED)
+      target_link_libraries(Spectra::Spectra INTERFACE Spectra)
+    else()
+      # Header-only include dir fallback
+      add_library(Spectra::Spectra INTERFACE IMPORTED)
+      # Typical include path is <pkg>/include
+      if(DEFINED Spectra_SOURCE_DIR)
+        target_include_directories(Spectra::Spectra INTERFACE
+          "${Spectra_SOURCE_DIR}/include")
+      elseif(DEFINED Spectra_INCLUDE_DIRS)
+        target_include_directories(Spectra::Spectra INTERFACE
+          "${Spectra_INCLUDE_DIRS}")
+      endif()
     endif()
-
-
-set(Python_EXECUTABLE      ${Python3_EXECUTABLE})
-set(Python_INCLUDE_DIR     ${Python3_INCLUDE_DIRS})
-set(Python_LIBRARY         ${Python3_LIBRARIES})
-set(Python_NumPy_INCLUDE_DIRS ${Python3_NumPy_INCLUDE_DIRS})
+  endif()
+endif()
 
 # OpenMP (optional)
 if(AD_ENABLE_OPENMP)
@@ -140,36 +135,31 @@ endif()
 # ------------------------------------------------------------------
 # Optional: GUROBI
 # ------------------------------------------------------------------
-# You can pass -DGUROBI_ROOT=/path/to/gurobi/linux64 on the cmake command line
 set(GUROBI_ROOT "" CACHE PATH "Path to GUROBI linux64 installation root")
-
 function(_ad_link_gurobi tgt)
   if(NOT AD_ENABLE_GUROBI)
     return()
   endif()
 
   if(NOT GUROBI_ROOT)
-    # Default to the path you used previously; make it easy to override
     set(GUROBI_ROOT "/home/seman/gurobi1101/linux64" CACHE PATH "" FORCE)
   endif()
 
   set(_gurobi_inc "${GUROBI_ROOT}/include")
-  # Prefer shared .so, but allow static C++ archive
   set(_gurobi_lib "${GUROBI_ROOT}/lib")
 
   if(EXISTS "${_gurobi_inc}" AND EXISTS "${_gurobi_lib}")
     target_include_directories(${tgt} PRIVATE "${_gurobi_inc}")
-    # Typical names: libgurobi110.so + libgurobi_c++.a (matches your original)
-    target_link_libraries(${tgt} PRIVATE
-      "${_gurobi_lib}/libgurobi_c++.a"
-      "${_gurobi_lib}/libgurobi110.so"
-    )
-    # Ensure runtime can find libgurobi*.so
-    if(UNIX AND NOT APPLE)
-      set_property(TARGET ${tgt} APPEND PROPERTY
-        BUILD_RPATH "${_gurobi_lib}")
-      set_property(TARGET ${tgt} APPEND PROPERTY
-        INSTALL_RPATH "${_gurobi_lib}")
+    find_library(GUROBI_SHARED NAMES gurobi gurobi110 PATHS "${_gurobi_lib}")
+    find_library(GUROBI_CPPA  NAMES gurobi_c++            PATHS "${_gurobi_lib}")
+    if(GUROBI_SHARED AND GUROBI_CPPA)
+      target_link_libraries(${tgt} PRIVATE "${GUROBI_CPPA}" "${GUROBI_SHARED}")
+      if(UNIX AND NOT APPLE)
+        set_property(TARGET ${tgt} APPEND PROPERTY BUILD_RPATH  "${_gurobi_lib}")
+        set_property(TARGET ${tgt} APPEND PROPERTY INSTALL_RPATH "${_gurobi_lib}")
+      endif()
+    else()
+      message(WARNING "GUROBI libs not found under ${_gurobi_lib}")
     endif()
   else()
     message(WARNING "GUROBI not found at GUROBI_ROOT='${GUROBI_ROOT}'. "
@@ -178,182 +168,27 @@ function(_ad_link_gurobi tgt)
 endfunction()
 
 # ------------------------------------------------------------------
-# Helper: add a pybind11 module with common settings
-# ------------------------------------------------------------------
-function(ad_add_pybind_module name)
-    # Usage: ad_add_pybind_module(<name> src1.cpp src2.cpp ...)
-    set(_srcs ${ARGN})  # ARGN contains all arguments after 'name'
-    
-    # Only need ONE of these - pybind11_add_module creates the target
-    pybind11_add_module(${name} ${_srcs})
-    message(STATUS "Added pybind11 module: ${name} with sources: ${_srcs}")
-    
-    target_compile_features(${name} PRIVATE cxx_std_23)
-    
-    # Common include dirs (PRIVATE)
-    target_include_directories(${name}
-        PRIVATE
-        "${PROJECT_SOURCE_DIR}/src"
-    )
-    
-    # Common links
-    target_link_libraries(${name}
-        PRIVATE
-        fmt::fmt
-        Eigen3::Eigen
-    )
-    
-    if(AD_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
-        target_link_libraries(${name} PRIVATE OpenMP::OpenMP_CXX)
-    endif()
-    
-    # Nice warnings
-    if(MSVC)
-        target_compile_options(${name} PRIVATE /W4)
-    else()
-        target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
-    endif()
-endfunction()
-
-# ------------------------------------------------------------------
-# Helper: add a nanobind module with common settings
-# ------------------------------------------------------------------
-function(ad_add_nanobind_module name)
-    # Usage: ad_add_nanobind_module(<name> src1.cpp src2.cpp ...)
-    set(_srcs ${ARGN})
-
-    # Create the nanobind extension target
-    nanobind_add_module(${name} ${_srcs})
-    message(STATUS "Added nanobind module: ${name} with sources: ${_srcs}")
-
-    target_compile_features(${name} PRIVATE cxx_std_23)
-
-    # Common include dirs
-    target_include_directories(${name}
-        PRIVATE
-        "${PROJECT_SOURCE_DIR}/src"
-        ${Python3_INCLUDE_DIRS}
-    )
-
-    # Common links
-    target_link_libraries(${name}
-        PRIVATE
-        fmt::fmt
-        Eigen3::Eigen
-        Python3::Module          # provided by find_package(Python3 ... Development.Module)
-    )
-
-    if(AD_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
-        target_link_libraries(${name} PRIVATE OpenMP::OpenMP_CXX)
-    endif()
-
-    # Warnings / visibility similar to your pybind helper
-    if(MSVC)
-        target_compile_options(${name} PRIVATE /W4)
-    else()
-        target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
-    endif()
-endfunction()
-
-
-# ------------------------------------------------------------------
-# Core AD Python module
-# ------------------------------------------------------------------
-# Source list isolated; add/remove files here
-set(AD_SOURCES
-  src/ad_bindings.cpp
-  src/ad/Variable.cpp
-  src/ad/Expression.cpp
-  src/ad/ADGraph.cpp
-)
-
-ad_add_nanobind_module(ad ${AD_SOURCES})
-
-# External system libs specific to 'ad' (from original list)
-# Prefer target_link_libraries with plain names; avoid raw -L/-l unless needed.
-# If the system requires explicit search paths, you can add them via
-# target_link_directories(ad PRIVATE /usr/lib64 /usr/lib64/x86_64-linux-gnu)
-# but try to rely on the linker defaults first.
-target_link_libraries(ad PRIVATE
-  m
-  dl
-)
-
-set(L1_SOURCES
-        l1penalty/src/bindings.cpp
-        l1penalty/src/Solvers.cpp
-        l1penalty/src/PolynomialVector.cpp
-        l1penalty/src/pointWork.cpp
-        l1penalty/src/Overloads.cpp
-        l1penalty/src/l1Solver.cpp
-        l1penalty/src/Helpers.cpp
-        l1penalty/src/l1Fun.cpp
-        l1penalty/src/TRModel.cpp
-)
-
-# ------------------------------------------------------------------
-# Optional extra Python modules
-# ------------------------------------------------------------------
-if(AD_ENABLE_L1CORE)
-  ad_add_pybind_module(l1core ${L1_SOURCES})
-  ad_add_pybind_module(simplex_core src/simplex_bindings.cpp)
-endif()
-
-if(AD_ENABLE_PIQP)
-  ad_add_pybind_module(piqp_cpp src/piqp_bindings.cpp)
-endif()
-
-if(AD_ENABLE_AMDQG)
-  ad_add_pybind_module(amdqg src/amdqg_bindings.cpp)
-endif()
-
-if(AD_ENABLE_OSQP)
-  # osqp_cpp
-  ad_add_pybind_module(osqp_cpp src/osqp_bindings.cpp)
-endif()
-
-if(AD_ENABLE_QDLDL)
-  # qdldl_cpp
-  ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
-endif()
-
-ad_add_pybind_module(foretree src/foretree_pybind.cpp)
-ad_add_nanobind_module(chomp src/chomp.cpp)
-
-# ------------------------------------------------------------------
 # Optional: SuiteSparse / CHOLMOD (for HYKKTCholmodStrategy)
 # ------------------------------------------------------------------
-# ------------------------------------------------------------------
-# Optional: SuiteSparse / CHOLMOD (for HYKKTCholmodStrategy)
-# ------------------------------------------------------------------
-option(AD_ENABLE_CHOLMOD "Enable HYKKT via SuiteSparse CHOLMOD" ON)
-
 set(AD_USE_CHOLMOD OFF)
 set(AD_CHOLMOD_PROVIDER "")
-set(AD_CHOLMOD_INCLUDE_DIRS "")
-set(AD_CHOLMOD_LIBRARIES "")
-
 if(AD_ENABLE_CHOLMOD)
-  # Try modern SuiteSparse config packages first
-  find_package(SuiteSparse CONFIG)
+  # Prefer modern package configs
+  find_package(SuiteSparse CONFIG QUIET)
   if(TARGET SuiteSparse::cholmod)
     set(AD_USE_CHOLMOD ON)
     set(AD_CHOLMOD_PROVIDER "SuiteSparse::cholmod")
   else()
-    # Try a Cholmod config
-    find_package(Cholmod) # some distros expose Cholmod::Cholmod
-    if(TARGET Cholmod::Cholmod OR Cholmod_FOUND)
+    find_package(Cholmod QUIET) # some distros export Cholmod::Cholmod
+    if(TARGET Cholmod::Cholmod)
       set(AD_USE_CHOLMOD ON)
       set(AD_CHOLMOD_PROVIDER "Cholmod::Cholmod")
     else()
-      # Fallback: pkg-config
-      find_package(PkgConfi)
+      find_package(PkgConfig QUIET)
       if(PKG_CONFIG_FOUND)
-        pkg_check_modules(CHOLMOD cholmod)
+        pkg_check_modules(CHOLMOD QUIET cholmod)
         if(CHOLMOD_FOUND)
           set(AD_USE_CHOLMOD ON)
-          set(AD_CHOLMOD_INCLUDE_DIRS ${CHOLMOD_INCLUDE_DIRS})
-          set(AD_CHOLMOD_LIBRARIES    ${CHOLMOD_LINK_LIBRARIES})
           set(AD_CHOLMOD_PROVIDER "pkg-config:cholmod")
         endif()
       endif()
@@ -368,18 +203,154 @@ if(AD_ENABLE_CHOLMOD)
   endif()
 endif()
 
-# Helper: attach CHOLMOD + EIGEN_CHOLMOD_SUPPORT to a target
 function(ad_use_cholmod tgt)
-include_directories(/usr/include/suitesparse)
-
-    target_include_directories(${tgt} PRIVATE ${AD_CHOLMOD_INCLUDE_DIRS})
-    target_link_libraries(${tgt} PRIVATE -lcholmod)
-set(EIGEN_CHOLMOD_SUPPORT ON)
-
+  if(NOT AD_USE_CHOLMOD)
+    return()
+  endif()
+  if(AD_CHOLMOD_PROVIDER STREQUAL "SuiteSparse::cholmod")
+    target_link_libraries(${tgt} PRIVATE SuiteSparse::cholmod)
+    target_compile_definitions(${tgt} PRIVATE EIGEN_CHOLMOD_SUPPORT=1)
+  elseif(AD_CHOLMOD_PROVIDER STREQUAL "Cholmod::Cholmod")
+    target_link_libraries(${tgt} PRIVATE Cholmod::Cholmod)
+    target_compile_definitions(${tgt} PRIVATE EIGEN_CHOLMOD_SUPPORT=1)
+  else()
+    # pkg-config fallback
+    target_include_directories(${tgt} PRIVATE ${CHOLMOD_INCLUDE_DIRS})
+    target_link_libraries(${tgt} PRIVATE ${CHOLMOD_LINK_LIBRARIES})
+    target_compile_definitions(${tgt} PRIVATE EIGEN_CHOLMOD_SUPPORT=1)
+  endif()
 endfunction()
 
+# ------------------------------------------------------------------
+# Helpers to create Python extension modules
+# ------------------------------------------------------------------
+function(ad__common_target_setup tgt)
+  target_compile_features(${tgt} PRIVATE cxx_std_23)
+  target_include_directories(${tgt}
+    PRIVATE
+      "${PROJECT_SOURCE_DIR}/src"
+  )
+  target_link_libraries(${tgt}
+    PRIVATE
+      fmt::fmt
+      Eigen3::Eigen
+  )
+  if(AD_ENABLE_OPENMP AND OpenMP_CXX_FOUND)
+    target_link_libraries(${tgt} PRIVATE OpenMP::OpenMP_CXX)
+  endif()
+  if(AD_ENABLE_SPECTRA AND TARGET Spectra::Spectra)
+    target_link_libraries(${tgt} PRIVATE Spectra::Spectra)
+    target_compile_definitions(${tgt} PRIVATE AD_HAVE_SPECTRA=1)
+  endif()
+  if(MSVC)
+    target_compile_options(${tgt} PRIVATE /W4)
+  else()
+    target_compile_options(${tgt} PRIVATE -Wall -Wextra -Wpedantic -fvisibility=hidden)
+  endif()
+endfunction()
+
+function(ad_add_pybind_module name)
+  # Usage: ad_add_pybind_module(<name> src1.cpp src2.cpp ...)
+  set(_srcs ${ARGN})
+  pybind11_add_module(${name} ${_srcs})
+  message(STATUS "Added pybind11 module: ${name} with sources: ${_srcs}")
+  ad__common_target_setup(${name})
+endfunction()
+
+function(ad_add_nanobind_module name)
+  # Usage: ad_add_nanobind_module(<name> src1.cpp src2.cpp ...)
+  set(_srcs ${ARGN})
+  nanobind_add_module(${name} ${_srcs})
+  message(STATUS "Added nanobind module: ${name} with sources: ${_srcs}")
+  ad__common_target_setup(${name})
+  # nanobind modules need Python
+  target_link_libraries(${name} PRIVATE Python3::Module)
+endfunction()
+
+# ------------------------------------------------------------------
+# Targets
+# ------------------------------------------------------------------
+
+# Core AD Python module
+set(AD_SOURCES
+  src/ad_bindings.cpp
+  src/ad/Variable.cpp
+  src/ad/Expression.cpp
+  src/ad/ADGraph.cpp
+)
+ad_add_nanobind_module(ad ${AD_SOURCES})
+target_link_libraries(ad PRIVATE m dl)  # system libs where available
+_ad_link_gurobi(ad)                      # optional GUROBI
+
+# chomp (nanobind)
+ad_add_nanobind_module(chomp
+  src/chomp.cpp
+  src/ad/ADGraph.cpp
+  src/ad/Expression.cpp
+  src/ad/Variable.cpp
+)
 ad_use_cholmod(chomp)
-#ad_add_pybind_module(lbl_cpp src/lbl_bindings.cpp)
+_ad_link_gurobi(chomp)
+
+find_package(TBB COMPONENTS tbb)
+if(TARGET TBB::tbb)
+  target_link_libraries(chomp PRIVATE TBB::tbb)
+else()
+  message(WARNING "oneTBB not found. Building foreforest without parallel backend.")
+  target_compile_definitions(chomp PRIVATE FF_NO_TBB)
+endif()
+
+if(TARGET TBB::tbb)
+  target_link_libraries(ad PRIVATE TBB::tbb)
+else()
+  message(WARNING "oneTBB not found. Building foreforest without parallel backend.")
+  target_compile_definitions(ad PRIVATE FF_NO_TBB)
+endif()
+
+# foretree (pybind11)
+ad_add_pybind_module(foretree src/foretree_pybind.cpp)
+
+# foreforest (pybind11 + optional oneTBB)
+ad_add_pybind_module(foreforest src/foreforest.cpp)
+find_package(TBB QUIET COMPONENTS tbb)
+if(TARGET TBB::tbb)
+  target_link_libraries(foreforest PRIVATE TBB::tbb)
+else()
+  message(WARNING "oneTBB not found. Building foreforest without parallel backend.")
+  target_compile_definitions(foreforest PRIVATE FF_NO_TBB)
+endif()
+
+# Optional modules
+if(AD_ENABLE_L1CORE)
+  ad_add_pybind_module(l1core
+    l1penalty/src/bindings.cpp
+    l1penalty/src/Solvers.cpp
+    l1penalty/src/PolynomialVector.cpp
+    l1penalty/src/pointWork.cpp
+    l1penalty/src/Overloads.cpp
+    l1penalty/src/l1Solver.cpp
+    l1penalty/src/Helpers.cpp
+    l1penalty/src/l1Fun.cpp
+    l1penalty/src/TRModel.cpp
+  )
+  ad_add_pybind_module(simplex_core src/simplex_bindings.cpp)
+endif()
+
+if(AD_ENABLE_PIQP)
+  ad_add_pybind_module(piqp_cpp src/piqp_bindings.cpp)
+endif()
+
+if(AD_ENABLE_AMDQG)
+  ad_add_pybind_module(amdqg src/amdqg_bindings.cpp)
+endif()
+
+if(AD_ENABLE_OSQP)
+  ad_add_pybind_module(osqp_cpp src/osqp_bindings.cpp)
+endif()
+
+if(AD_ENABLE_QDLDL)
+  ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
+endif()
 
 # ------------------------------------------------------------------
 # Summary
@@ -387,10 +358,16 @@ ad_use_cholmod(chomp)
 message(STATUS "==== Build summary ====")
 message(STATUS "C++ Standard          : C++${CMAKE_CXX_STANDARD}")
 message(STATUS "Python3               : ${Python3_EXECUTABLE} (${Python3_VERSION})")
-message(STATUS "pybind11              : ${pybind11_VERSION}")
-message(STATUS "Eigen3                : ${Eigen3_VERSION}")
+if(DEFINED pybind11_VERSION)
+  message(STATUS "pybind11              : ${pybind11_VERSION}")
+endif()
+if(DEFINED Eigen3_VERSION)
+  message(STATUS "Eigen3                : ${Eigen3_VERSION}")
+endif()
 message(STATUS "OpenMP enabled        : ${AD_ENABLE_OPENMP} (found: ${OpenMP_CXX_FOUND})")
+message(STATUS "Enable Spectra        : ${AD_ENABLE_SPECTRA}")
 message(STATUS "Build piqp_cpp        : ${AD_ENABLE_PIQP}")
 message(STATUS "Build osqp_cpp        : ${AD_ENABLE_OSQP}")
 message(STATUS "Build qdldl_cpp       : ${AD_ENABLE_QDLDL}")
 message(STATUS "Link GUROBI           : ${AD_ENABLE_GUROBI} (root: ${GUROBI_ROOT})")
+message(STATUS "CHOLMOD enabled       : ${AD_ENABLE_CHOLMOD} (use: ${AD_USE_CHOLMOD})")

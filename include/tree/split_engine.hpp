@@ -154,90 +154,17 @@ struct ExactBackend {
   static constexpr bool supports_kway    = false;
   static constexpr bool supports_oblique = true;
 
+  // Now fully delegated to AxisSplitFinder exact-mode API
   static Candidate best_axis(const SplitContext& ctx,
                              const float* Xraw, int P,
                              const int* node_idx, int nidx,
                              int missing_policy,
                              const uint8_t* miss_mask) {
-    Candidate best; best.kind = SplitKind::Axis; best.thr = -1;
-    best.gain = -std::numeric_limits<double>::infinity();
-    if (!Xraw || !ctx.row_g || !ctx.row_h || nidx <= 1) return best;
-
-    std::vector<std::pair<float,int>> col; col.reserve(nidx);
-
-    for (int f = 0; f < P; ++f) {
-      col.clear();
-      int Cm = 0; // total missing count at node for feature f
-      for (int ii = 0; ii < nidx; ++ii) {
-        const int r = node_idx[ii];
-        const size_t off = (size_t)r*(size_t)P + (size_t)f;
-        const bool miss = miss_mask ? (miss_mask[off] != 0)
-                                    : !std::isfinite(Xraw[off]);
-        if (!miss) col.emplace_back(Xraw[off], r);
-        else       ++Cm;
-      }
-      const int n_valid = (int)col.size();
-      const int n_total = n_valid + Cm;
-      if (n_valid < ctx.hyp.min_samples_leaf || n_valid < 2) continue;
-
-      std::sort(col.begin(), col.end(),
-                [](const auto& a, const auto& b){ return a.first < b.first; });
-
-      const double Gm = (ctx.Gmiss ? ctx.Gmiss[f] : 0.0);
-      const double Hm = (ctx.Hmiss ? ctx.Hmiss[f] : 0.0);
-      const bool has_miss = ctx.has_missing && (Cm > 0);
-
-      double GL = 0.0, HL = 0.0; int nL = 0;
-      const int8_t mono = (ctx.monotone && f < (int)ctx.monotone->size()) ? (*ctx.monotone)[f] : 0;
-
-      for (int k = 0; k < n_valid - 1; ++k) {
-        const int r = col[k].second;
-        GL += (double)ctx.row_g[r];
-        HL += (double)ctx.row_h[r];
-        ++nL;
-
-        const float v  = col[k].first;
-        const float vp = col[k+1].first;
-        if (!(v < vp)) continue; // need strict separation
-
-        auto eval_dir = [&](bool miss_left){
-          double GLL = GL, HLL = HL; int nLL = nL;
-          if (miss_left && has_miss) { GLL += Gm; HLL += Hm; nLL += Cm; }
-          const double GRR = ctx.Gp - GLL;
-          const double HRR = ctx.Hp - HLL;
-          const int    nRR = n_total - nLL;
-          if (!SplitUtils::monotone_ok(mono, GLL, HLL, GRR, HRR, ctx.hyp))
-            return -std::numeric_limits<double>::infinity();
-          return SplitUtils::split_gain(ctx.Gp, ctx.Hp, GLL, HLL, nLL, nRR, ctx.hyp);
-        };
-
-        double gain; bool miss_left_pick = true;
-        if (missing_policy == 1) {
-          gain = eval_dir(true);
-          miss_left_pick = true;
-        } else if (missing_policy == 2) {
-          gain = eval_dir(false);
-          miss_left_pick = false;
-        } else {
-          const double gL = eval_dir(true);
-          const double gR = eval_dir(false);
-          if (gL >= gR) { gain = gL; miss_left_pick = true; }
-          else          { gain = gR; miss_left_pick = false; }
-        }
-
-        if (gain > best.gain) {
-          best.gain      = gain;
-          best.kind      = SplitKind::Axis;
-          best.feat      = f;
-          best.thr       = k;           // rank among sorted valid samples
-          best.miss_left = miss_left_pick;
-          // Optional: best.split_value = 0.5*(double(v)+double(vp));
-        }
-      }
-    }
-    return best;
+    AxisSplitFinder finder;
+    return finder.best_axis_exact(ctx, Xraw, P, node_idx, nidx, missing_policy, miss_mask);
   }
 
+  // Oblique remains delegated to ObliqueSplitFinder (exact uses ctx columns)
   static Candidate best_oblique(const SplitContext& ctx,
                                 int k_features,
                                 double ridge,
