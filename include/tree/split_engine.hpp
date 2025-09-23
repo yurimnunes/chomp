@@ -8,7 +8,7 @@
 #include <type_traits>
 
 #include "split_finder.hpp"  // AxisSplitFinder, CategoricalKWaySplitFinder, ObliqueSplitFinder
-                             // SplitHyper, SplitContext, Candidate, SplitKind
+                             // SplitHyper, foretree::splitx::SplitContext, foretree::splitx::Candidate, foretree::splitx::SplitKind
 
 namespace foretree {
 
@@ -100,13 +100,13 @@ struct SplitEngineConfig {
 //     static constexpr bool supports_kway    = ...;
 //     static constexpr bool supports_oblique = ...;
 //
-//     static Candidate best_axis(const SplitContext&);
+//     static foretree::splitx::Candidate best_axis(const foretree::splitx::SplitContext&);
 //
 //     // Only if supports_kway == true
-//     static Candidate best_kway(const SplitContext&, int max_groups);
+//     static foretree::splitx::Candidate best_kway(const foretree::splitx::SplitContext&, int max_groups);
 //
 //     // Only if supports_oblique == true
-//     static Candidate best_oblique(const SplitContext&,
+//     static foretree::splitx::Candidate best_oblique(const foretree::splitx::SplitContext&,
 //                                   int k_features, double ridge,
 //                                   double axis_guard_gain /*may be < 0*/,
 //                                   // Exact-only extras (ignored by Histogram):
@@ -123,18 +123,18 @@ struct HistogramBackend {
   static constexpr bool supports_kway    = true;
   static constexpr bool supports_oblique = true;  // histogram-backed oblique via bin centers
 
-  static Candidate best_axis(const SplitContext& ctx) {
+  static foretree::splitx::Candidate best_axis(const foretree::splitx::SplitContext& ctx) {
     AxisSplitFinder finder;
     return finder.best_axis(ctx);
   }
 
-  static Candidate best_kway(const SplitContext& ctx, int max_groups) {
+  static foretree::splitx::Candidate best_kway(const foretree::splitx::SplitContext& ctx, int max_groups) {
     CategoricalKWaySplitFinder finder;
     finder.max_groups = std::max(2, max_groups);
     return finder.best_kway(ctx);
   }
 
-  static Candidate best_oblique(const SplitContext& ctx,
+  static foretree::splitx::Candidate best_oblique(const foretree::splitx::SplitContext& ctx,
                                 int k_features,
                                 double ridge,
                                 double /*axis_guard_gain*/ = -1.0,
@@ -155,7 +155,7 @@ struct ExactBackend {
   static constexpr bool supports_oblique = true;
 
   // Now fully delegated to AxisSplitFinder exact-mode API
-  static Candidate best_axis(const SplitContext& ctx,
+  static foretree::splitx::Candidate best_axis(const foretree::splitx::SplitContext& ctx,
                              const float* Xraw, int P,
                              const int* node_idx, int nidx,
                              int missing_policy,
@@ -165,7 +165,7 @@ struct ExactBackend {
   }
 
   // Oblique remains delegated to ObliqueSplitFinder (exact uses ctx columns)
-  static Candidate best_oblique(const SplitContext& ctx,
+  static foretree::splitx::Candidate best_oblique(const foretree::splitx::SplitContext& ctx,
                                 int k_features,
                                 double ridge,
                                 double axis_guard_gain = -1.0,
@@ -173,7 +173,7 @@ struct ExactBackend {
                                 const int* /*node_idx*/ = nullptr, int /*nidx*/ = 0,
                                 int /*missing_policy*/ = 0, const uint8_t* /*miss*/ = nullptr) {
     if (!ctx.Xcols || !ctx.row_g || !ctx.row_h || ctx.N <= 0) {
-      Candidate c; c.kind = SplitKind::Oblique;
+      foretree::splitx::Candidate c; c.kind = foretree::splitx::SplitKind::Oblique;
       c.gain = -std::numeric_limits<double>::infinity();
       return c;
     }
@@ -191,16 +191,16 @@ struct Splitter {
   // --------------------- PRESERVE ALL EXISTING APIs -------------------------
   
   // Legacy API 1: Simple 2-parameter call
-  static inline Candidate best_split(const SplitContext& ctx, SplitEngine eng) {
+  static inline foretree::splitx::Candidate best_split(const foretree::splitx::SplitContext& ctx, SplitEngine eng) {
     if (eng == SplitEngine::Histogram) return HistogramBackend::best_axis(ctx);
     // For Exact legacy call we cannot run without the raw arrays; return invalid.
-    Candidate c; c.kind = SplitKind::Axis;
+    foretree::splitx::Candidate c; c.kind = foretree::splitx::SplitKind::Axis;
     c.gain = -std::numeric_limits<double>::infinity();
     return c;
   }
 
   // Legacy API 2: Exact with full raw parameters (PRESERVE EXACTLY)
-  static inline Candidate best_split(const SplitContext& ctx, SplitEngine eng,
+  static inline foretree::splitx::Candidate best_split(const foretree::splitx::SplitContext& ctx, SplitEngine eng,
                                      const float* Xraw, int P,
                                      const int* node_idx, int nidx,
                                      int missing_policy, const uint8_t* miss_mask) {
@@ -210,7 +210,7 @@ struct Splitter {
 
   // --------------------------- NEW Enhanced APIs --------------------------------
   template <class Backend>
-  static Candidate best_split_with_backend(const SplitContext& ctx,
+  static foretree::splitx::Candidate best_split_with_backend(const foretree::splitx::SplitContext& ctx,
                                            const SplitEngineConfig& cfg,
                                            // Exact-only extras (ignored by Histogram):
                                            const float* Xraw = nullptr, int P = 0,
@@ -218,10 +218,10 @@ struct Splitter {
                                            int missing_policy = 0,
                                            const uint8_t* miss_mask = nullptr)
   {
-    Candidate best; best.gain = -std::numeric_limits<double>::infinity();
+    foretree::splitx::Candidate best; best.gain = -std::numeric_limits<double>::infinity();
 
     // 1) Axis
-    Candidate axis; axis.gain = -std::numeric_limits<double>::infinity();
+    foretree::splitx::Candidate axis; axis.gain = -std::numeric_limits<double>::infinity();
     if (cfg.enable_axis) {
       if constexpr (std::is_same_v<Backend, HistogramBackend>) {
         axis = Backend::best_axis(ctx);
@@ -231,7 +231,7 @@ struct Splitter {
     }
 
     // 2) K-way (only if supported by backend)
-    Candidate kway; kway.gain = -std::numeric_limits<double>::infinity();
+    foretree::splitx::Candidate kway; kway.gain = -std::numeric_limits<double>::infinity();
     if constexpr (Backend::supports_kway) {
       if (cfg.enable_kway) {
         kway = Backend::best_kway(ctx, cfg.kway_max_groups);
@@ -239,7 +239,7 @@ struct Splitter {
     }
 
     // 3) Oblique (optional; only if supported)
-    Candidate obli; obli.gain = -std::numeric_limits<double>::infinity();
+    foretree::splitx::Candidate obli; obli.gain = -std::numeric_limits<double>::infinity();
     if constexpr (Backend::supports_oblique) {
       if (cfg.enable_oblique) {
         const double guard = (axis.gain > 0.0) ? axis.gain : -1.0;
@@ -256,20 +256,20 @@ struct Splitter {
       }
     }
 
-    // 4) Pick max-gain among enabled candidates
+    // 4) Pick max-gain among enabled foretree::splitx::Candidates
     best = axis;
     if (kway.gain > best.gain) best = kway;
     if (obli.gain > best.gain) best = obli;
 
     if (!std::isfinite(best.gain)) {
-      best.kind = SplitKind::Axis;
+      best.kind = foretree::splitx::SplitKind::Axis;
       best.gain = -std::numeric_limits<double>::infinity();
     }
     return best;
   }
 
   // New API: Enhanced with config
-  static Candidate best_split(const SplitContext& ctx,
+  static foretree::splitx::Candidate best_split(const foretree::splitx::SplitContext& ctx,
                               SplitEngine backend,
                               const SplitEngineConfig& cfg,
                               const float* Xraw = nullptr, int P = 0,

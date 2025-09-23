@@ -1,20 +1,30 @@
 #pragma once
 #include "Definitions.h"
+
 #include <algorithm>
 #include <functional>
+#include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "../../third_party/robin_map.h"
+#include "../../third_party/robin_set.h"
+
+// ============================== Forward decls ================================
 struct Variable;
 using VariablePtr = std::shared_ptr<Variable>;
 
 struct ADNode;
 using ADNodePtr = std::shared_ptr<ADNode>;
 
-// Input validation helpers
+struct ADGraph;
+using ADGraphPtr = std::shared_ptr<ADGraph>;
+
+// ============================ Validation helpers =============================
 inline bool validate_unary_inputs(const std::vector<ADNodePtr> &inputs,
                                   const std::string &op_name) {
     if (inputs.size() != 1) {
@@ -47,7 +57,7 @@ inline bool validate_binary_inputs(const std::vector<ADNodePtr> &inputs,
     return true;
 }
 
-// Reset-on-epoch-change (for accumulators like gradients)
+// ============================== Epoch helpers ================================
 static inline double &ensure_epoch_zero(double &x, unsigned &e, unsigned cur) {
     if (e != cur) {
         x = 0.0;
@@ -55,14 +65,10 @@ static inline double &ensure_epoch_zero(double &x, unsigned &e, unsigned cur) {
     }
     return x;
 }
-
-// Just advance epoch, do NOT modify x (for cached values you want to keep)
 static inline void touch_epoch(unsigned &e, unsigned cur) {
     if (e != cur)
         e = cur;
 }
-
-// Helper for setting values with epoch update (for computed values)
 static inline double &set_epoch_value(double &x, unsigned &e, unsigned cur,
                                       double new_val) {
     x = new_val;
@@ -70,76 +76,207 @@ static inline double &set_epoch_value(double &x, unsigned &e, unsigned cur,
     return x;
 }
 
-#include "../../third_party/robin_map.h"
-
+// ================================= ADNode ====================================
 struct ADNode {
     Operator type = Operator::NA;
     std::string name;
+
+    // AoS “legacy” scalar slots — kept for compatibility
     double value = 0.0;
     double gradient = 0.0;
-    double dot = 0.0;      // tangent for forward-mode
-    double grad_dot = 0.0; // derivative of gradient along dot
-    int order = -1;        // for vectorized gradient output
+    double dot = 0.0;      // single-lane legacy view (lane 0)
+    double grad_dot = 0.0; // single-lane legacy view (lane 0)
+    int order = -1;
 
-    // Epochs for lazy reset
+    // Epochs (lazy reset)
     unsigned val_epoch = 0;
     unsigned grad_epoch = 0;
-    unsigned dot_epoch = 0;
-    unsigned gdot_epoch = 0;
+    unsigned dot_epoch = 0;  // (lane 0)
+    unsigned gdot_epoch = 0; // (lane 0)
 
     std::vector<ADNodePtr> inputs;
 
-    void addInput(const ADNodePtr &inputNode);
+    void addInput(const ADNodePtr &inputNode) { inputs.push_back(inputNode); }
 
-    // (Legacy) function slots kept for compatibility; unused now.
+    // Legacy compatibility placeholders
     std::function<void()> backwardOperation = nullptr;
     std::function<void()> backwardOperationHVP = nullptr;
 
-    // define lb
+    // Optional variable bounds
     double lb = -std::numeric_limits<double>::infinity();
-    // define ub
     double ub = std::numeric_limits<double>::infinity();
 
-    NLP nlpType = NLP::NA; // for classifying nonlinear types
+    NLP nlpType = NLP::NA;
+    int id = -1; // unique id in graph (debug)
 };
 
-struct ADGraph;
-using ADGraphPtr = std::shared_ptr<ADGraph>;
+// ============================== Graph cache ==================================
+struct GraphCache {
+    bool dirty = true;
 
+    // Stable integer ids per node
+    tsl::robin_map<const ADNode *, int> id_of; // node* -> id
+    std::vector<ADNode *> by_id;               // id   -> node*
+    std::vector<int> free_ids;
+    int next_id = 0;
+
+    // Adjacency (parents -> children) and reverse
+    std::vector<tsl::robin_set<int>> adj;
+    std::vector<tsl::robin_set<int>> radj;
+    std::vector<int> indeg;
+
+    // Global topological order (ids)
+    std::vector<ADNode *> topo;
+
+    // Incremental maintenance
+    std::unordered_set<const ADNode *> dirty_nodes;
+
+    // Heuristics
+    size_t full_rebuild_threshold_nodes = 10000;
+    double full_rebuild_dirty_ratio = 0.25;
+};
+
+// ================================= ADGraph ===================================
 struct ADGraph {
-    bool hvp_add_first_order_ = true; // default for single-lane path
+    // ----------------------- Config / cache / public fields
+    // -------------------
+    bool hvp_add_first_order_ = true; // keep single-lane behavior
+    GraphCache cache_;
 
-    // ---- Construction / maintenance
+    std::vector<ADNodePtr> nodes;
+    tsl::robin_map<std::string, ADNodePtr> nodeVariables;
+
+    // Global epochs
+    unsigned cur_val_epoch_ = 1;
+    unsigned cur_grad_epoch_ = 1;
+    unsigned cur_dot_epoch_ = 1;
+    unsigned cur_gdot_epoch_ = 1;
+
+    // --------------------------- LANE STORAGE (minimal)
+    // ----------------------- Only the hot lane data for HVP batching: dot and
+    // gdot
+    struct Lanes {
+        size_t n = 0, L = 1;           // nodes, lanes
+        std::vector<double> dot;       // size n*L, layout: l + L*i
+        std::vector<double> gdot;      // size n*L
+        std::vector<unsigned> dot_ep;  // size n*L (lazy reset)
+        std::vector<unsigned> gdot_ep; // size n*L
+
+        inline size_t idx(size_t i, size_t l) const { return l + L * i; }
+
+        void allocate(size_t n_, size_t L_) {
+            n = n_;
+            L = std::max<size_t>(1, L_);
+            dot.assign(n * L, 0.0);
+            gdot.assign(n * L, 0.0);
+            dot_ep.assign(n * L, 0);
+            gdot_ep.assign(n * L, 0);
+        }
+        inline size_t base(int uid) const noexcept {
+            // uid is guaranteed >= 0 after rebuild; if not, guard or cast
+            // carefully
+            return static_cast<size_t>(uid) * L;
+        }
+
+    } lanes_; // hot multi-RHS buffers
+
+    size_t lanes_count_ = 1;
+
+    // ------------------------ Lane API (inline helpers)
+    // -----------------------
+    inline void set_num_lanes(size_t k) {
+        lanes_count_ = std::max<size_t>(1, k);
+        ensureLaneBuffers_();
+    }
+    inline size_t lanes() const { return lanes_count_; }
+
+    inline void resetTangentsLane(size_t l) {
+        if (l >= lanes_.L)
+            return;
+        const size_t n = lanes_.n;
+        const size_t off = lanes_.idx(0, l);
+        std::fill_n(lanes_.dot.begin() + off, n, 0.0);
+        std::fill_n(lanes_.dot_ep.begin() + off, n, cur_dot_epoch_);
+    }
+    inline void resetGradDotLane(size_t l) {
+        if (l >= lanes_.L)
+            return;
+        const size_t n = lanes_.n;
+        const size_t off = lanes_.idx(0, l);
+        std::fill_n(lanes_.gdot.begin() + off, n, 0.0);
+        std::fill_n(lanes_.gdot_ep.begin() + off, n, cur_gdot_epoch_);
+    }
+
+    void resetTangents() { resetTangentsAll(); }
+    void resetGradDot() { resetGradDotAll(); }
+    void initiateBackwardPassHVP() { initiateBackwardPassFusedLanes(); }
+    inline void resetTangentsAll() {
+        std::fill(lanes_.dot.begin(), lanes_.dot.end(), 0.0);
+        std::fill(lanes_.dot_ep.begin(), lanes_.dot_ep.end(), cur_dot_epoch_);
+    }
+    inline void resetGradDotAll() {
+        std::fill(lanes_.gdot.begin(), lanes_.gdot.end(), 0.0);
+        std::fill(lanes_.gdot_ep.begin(), lanes_.gdot_ep.end(),
+                  cur_gdot_epoch_);
+    }
+
+    // ----------------------------- Topology APIs
+    // ------------------------------
+    int ensure_id_(const ADNode *n);
+    void release_id_(int id);
+    void link_edge_(int pid, int cid);
+    void unlink_edge_(int pid, int cid);
+
+    void markDirty_();
+    void markDirty_(ADNode *n);
+    void rebuildCacheFull_();
+    void refreshIncremental_();
+
+    void collectForward_(const std::vector<int> &starts,
+                         std::vector<char> &in_aff,
+                         std::vector<int> &aff) const;
+    void removeFromTopo_(const std::vector<char> &in_aff);
+    bool topoForAffected_(const std::vector<int> &affected,
+                          std::vector<int> &topo_aff) const;
+    void spliceAffected_(const std::vector<int> &affected,
+                         const std::vector<int> &topo_aff);
+
+    // ------------------------- Graph construction APIs
+    // ------------------------
     void deleteNode(const ADNodePtr &node);
     void addNode(const ADNodePtr &node);
     void makeNodesUnique();
 
-    // ---- Introspection
+    // ---------------------------- Introspection
+    // -------------------------------
     std::string getExpression(const ADNodePtr &node);
     void printTree(const ADNodePtr &node, int depth = 0);
     std::vector<ADNodePtr> findRootNodes() const;
 
-    // ---- Forward
-    void computeForwardPass();
+    // -------------------------- Scalar forward/grad
+    // ---------------------------
+    void computeForwardPass(); // AoS compat
     void computeNodeValue(const ADNodePtr &node,
                           std::unordered_set<ADNodePtr> &visited);
     void resetForwardPass();
 
-    // ---- Reverse (gradients)
     void initiateBackwardPass(const ADNodePtr &outputNode);
     void resetGradients();
 
-    // ---- Public Gradient API
+    // void computeForwardPassWithDot(); // AoS compat
+    void initiateBackwardPassFused(); // AoS compat
+
+    // --------------------------- Gradient utilities
+    // ---------------------------
     tsl::robin_map<std::string, double>
     computePartialDerivatives(const ADNodePtr &expr);
-
     ADNodePtr getNode(const std::string &name);
     double getGradientOfVariable(const VariablePtr &var, const ADNodePtr &expr);
     double evaluate(const ADNodePtr &expr);
     void initializeNodeVariables();
     std::vector<double> getGradientVector(const ADNodePtr &expr);
 
-    // ---- Rebuild graph (unique variables)
+    // ------------------------------ Subgraphs --------------------------------
     std::tuple<ADGraphPtr, tsl::robin_map<std::string, ADNodePtr>>
     rebuildGraphWithUniqueVariables(const ADNodePtr &rootNode);
     void collectNodes(const ADNodePtr &start,
@@ -147,65 +284,56 @@ struct ADGraph {
                       std::unordered_set<ADNodePtr> &vis,
                       tsl::robin_map<std::string, ADNodePtr> &vars);
 
-    // ---- HVP (forward-over-reverse)
-    void resetTangents();
-    void resetGradDot();
-    void computeForwardPassWithDot();
-    void initiateBackwardPassHVP();
-    void initiateBackwardPassFused();
-    std::vector<double> hessianVectorProduct(const ADNodePtr &outputNode,
-                                             const std::vector<double> &v);
-    std::vector<std::vector<double>> computeHessianDense(const ADNodePtr &y);
-
-    // ---- Adopt external subgraph (registers variables)
     void adoptSubgraph(const ADNodePtr &root);
 
-    // ---- Public fields (existing)
-    std::vector<ADNodePtr> nodes;
-    tsl::robin_map<std::string, ADNodePtr> nodeVariables;
+    // =========================== HVP / Hessian API
+    // ============================ Legacy single-RHS entry
+    std::vector<double> hessianVectorProduct(const ADNodePtr &outputNode,
+                                             const std::vector<double> &v);
 
-    // ===== Epoch counters for lazy reset =====
-    unsigned cur_val_epoch_ = 1;
-    unsigned cur_grad_epoch_ = 1;
-    unsigned cur_dot_epoch_ = 1;
-    unsigned cur_gdot_epoch_ = 1;
+    // Dense Hessian (slow path)
+    std::vector<std::vector<double>> computeHessianDense(const ADNodePtr &y);
 
-    void computeForwardPassWithDotFused() ;
+    // NEW: multi-RHS entry for batched HVP
+    // Layout expected for V_ptr/Y_ptr: lane-inner contiguous for each node:
+    // element (node i, lane l) is at address base + (l + L*i).
+    void hessianMultiVectorProduct(const ADNodePtr &outputNode,
+                                   const double *V_ptr, size_t ldV, // ldV == L
+                                   double *Y_ptr, size_t ldY,       // ldY == L
+                                   size_t k);
+
+    // ====================== Lane-aware fused passes (impl in .cpp) ===========
+    // Forward: assumes primals (AoS) are up-to-date; propagates all lanes' dot.
+    void computeForwardPassWithDotLanes();
+    // Reverse: seeds grad[root]=1, gdot[root,l]=0; accumulates into gdot lanes.
+    void initiateBackwardPassFusedLanes();
 
 private:
-    // ===== Cached topology (rebuilt only when graph mutates) =====
-    struct Cache {
-        std::vector<ADNode *> topo;             // forward order
-        std::vector<std::vector<ADNode *>> out; // children (by index)
-        // std::unordered_map<ADNode *, int> id_of; // raw* -> id
-        tsl::robin_map<ADNode *, int> id_of; // or as a member
-    std::vector<std::vector<ADNode*>> levels; // NEW: levelized topological layers
+    // Allocate lane buffers to current graph size/lanes_count_
+    inline void ensureLaneBuffers_() {
+        const size_t n =
+            cache_.by_id.empty() ? nodes.size() : cache_.by_id.size();
+        lanes_.allocate(n, lanes_count_);
+    }
 
-        bool dirty = true;
-    } cache_;
+    // Node kernels (per-node outer loop, inner loop over lanes)
+    void fused_forward_dot_kernel_lanes_(int uid);
+    void fused_backward_kernel_lanes_(int uid);
 
-    void fused_forward_dot_kernel_(ADNode* u);
-    void fused_backward_kernel_(ADNode* u);
-
-    void markDirty_();
+    // Rebuild & utilities
     void rebuildCache_();
-
-    // Additional optimization: check for cycles without full rebuild
     bool hasCycles() const;
-    // Add a comprehensive node name index
-    std::unordered_map<std::string, ADNodePtr> nodeIndex_;
 
+    std::unordered_map<std::string, ADNodePtr> nodeIndex_;
     void updateNodeIndex_();
 
     enum class NodeColor { WHITE, GRAY, BLACK };
-
-    // DFS-based topological sort with cycle detection
     bool dfsTopoSort_(int nodeId, std::vector<NodeColor> &colors,
                       std::vector<ADNode *> &topoOrder,
                       const std::vector<std::vector<int>> &adjList);
-
     bool buildTopoOrderDFS_();
 
+    // Convenience exec helpers (scalar/AoS — unchanged)
     void executeUnaryOp(ADNode *node, std::function<double(double)> forward_fn,
                         std::function<double(double)> backward_fn = nullptr) {
         if (!validate_unary_inputs(node->inputs, "unary op"))
@@ -226,7 +354,7 @@ private:
     }
 };
 
-// Prefer the first non-null graph, else create one.
+// ============================ pick_graph helper ==============================
 inline ADGraphPtr pick_graph(const ADGraphPtr &a,
                              const ADGraphPtr &b = nullptr) {
     if (a)

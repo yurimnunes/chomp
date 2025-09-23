@@ -358,26 +358,39 @@ class Model:
         res: dict[str, object] = {}
 
         # ---------- objective ----------
-        if "f" in want_set:
-            try:
-                fv = float(self.f_grad.value(x))  # same tape as f_grad
-            except Exception:
-                fv = float("inf")
-            if not np.isfinite(fv):
-                fv = float("inf")
-            res["f"] = fv
+        if "f" in want_set or "g" in want_set or "H" in want_set:
+            val, grad = self.f_grad.value_grad(x)  # fused call
+            res["f"] = val
+            res["g"] = grad
+            
+        else:
+            if "f" in want_set:
+                start_time = time.time()
+                try:
+                    fv = float(self.f_grad.value(x))  # same tape as f_grad
+                except Exception:
+                    fv = float("inf")
+                if not np.isfinite(fv):
+                    fv = float("inf")
+                res["f"] = fv
+                end_time = time.time()
+                print(f"Objective eval time: {end_time - start_time:.6f} seconds")
 
-        if "g" in want_set:
-            try:
-                g = self.f_grad(x)
-                # g = g if isinstance(g, np.ndarray) and g.dtype == float else _as_float_array(g)
-                if not np.isfinite(g).all():
+            if "g" in want_set:
+                start_time = time.time()
+                try:
+                    g = self.f_grad(x)
+                    # g = g if isinstance(g, np.ndarray) and g.dtype == float else _as_float_array(g)
+                    if not np.isfinite(g).all():
+                        g = np.zeros(n, dtype=float)
+                except Exception:
                     g = np.zeros(n, dtype=float)
-            except Exception:
-                g = np.zeros(n, dtype=float)
-            res["g"] = g
+                res["g"] = g
+                end_time = time.time()
+                print(f"Gradient eval time: {end_time - start_time:.6f} seconds")
 
         if "H" in want_set:
+            start_time = time.time()
             try:
                 H = self.f_hess(x)
                 if sp.issparse(H):
@@ -399,11 +412,14 @@ class Model:
                 res["H"] = (
                     sp.eye(n, format="csr") if use_sparse else np.eye(n, dtype=float)
                 )
+            end_time = time.time()
+            print(f"Hessian eval time: {end_time - start_time:.6f} seconds")
 
         # ---------- constraints: fused loops ----------
         # Inequalities
         haveI = mI > 0 and (("cI" in want_set) or ("JI" in want_set))
         if haveI:
+            start_time = time.time()
             cI_vals = None
             JI_rows = None
             try:
@@ -414,12 +430,12 @@ class Model:
                 # single pass
                 for i, gi in enumerate(self.cI_grads):
                     if cI_vals is not None:
-                        cI_vals[i] = float(gi.value(x))
+                        cI_vals[i] = gi.value(x)
                     if JI_rows is not None:
                         row = gi(x)
                         JI_rows[i, :] = row
                 if cI_vals is not None:
-                    res["cI"] = _finite_or_zero(cI_vals)
+                    res["cI"] = cI_vals
                 if JI_rows is not None:
                     if self.use_sparse:
                         JI = sp.csr_matrix(JI_rows)  # one conversion
@@ -428,7 +444,7 @@ class Model:
                             JI_rows  # keep dense view for downstream use
                         )
                     else:
-                        res["JI"] = _finite_or_zero(JI_rows)
+                        res["JI"] = JI_rows
                         self._dense_JI_cache = res["JI"]  # type: ignore[assignment]
             except Exception:
                 if "cI" in want_set:
@@ -440,6 +456,8 @@ class Model:
                         else np.zeros((mI, n), dtype=float)
                     )
                 self._dense_JI_cache = None
+            end_time = time.time()
+            print(f"Inequality eval time: {end_time - start_time:.6f} seconds")
 
         else:
             if "cI" in want_set:
@@ -453,27 +471,40 @@ class Model:
         if haveE:
             cE_vals = None
             JE_rows = None
+            start_time = time.time()
             try:
                 if "cE" in want_set:
                     cE_vals = np.empty(self.m_eq, dtype=float)
                 if "JE" in want_set:
                     JE_rows = np.empty((self.m_eq, n), dtype=float)
-                for j, ge in enumerate(self.cE_grads):
-                    if cE_vals is not None:
-                        cE_vals[j] = float(ge.value(x))
-                    if JE_rows is not None:
-                        row = ge(x)
-                        JE_rows[j, :] = row
+                
+                if "cE" in want_set or "JE" in want_set:
+                    for j, ge in enumerate(self.cE_grads):
+                        val, row = ge.value_grad(x)  # <-- NEW: fused call
+                        if cE_vals is not None:
+                            cE_vals[j] = val
+                        if JE_rows is not None:
+                            JE_rows[j, :] = row
+                else:
+                    # twp passes
+                    for j, ge in enumerate(self.cE_grads):
+                        if cE_vals is not None:
+                            cE_vals[j] = ge.value(x)
+                        if JE_rows is not None:
+                            row = ge(x)
+                            JE_rows[j, :] = row
+                            
                 if cE_vals is not None:
-                    res["cE"] = _finite_or_zero(cE_vals)
+                    res["cE"] = cE_vals
                 if JE_rows is not None:
                     if self.use_sparse:
                         JE = sp.csr_matrix(JE_rows)
                         res["JE"] = JE
                         self._dense_JE_cache = JE_rows
                     else:
-                        res["JE"] = _finite_or_zero(JE_rows)
+                        res["JE"] = JE_rows
                         self._dense_JE_cache = res["JE"]  # type: ignore[assignment]
+                        
             except Exception:
                 if "cE" in want_set:
                     res["cE"] = np.zeros(self.m_eq, dtype=float)
@@ -484,6 +515,8 @@ class Model:
                         else np.zeros((self.m_eq, n), dtype=float)
                     )
                 self._dense_JE_cache = None
+            end_time = time.time()
+            print(f"Equality eval time: {end_time - start_time:.6f} seconds ")
         else:
             if "cE" in want_set:
                 res["cE"] = None
@@ -534,8 +567,6 @@ class Model:
             np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()
         ):
             raise ValueError("Non-finite values in x, lam, or nu")
-        cfg = getattr(self, "cfg", None)
-        use_sparse = self.use_sparse
 
         # Base Hessian directly from AD (avoid dict path)
         start_time = time.time()

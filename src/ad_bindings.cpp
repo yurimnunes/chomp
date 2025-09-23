@@ -535,6 +535,45 @@ public:
         return (g && expr_root) ? g->getExpression(expr_root) : std::string{};
     }
 
+      // NEW: fused (f, grad) in one forward+reverse
+    [[gnu::hot]]
+    std::pair<double, Arr1D> value_grad_numpy(Arr1D x_in) {
+        auto x = as_span_1d(x_in);
+        const ssize_t n = static_cast<ssize_t>(x.size());
+        if (static_cast<size_t>(n) != var_nodes.size()) [[unlikely]]
+            throw std::invalid_argument("GradFn.value_grad: wrong input length");
+
+        // set inputs
+        for (ssize_t i = 0; i < n; ++i)
+            var_nodes[static_cast<size_t>(i)]->value =
+                x[static_cast<size_t>(i)];
+
+        double fval;
+        {
+            nb::gil_scoped_release nogil;
+            // one forward
+            g->resetGradients();     // reset grads (also bumps epoch)
+            g->resetForwardPass();   // bump value epoch
+            g->computeForwardPass(); // compute all primals
+
+            // capture f(x) before backward
+            fval = expr_root->value;
+
+            // one reverse
+            set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
+                            g->cur_grad_epoch_, 1.0);
+            g->initiateBackwardPass(expr_root);
+        }
+
+        // pack gradient in input order
+        Arr1D grad = create_zeros_1d(n);
+        double* gd = grad.data();
+        for (ssize_t i = 0; i < n; ++i)
+            gd[i] = var_nodes[static_cast<size_t>(i)]->gradient;
+
+        return {fval, std::move(grad)};
+    }
+    
     GradFn(nb::object f, size_t arity, bool vector_input)
         : g(std::make_shared<ADGraph>()), vector_mode(vector_input),
           python_func(f) {
@@ -713,7 +752,7 @@ public:
                                 v[i]);
             }
             g->resetForwardPass();
-            g->computeForwardPassWithDot();
+            g->computeForwardPassWithDotLanes();
             g->resetGradients();
             g->resetGradDot();
             set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
@@ -827,7 +866,8 @@ class LagHessFn {
 public:
     using dvec = Eigen::VectorXd;
     using dmat = Eigen::MatrixXd;
-
+    std::vector<int> x2g_; // x_nodes index -> graph order k
+    std::vector<int> g2x_; // graph order k -> x_nodes index
     ADGraphPtr g;
     ADNodePtr L_root;
     std::vector<ADNodePtr> x_nodes, lam_nodes, nu_nodes;
@@ -835,6 +875,24 @@ public:
     nb::object f_fun;
     std::vector<nb::object> cI_funs, cE_funs;
     bool vector_mode{};
+    bool order_ready_{false};
+
+    void build_permutations_once_() {
+        if (order_ready_)
+            return;
+        g->initializeNodeVariables(); // one-time
+        const size_t n = x_nodes.size();
+        x2g_.assign(n, -1);
+        g2x_.assign(n, -1);
+        for (size_t i = 0; i < n; ++i) {
+            const int k = x_nodes[i]->order;
+            if (k < 0 || (size_t)k >= n)
+                throw std::runtime_error("bad order");
+            x2g_[i] = k;
+            g2x_[k] = static_cast<int>(i);
+        }
+        order_ready_ = true;
+    }
 
     // ---------------------- construction ----------------------
     LagHessFn(nb::object f, const std::vector<nb::object> &cI,
@@ -909,8 +967,11 @@ public:
         add_lin(cE_funs, nu_nodes);
 
         L_root = acc;
+
         // Important: do NOT try to set node->order here; ADGraph will assign.
         g->initializeNodeVariables(); // make sure variables are indexed
+        build_permutations_once_();
+
         // and a first forward so values exist before first HVP
         {
             nb::gil_scoped_release nogil;
@@ -965,31 +1026,18 @@ public:
     }
 
     std::vector<double> x_to_graph_order_(std::span<const double> v_x) const {
-        if (v_x.size() != x_nodes.size())
-            throw std::invalid_argument("v length mismatch");
-        std::vector<double> v_g(v_x.size(), 0.0);
-        // After refresh_orders_(), each x_nodes[i]->order is a valid index
-        // [0..n)
-        for (size_t i = 0; i < x_nodes.size(); ++i) {
-            int k = x_nodes[i]->order;
-            if (k < 0 || (size_t)k >= v_g.size())
-                throw std::runtime_error("invalid node order");
-            v_g[(size_t)k] = v_x[i];
-        }
+        const size_t n = x_nodes.size();
+        std::vector<double> v_g(n);
+        for (size_t i = 0; i < n; ++i)
+            v_g[(size_t)x2g_[i]] = v_x[i];
         return v_g;
     }
-
     std::vector<double>
     graph_to_x_order_(const std::vector<double> &w_g) const {
-        if (w_g.size() != x_nodes.size())
-            throw std::invalid_argument("size mismatch");
-        std::vector<double> w_x(w_g.size(), 0.0);
-        for (size_t i = 0; i < x_nodes.size(); ++i) {
-            int k = x_nodes[i]->order;
-            if (k < 0 || (size_t)k >= w_g.size())
-                throw std::runtime_error("invalid node order");
-            w_x[i] = w_g[(size_t)k];
-        }
+        const size_t n = x_nodes.size();
+        std::vector<double> w_x(n);
+        for (size_t k = 0; k < n; ++k)
+            w_x[(size_t)g2x_[k]] = w_g[k];
         return w_x;
     }
 
@@ -998,7 +1046,7 @@ public:
         set_state_numpy(x_in, lam_in, nu_in);
 
         // Ensure orders are fresh & consistent with ADGraph
-        refresh_orders_();
+        build_permutations_once_();
 
         // pack v in x-order -> graph-order
         std::span<const double> vx{v_in.data(), (size_t)v_in.shape(0)};
@@ -1024,7 +1072,7 @@ public:
         if (!v || !y)
             throw std::invalid_argument("hvp_into_nogil: null pointer");
 
-        refresh_orders_(); // makes x_nodes[i]->order valid
+        build_permutations_once_();
 
         std::vector<double> v_x(n), v_g, Hv_g, Hv_x;
         v_x.assign(v, v + n);
@@ -1047,27 +1095,48 @@ public:
         Arr2D H = create_zeros_2d((ssize_t)n, (ssize_t)n);
         double *Hd = H.data();
 
-        // Refresh order once; ADGraph’s initialize is deterministic for a
-        // stable map state
-        refresh_orders_();
+        // Ensure stable variable ordering and permutations
+        build_permutations_once_(); // fills x2g_ and g2x_
 
-        std::vector<double> e_x(n, 0.0), e_g, col_g, col_x;
-        for (size_t j = 0; j < n; ++j) {
-            std::fill(e_x.begin(), e_x.end(), 0.0);
-            e_x[j] = 1.0;
+        // Choose a lane batch size (tune: 8/16 often good; graph will handle
+        // <=k)
+        const size_t L = 16;
 
-            e_g = x_to_graph_order_(std::span<const double>(e_x.data(), n));
+        // Workspace for k RHS and k outputs in **graph order** with lane-inner
+        // layout
+        std::vector<double> V(n * L, 0.0);
+        std::vector<double> Y(n * L, 0.0);
+
+        for (size_t base = 0; base < n; base += L) {
+            const size_t k = std::min(L, n - base);
+
+            // Build k unit vectors directly in graph order:
+            // column j corresponds to x-index (base + j) => graph id
+            // x2g_[base+j]
+            std::fill(V.begin(), V.end(), 0.0);
+            for (size_t j = 0; j < k; ++j) {
+                const size_t xj = base + j;
+                const int gij = x2g_[xj];
+                V[size_t(gij) * L + j] = 1.0; // lane-inner: (node i, lane j)
+            }
+
+            // Batched HVP in graph order (ldV/ldY = L lanes)
             {
                 nb::gil_scoped_release nogil;
-                col_g = g->hessianVectorProduct(L_root, e_g);
+                g->hessianMultiVectorProduct(L_root, V.data(), /*ldV=*/L,
+                                             Y.data(), /*ldY=*/L, k);
             }
-            col_x = graph_to_x_order_(col_g);
 
-            // write column j in column-major (Arr2D is C-contig; we still store
-            // by [i*n + j])
-            for (size_t i = 0; i < n; ++i)
-                Hd[i * n + j] = col_x[i];
+            // Scatter each column j back to x order without extra copies
+            for (size_t j = 0; j < k; ++j) {
+                const size_t col_x = base + j;
+                for (size_t gi = 0; gi < n; ++gi) {
+                    const size_t xi = g2x_[gi];
+                    Hd[xi * n + col_x] = Y[gi * L + j]; // write H[xi, col_x]
+                }
+            }
         }
+
         return H;
     }
 
@@ -1087,7 +1156,7 @@ public:
         double *Yd = Y.data();
         const double *Vd = V_in.data();
 
-        refresh_orders_();
+        build_permutations_once_();
 
         std::vector<double> v_x((size_t)n), v_g, Hy_g, Hy_x;
         for (ssize_t j = 0; j < k; ++j) {
@@ -1557,6 +1626,8 @@ NB_MODULE(ad, m) {
         .def("expr_str", &GradFn::expr_str)
         .def("value", &GradFn::value_numpy, "x"_a,
              "Evaluate f(x) (ndarray) -> float")
+        .def("value_grad", &GradFn::value_grad_numpy, "x"_a,
+             "Evaluate (f(x), grad f(x)) (ndarray) -> (float, ndarray)")
         .def("__repr__", [](const GradFn &self) {
             return "<GradFn expr=" + self.expr_str() + ">";
         });

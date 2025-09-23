@@ -4,7 +4,6 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
-#include <execution>
 #include <functional>
 #include <memory>
 #include <numeric>
@@ -16,15 +15,58 @@
 #include <utility>
 #include <vector>
 
+// stdexec (CPU) + optional CUDA
+#include <stdexec/execution.hpp>
+#include <exec/static_thread_pool.hpp>
+#ifdef FORETREE_EXEC_USE_CUDA
+  #include <nvexec/stream_context.cuh>
+#endif
+
 #include "gradient_hist_system.hpp"
 #include "unified_tree.hpp"
 
 namespace foretree {
 
 // ============================================================================
+// Small execution shim over stdexec/nvexec
+// ============================================================================
+namespace execx {
+
+struct Context {
+#ifdef FORETREE_EXEC_USE_CUDA
+  // CUDA stream context (one per host thread that owns Context)
+  nvexec::stream_context cuda_ctx;
+  auto scheduler() { return cuda_ctx.get_scheduler(); }
+#else
+  exec::static_thread_pool pool;
+  explicit Context(unsigned threads = std::thread::hardware_concurrency())
+    : pool(threads ? threads : 1) {}
+  auto scheduler() { return pool.get_scheduler(); }
+#endif
+};
+
+template <class F>
+inline void bulk(Context& ctx, int n, F&& fn) {
+  if (n <= 0) return;
+  if (n == 1) { fn(0); return; }
+
+  auto snd = stdexec::bulk(stdexec::schedule(ctx.scheduler()),
+                           (std::size_t)n,
+                           [f = std::forward<F>(fn)](std::size_t i) { f((int)i); });
+  stdexec::sync_wait(std::move(snd));
+}
+
+// Convenience for working over an index vector [0..n)
+template <class F>
+inline void bulk_iota(Context& ctx, int n, F&& fn) {
+  bulk(ctx, n, std::forward<F>(fn));
+}
+
+} // namespace execx
+
+// ============================================================================
 // ForeForest — bagging (Random Forest) + boosting (GBDT) with optional DART
 // ============================================================================
-
 struct ForeForestConfig {
     enum class Mode { Bagging, GBDT } mode = Mode::Bagging;
 
@@ -41,15 +83,15 @@ struct ForeForestConfig {
     HistogramConfig hist_cfg{}; // binning
     TreeConfig tree_cfg{};      // tree growth/splits/posting
 
-    // --- Column sampling (wire through UnifiedTree when ready) ---
+    // --- Column sampling (wired into UnifiedTree below) ---
     double colsample_bytree = 1.0; // fraction of features per tree
     double colsample_bynode = 1.0; // fraction per node (split-time)
 
     // --- Bagging (Random Forest) ---
-    double rf_row_subsample = 1.0; // fraction of rows per tree (bootstrap size)
-    bool rf_bootstrap = true;      // with replacement
+    double rf_row_subsample = 1.0;   // fraction of rows per tree (bootstrap size)
+    bool rf_bootstrap = true;        // with replacement
     bool rf_bootstrap_dedup = false; // keep multiplicities by default
-    bool rf_parallel = true;       // parallel tree building (requires PSTL)
+    bool rf_parallel = true;         // parallel tree building (via stdexec)
 
     // --- Boosting (GBDT) ---
     double gbdt_row_subsample = 1.0; // stochastic boosting fraction
@@ -60,6 +102,9 @@ struct ForeForestConfig {
     double dart_drop_rate = 0.1; // prob of dropping each existing tree per iter
     int dart_max_drop = 3;       // cap number of dropped trees
     bool dart_normalize = true;  // normalize weights by 1/(k+1)
+
+    // --- Execution ---
+    int threads = 0; // 0 -> hw_concurrency (CPU mode); ignored on CUDA
 };
 
 class ForeForest {
@@ -67,7 +112,14 @@ public:
     explicit ForeForest(ForeForestConfig cfg)
         : cfg_(std::move(cfg)),
           rng_(cfg_.rng_seed),
-          ghs_(std::make_unique<GradientHistogramSystem>(cfg_.hist_cfg)) {}
+          ghs_(std::make_unique<GradientHistogramSystem>(cfg_.hist_cfg)),
+#ifndef FORETREE_EXEC_USE_CUDA
+          ctx_((unsigned)(cfg_.threads > 0 ? cfg_.threads
+                                           : (int)std::thread::hardware_concurrency()))
+#else
+          ctx_()
+#endif
+    {}
 
     // Provide raw matrix if you want Exact/Hybrid splits to use float values +
     // missing mask Xraw: pointer to N * P row-major (float). Xmiss: N*P mask
@@ -173,6 +225,27 @@ public:
     }
 
 private:
+    // ------------------ Helpers: per-tree TreeConfig wiring ------------------
+    TreeConfig make_tree_cfg_for_this_round_() const {
+        TreeConfig tc = cfg_.tree_cfg;
+
+        // Wire colsample fractions into percentages expected by UnifiedTree
+        tc.colsample_bytree_percent = std::clamp(
+            (int)std::round(100.0 * std::clamp(cfg_.colsample_bytree, 0.0, 1.0)), 1, 100);
+        // The "bynode" fraction maps to UnifiedTree's per-node percentage
+        tc.colsample_bynode_percent = std::clamp(
+            (int)std::round(100.0 * std::clamp(cfg_.colsample_bynode, 0.0, 1.0)), 1, 100);
+
+        // Ensure sane GOSS defaults (UnifiedTree defaults scale_hessian=true)
+        if (tc.goss.enabled && !tc.goss.scale_hessian) {
+            tc.goss.scale_hessian = true;
+        }
+        // If someone set both caching and GOSS aggressively, UnifiedTree will
+        // internally avoid tree-level cache when GOSS is enabled; nothing to do here.
+
+        return tc;
+    }
+
     // ===================== Bagging (Random Forest) ===========================
     void train_bagging_(std::vector<float> &g, std::vector<float> &h,
                         const double *y) {
@@ -188,7 +261,7 @@ private:
         // Pre-generate row samples per tree
         std::vector<std::vector<int>> boot_rows((size_t)M);
 
-        // Per-thread RNGs to avoid data races under parallel generation
+        // Per-tree RNGs (each isolated) to avoid races
         std::vector<std::mt19937_64> rngs((size_t)M);
         for (int t = 0; t < M; ++t)
             rngs[(size_t)t] =
@@ -221,10 +294,7 @@ private:
         };
 
         if (cfg_.rf_parallel) {
-            std::vector<int> tids(M);
-            std::iota(tids.begin(), tids.end(), 0);
-            std::for_each(std::execution::par, tids.begin(), tids.end(),
-                          [&](int t) { gen_sample(t); });
+            execx::bulk_iota(ctx_, M, [&](int t){ gen_sample(t); });
         } else {
             for (int t = 0; t < M; ++t) gen_sample(t);
         }
@@ -233,19 +303,16 @@ private:
         tree_weights_.assign((size_t)M, 1.0); // we'll average at predict time
 
         auto build_one = [&](int t) {
-            UnifiedTree T(cfg_.tree_cfg, ghs_.get());
+            TreeConfig tc = make_tree_cfg_for_this_round_();
+            UnifiedTree T(tc, ghs_.get());
             if (cfg_.use_raw_matrix_for_exact)
                 T.set_raw_matrix(Xraw_, Xmiss_);
-            // TODO: plumb colsample_bytree / bynode into T if supported
             T.fit_with_row_ids(*codes_, N_, P_, g, h, boot_rows[(size_t)t]);
             trees_[(size_t)t] = std::move(T);
         };
 
         if (cfg_.rf_parallel) {
-            std::vector<int> tids(M);
-            std::iota(tids.begin(), tids.end(), 0);
-            std::for_each(std::execution::par, tids.begin(), tids.end(),
-                          [&](int t) { build_one(t); });
+            execx::bulk_iota(ctx_, M, [&](int t){ build_one(t); });
         } else {
             for (int t = 0; t < M; ++t) build_one(t);
         }
@@ -255,7 +322,7 @@ private:
     void train_gbdt_(std::vector<float> &g, std::vector<float> &h,
                      const double *y) {
         const int M = std::max(1, cfg_.n_estimators);
-        // Start from base_score_ (mean(y)) for squared loss
+        // Start from base_score_ (mean of y) for squared loss
         std::vector<double> F(N_, base_score_);
 
         trees_.clear();
@@ -314,10 +381,10 @@ private:
             }
 
             // Train tree on current (g,h)
-            UnifiedTree T(cfg_.tree_cfg, ghs_.get());
+            TreeConfig tc = make_tree_cfg_for_this_round_();
+            UnifiedTree T(tc, ghs_.get());
             if (cfg_.use_raw_matrix_for_exact)
                 T.set_raw_matrix(Xraw_, Xmiss_);
-            // TODO: plumb colsample_bytree / bynode into T if supported
             T.fit_with_row_ids(*codes_, N_, P_, g, h, rows);
 
             // Weight for new tree (with DART normalization if needed)
@@ -379,7 +446,8 @@ private:
         (void)P; // already validated earlier
         std::vector<double> out(N, 0.0);
 
-        // Simple serial accumulation; can be parallelized by trees if desired
+        // Serial accumulation; parallelizing here is possible but usually
+        // dwarfed by training time.
         std::vector<double> pred(N, 0.0);
         for (size_t t = 0; t < trees_.size(); ++t) {
             const double wt = tree_weights_[t];
@@ -429,6 +497,9 @@ private:
 
     // Bias for boosting (squared loss)
     double base_score_ = 0.0;
+
+    // stdexec execution context (CPU pool or CUDA stream)
+    execx::Context ctx_;
 };
 
 } // namespace foretree

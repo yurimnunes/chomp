@@ -70,9 +70,9 @@ struct TreeConfig {
     // GOSS configuration
     struct GOSS {
         bool enabled = false;
-        double top_rate = 0.2;
-        double other_rate = 0.1;
-        bool scale_hessian = false;
+        double top_rate = 0.2;       // a
+        double other_rate = 0.1;     // b
+        bool scale_hessian = true;   // <- default true: H scales like weights
         int min_node_size = 2000;
     } goss;
 
@@ -80,6 +80,22 @@ struct TreeConfig {
     bool cache_histograms = true;
     bool presort_goss = true;
     int cache_threshold = 1000;
+
+    // --- On-tree (pre) pruning ------------------------------------------------
+    struct OnTree {
+        bool  enabled = false;
+
+        // Cost-complexity alpha applied during growth: accept split only if
+        // (gain - ccp_alpha*(Δleaves)) > 0. For a binary split, Δleaves = +1.
+        double ccp_alpha = 0.0;
+
+        // Extra safety thresholds (applied after ccp_alpha):
+        double min_gain = 0.0;                 // absolute minimum gain
+        double min_gain_rel = 0.0;             // relative to |parent leaf objective|
+        double min_impurity_decrease = 0.0;    // alias for API parity
+
+        double eps = 1e-12;                    // numerical guard
+    } on_tree;
 };
 
 struct Node {
@@ -229,9 +245,12 @@ public:
         else
             grow_level_();
 
+        // Finalize leaves (use GOSS-weighted totals if GOSS was active for node)
         for (auto &n : nodes_)
-            if (n.is_leaf)
-                n.leaf_value = leaf_value_(n.G, n.H);
+            if (n.is_leaf) {
+                auto [GG, HH] = node_totals_for_leaf_(n);
+                n.leaf_value = leaf_value_(GG, HH);
+            }
         pack_();
 
         cleanup_caching_();
@@ -309,9 +328,7 @@ private:
     // Caching structures
     std::unique_ptr<HistogramPool> hist_pool_;
     std::unique_ptr<HistPair> tree_histogram_;
-    std::vector<int> goss_sorted_indices_;
     std::vector<int> tree_features_;
-    bool goss_sorted_ = false;
 
     void initialize_bin_info_() {
         if (ghs_ && P_ > 0) {
@@ -346,11 +363,8 @@ private:
             hist_pool_ = std::make_unique<HistogramPool>(total_hist_size_);
         }
 
-        if (cfg_.presort_goss && cfg_.goss.enabled) {
-            build_goss_sort_();
-        }
-
-        if (cfg_.cache_histograms &&
+        // Build a tree-level histogram only when NOT using GOSS (keeps parent=left+right valid)
+        if (cfg_.cache_histograms && !cfg_.goss.enabled &&
             index_pool_.size() >= cfg_.cache_threshold) {
             build_tree_histogram_();
         }
@@ -362,21 +376,7 @@ private:
             hist_pool_.reset();
         }
         tree_histogram_.reset();
-        goss_sorted_indices_.clear();
         tree_features_.clear();
-        goss_sorted_ = false;
-    }
-
-    void build_goss_sort_() {
-        goss_sorted_indices_.resize(index_pool_.size());
-        std::iota(goss_sorted_indices_.begin(), goss_sorted_indices_.end(), 0);
-
-        std::sort(goss_sorted_indices_.begin(), goss_sorted_indices_.end(),
-                  [&](int i, int j) {
-                      return std::abs((*g_)[index_pool_[i]]) >
-                             std::abs((*g_)[index_pool_[j]]);
-                  });
-        goss_sorted_ = true;
     }
 
     void build_tree_histogram_() {
@@ -419,7 +419,6 @@ private:
         packed_ = false;
         feat_gain_.assign(P_, 0.0);
         feat_pool_.clear();
-        goss_sorted_ = false;
     }
 
     inline void register_pos_(const Node &n) {
@@ -471,7 +470,11 @@ private:
         return step;
     }
 
+    // NOTE: integrates on-tree pruning into priority used for leaf-wise growth
     double priority_(double gain, const Node &nd) const {
+        if (cfg_.on_tree.enabled)
+            gain -= cfg_.on_tree.ccp_alpha; // Δleaves = +1 for a binary split
+
         double pr = gain;
         if (cfg_.leaf_depth_penalty > 0.0)
             pr /= (1.0 + cfg_.leaf_depth_penalty * double(nd.depth));
@@ -611,6 +614,11 @@ private:
         return false;
     }
 
+    // Helper: does this node use GOSS?
+    bool node_uses_goss_(const Node& nd) const {
+        return cfg_.goss.enabled && (nd.hi - nd.lo) >= cfg_.goss.min_node_size;
+    }
+
     // Histogram Provider with efficient caching
     struct HistogramProvider {
         const UnifiedTree &T;
@@ -622,7 +630,7 @@ private:
 
         std::unique_ptr<HistPair>
         build_histogram(const Node &nd, const std::vector<int> &feats) const {
-            // Check if we can use cached histogram
+            // If we have a valid per-node cache for these features, use it
             if (nd.hist_valid && nd.hist_features == feats) {
                 auto hist = T.hist_pool_ ? T.hist_pool_->get()
                                          : std::make_unique<HistPair>();
@@ -638,15 +646,17 @@ private:
             hist->resize(T.total_hist_size_);
             hist->clear();
 
-            // Try to derive from tree histogram if features match
-            if (T.tree_histogram_ && feats == T.tree_features_ &&
+            const bool goss_here = T.node_uses_goss_(nd);
+
+            // Avoid deriving from tree-level histogram when GOSS is active
+            if (!goss_here && T.tree_histogram_ && feats == T.tree_features_ &&
                 nd.C >= T.cfg_.cache_threshold) {
                 derive_from_tree_histogram_(nd, feats, *hist);
             } else {
-                build_from_rows_(nd, feats, *hist);
+                build_from_rows_(nd, feats, *hist, goss_here);
             }
 
-            // Cache the result
+            // Cache the result on the node (safe regardless of GOSS)
             if (T.cfg_.cache_histograms) {
                 nd.hist_G = hist->G;
                 nd.hist_H = hist->H;
@@ -662,16 +672,13 @@ private:
         void derive_from_tree_histogram_(const Node &nd,
                                          const std::vector<int> &feats,
                                          HistPair &hist) const {
-            // This is a simplified version - in practice you'd need to track
-            // which rows belong to which nodes to properly subtract
-            build_from_rows_(nd, feats, hist);
+            // NOTE: This simplified version falls back to direct build for correctness.
+            build_from_rows_(nd, feats, hist, /*use_goss=*/false);
         }
 
         void build_from_rows_(const Node &nd, const std::vector<int> &feats,
-                              HistPair &hist) const {
+                              HistPair &hist, bool use_goss) const {
             std::vector<int> work_rows = subsample_for_node_(nd);
-            const bool use_goss = should_use_goss_(nd);
-
             if (use_goss) {
                 build_with_goss_(nd, feats, hist);
             } else if (!work_rows.empty()) {
@@ -703,52 +710,63 @@ private:
             return out;
         }
 
-        bool should_use_goss_(const Node &nd) const {
-            return T.cfg_.goss.enabled && nd.C >= T.cfg_.goss.min_node_size;
-        }
-
         void build_with_goss_(const Node &nd, const std::vector<int> &feats,
                               HistPair &hist) const {
-            if (!T.goss_sorted_) {
+            const double a = std::clamp(T.cfg_.goss.top_rate,   0.01, 1.0);
+            const double b = std::clamp(T.cfg_.goss.other_rate, 0.0,  1.0);
+            const int total = nd.hi - nd.lo;
+
+            if (total < T.cfg_.goss.min_node_size) {
                 build_for_range_(nd.lo, nd.hi, feats, hist);
                 return;
             }
 
-            const double a = std::clamp(T.cfg_.goss.top_rate, 0.01, 1.0);
-            const double b = std::clamp(T.cfg_.goss.other_rate, 0.0, 1.0);
-            const int total = nd.hi - nd.lo;
-
-            int k_top = std::max(1, (int)std::round(a * total));
-            int k_rest = std::max(0, (int)std::round(b * total));
-
-            std::vector<int> top_rows, rest_rows;
-
-            // Collect top and rest rows from GOSS sorted order
-            for (int idx : T.goss_sorted_indices_) {
-                if (idx >= nd.lo && idx < nd.hi) {
-                    if (top_rows.size() < k_top) {
-                        top_rows.push_back(index_pool[idx]);
-                    } else if (rest_rows.size() < k_rest) {
-                        rest_rows.push_back(index_pool[idx]);
-                    }
-                }
+            // Build (|g|, row) for this node
+            std::vector<std::pair<double,int>> node_samples;
+            node_samples.reserve(total);
+            for (int i = nd.lo; i < nd.hi; ++i) {
+                const int r = index_pool[i];
+                node_samples.emplace_back(std::abs((*T.g_)[r]), r);
             }
 
+            // Sort descending by |g|
+            std::sort(node_samples.begin(), node_samples.end(),
+                      [](const auto &A, const auto &B){ return A.first > B.first; });
+
+            // Select top and rest deterministically
+            int k_top  = std::max(1, (int)std::round(a * total));
+            int k_rest = std::max(0, (int)std::round(b * total));
+            k_top  = std::min(k_top, total);
+            k_rest = std::min(k_rest, total - k_top);
+
+            std::vector<int> top_rows;  top_rows.reserve(k_top);
+            std::vector<int> rest_rows; rest_rows.reserve(k_rest);
+
+            for (int i = 0; i < k_top; ++i)
+                top_rows.push_back(node_samples[i].second);
+
+            // Deterministic rest: take next k_rest
+            for (int i = k_top; i < k_top + k_rest; ++i)
+                rest_rows.push_back(node_samples[i].second);
+
+            // Build separate histograms
             HistPair top_hist, rest_hist;
-            top_hist.resize(T.total_hist_size_);
-            top_hist.clear();
-            rest_hist.resize(T.total_hist_size_);
-            rest_hist.clear();
+            top_hist.resize(T.total_hist_size_); top_hist.clear();
+            rest_hist.resize(T.total_hist_size_); rest_hist.clear();
 
-            build_for_rows_(top_rows, feats, top_hist);
-            build_for_rows_(rest_rows, feats, rest_hist);
+            build_for_rows_(top_rows,  feats, top_hist);
+            if (!rest_rows.empty())
+                build_for_rows_(rest_rows, feats, rest_hist);
 
-            const double scale = (1.0 - a) / std::max(b, 1e-15);
+            // Combine with proper GOSS weighting
+            const double rest_scale = (1.0 - a) / std::max(b, 1e-15);
+
             for (size_t i = 0; i < hist.G.size(); ++i) {
-                hist.G[i] = top_hist.G[i] + scale * rest_hist.G[i];
+                hist.G[i] = top_hist.G[i] + rest_scale * rest_hist.G[i];
                 hist.H[i] = T.cfg_.goss.scale_hessian
-                                ? (top_hist.H[i] + scale * rest_hist.H[i])
-                                : (top_hist.H[i] + rest_hist.H[i]);
+                          ? (top_hist.H[i] + rest_scale * rest_hist.H[i])
+                          : (top_hist.H[i] + rest_hist.H[i]);
+                // counts are unweighted
                 hist.C[i] = top_hist.C[i] + rest_hist.C[i];
             }
         }
@@ -800,13 +818,27 @@ private:
         }
 
     public:
-        Candidate best_split(const Node &nd, const SplitHyper &hyp,
+        foretree::splitx::Candidate best_split(const Node &nd, const SplitHyper &hyp,
                              const std::vector<int8_t> *mono) {
             auto feats = T.select_features_(nd.depth);
             auto hist = build_histogram(nd, feats);
 
-            SplitContext ctx{&hist->G, &hist->H, &hist->C, T.P_, 0,
-                             nd.G,     nd.H,     nd.C,     mono, hyp};
+            // Compute parent totals consistently from histogram (match sampling/weights)
+            double Gtot = 0.0, Htot = 0.0;
+            if (!feats.empty()) {
+                const int f0 = feats[0];
+                const size_t off0 = T.feature_offsets_[f0];
+                const int n_bins0 = T.finite_bins_per_feat_[f0] + 1;
+                for (int b = 0; b < n_bins0; ++b) {
+                    Gtot += hist->G[off0 + (size_t)b];
+                    Htot += hist->H[off0 + (size_t)b];
+                }
+            } else {
+                Gtot = nd.G; Htot = nd.H;
+            }
+
+            foretree::splitx::SplitContext ctx{&hist->G, &hist->H, &hist->C, T.P_, 0,
+                             Gtot, Htot, nd.C, mono, hyp};
 
             ctx.variable_bins = true;
             ctx.feature_offsets = T.feature_offsets_.data();
@@ -860,9 +892,9 @@ private:
             }
         }
 
-        Candidate best_split(const Node &nd, const SplitHyper &hyp,
+        foretree::splitx::Candidate best_split(const Node &nd, const SplitHyper &hyp,
                              const std::vector<int8_t> *mono) {
-            SplitContext ctx{nullptr, nullptr, nullptr, T.P_, 0,
+            foretree::splitx::SplitContext ctx{nullptr, nullptr, nullptr, T.P_, 0,
                              nd.G,    nd.H,    nd.C,    mono, hyp};
             ctx.row_g = T.g_->data();
             ctx.row_h = T.h_->data();
@@ -889,14 +921,14 @@ private:
 
     // Core evaluation logic
     template <class Provider>
-    bool eval_with_provider_(Provider &prov, Node &nd, Candidate &out) const {
+    bool eval_with_provider_(Provider &prov, Node &nd, foretree::splitx::Candidate &out) const {
         if (nd.C < cfg_.min_samples_split || nd.depth >= cfg_.max_depth)
             return false;
 
         const auto *mono = maybe_monotone_();
         const SplitHyper hyp = make_hyper_();
 
-        Candidate cand = prov.best_split(nd, hyp, mono);
+        foretree::splitx::Candidate cand = prov.best_split(nd, hyp, mono);
         if (cand.thr < 0)
             return false;
 
@@ -904,7 +936,7 @@ private:
         return true;
     }
 
-    bool eval_node_split_(Node &nd, Candidate &out) const {
+    bool eval_node_split_(Node &nd, foretree::splitx::Candidate &out) const {
         const bool exact = use_exact_for_(nd);
         if (exact) {
             ExactProvider prov(*this, index_pool_);
@@ -972,7 +1004,7 @@ private:
         return i;
     }
 
-    void apply_split_(Node &nd, const Candidate &sp) {
+    void apply_split_(Node &nd, const foretree::splitx::Candidate &sp) {
         int mid;
         if (std::isfinite(sp.split_value) && Xraw_) {
             mid = partition_exact_(nd, sp.feat, sp.split_value, sp.miss_left);
@@ -1007,8 +1039,8 @@ private:
             std::isfinite(sp.gain))
             feat_gain_[sp.feat] += sp.gain;
 
-        // Sibling subtraction optimization
-        if (cfg_.use_sibling_subtract) {
+        // Sibling subtraction optimization (skip on GOSS nodes)
+        if (cfg_.use_sibling_subtract && !node_uses_goss_(nd)) {
             auto features = select_features_(nd.depth);
             HistogramProvider prov(*this, index_pool_);
 
@@ -1048,6 +1080,37 @@ private:
         register_pos_(nodes_.back());
     }
 
+    // --- On-tree acceptance ---------------------------------------------------
+    inline double parent_leaf_objective_(const Node& nd) const {
+        return leaf_objective_optimal_(nd.G, nd.H);
+    }
+
+    inline bool accept_split_(const Node& nd, const foretree::splitx::Candidate& sp) const {
+        if (!cfg_.on_tree.enabled) return true;
+
+        double g = sp.gain;
+
+        // Cost-complexity penalty: binary split creates +1 new leaf
+        if (cfg_.on_tree.ccp_alpha > 0.0)
+            g -= cfg_.on_tree.ccp_alpha;
+
+        // Absolute minimum gain (honor alias)
+        const double min_abs = std::max(cfg_.on_tree.min_gain,
+                                        cfg_.on_tree.min_impurity_decrease);
+        if (min_abs > 0.0 && g < (min_abs - cfg_.on_tree.eps))
+            return false;
+
+        // Relative threshold
+        if (cfg_.on_tree.min_gain_rel > 0.0) {
+            const double base = std::abs(parent_leaf_objective_(nd));
+            const double rel_thresh = cfg_.on_tree.min_gain_rel * base;
+            if (g < (rel_thresh - cfg_.on_tree.eps))
+                return false;
+        }
+
+        return (g > cfg_.on_tree.eps);
+    }
+
     // Growth algorithms
     void grow_leaf_() {
         struct QItem {
@@ -1066,9 +1129,10 @@ private:
 
         auto push_node = [&](int id) {
             Node &n = *by_id_(id);
-            Candidate sp;
-            if (!eval_node_split_(n, sp)) {
-                n.leaf_value = leaf_value_(n.G, n.H);
+            foretree::splitx::Candidate sp;
+            if (!eval_node_split_(n, sp) || !accept_split_(n, sp)) {
+                auto [GG, HH] = node_totals_for_leaf_(n);
+                n.leaf_value = leaf_value_(GG, HH);
                 return;
             }
             double pr = priority_(sp.gain, n);
@@ -1084,9 +1148,10 @@ private:
             heap.pop();
             Node &n = *by_id_(it.id);
 
-            Candidate sp;
-            if (!eval_node_split_(n, sp)) {
-                n.leaf_value = leaf_value_(n.G, n.H);
+            foretree::splitx::Candidate sp;
+            if (!eval_node_split_(n, sp) || !accept_split_(n, sp)) {
+                auto [GG, HH] = node_totals_for_leaf_(n);
+                n.leaf_value = leaf_value_(GG, HH);
                 continue;
             }
 
@@ -1116,9 +1181,10 @@ private:
                 q.erase(q.begin());
                 Node &n = *by_id_(id);
 
-                Candidate sp;
-                if (!eval_node_split_(n, sp)) {
-                    n.leaf_value = leaf_value_(n.G, n.H);
+                foretree::splitx::Candidate sp;
+                if (!eval_node_split_(n, sp) || !accept_split_(n, sp)) {
+                    auto [GG, HH] = node_totals_for_leaf_(n);
+                    n.leaf_value = leaf_value_(GG, HH);
                     continue;
                 }
 
@@ -1277,6 +1343,43 @@ public:
             step = std::clamp(step, -cfg_.max_delta_step, cfg_.max_delta_step);
         const double w = step;
         return 0.5 * denom * w * w + w * G + std::abs(w) * cfg_.alpha_;
+    }
+
+private:
+    // Compute (G,H) for leaves consistent with GOSS if active for the node.
+    std::pair<double,double> node_totals_for_leaf_(const Node& nd) const {
+        if (!node_uses_goss_(nd)) return {nd.G, nd.H};
+
+        const double a = std::clamp(cfg_.goss.top_rate,   0.01, 1.0);
+        const double b = std::clamp(cfg_.goss.other_rate, 0.0,  1.0);
+        const int total = nd.hi - nd.lo;
+
+        int k_top  = std::max(1, (int)std::round(a * total));
+        int k_rest = std::max(0, (int)std::round(b * total));
+        k_top  = std::min(k_top, total);
+        k_rest = std::min(k_rest, total - k_top);
+
+        std::vector<std::pair<double,int>> v;
+        v.reserve(total);
+        for (int i = nd.lo; i < nd.hi; ++i) {
+            const int r = index_pool_[i];
+            v.emplace_back(std::abs((*g_)[r]), r);
+        }
+        std::sort(v.begin(), v.end(), [](auto &A, auto &B){ return A.first > B.first; });
+
+        double Gt=0.0, Ht=0.0, Gr=0.0, Hr=0.0;
+        for (int i = 0; i < k_top; ++i) {
+            const int r = v[i].second; Gt += (*g_)[r]; Ht += (*h_)[r];
+        }
+        for (int i = k_top; i < k_top + k_rest; ++i) {
+            const int r = v[i].second; Gr += (*g_)[r]; Hr += (*h_)[r];
+        }
+
+        const double rest_scale = (1.0 - a) / std::max(b, 1e-15);
+        const double GG = Gt + rest_scale * Gr;
+        const double HH = cfg_.goss.scale_hessian ? (Ht + rest_scale * Hr)
+                                                  : (Ht + Hr);
+        return {GG, HH};
     }
 };
 

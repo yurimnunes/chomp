@@ -15,12 +15,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build options
 option(AD_ENABLE_OPENMP   "Enable OpenMP"                     ON)
-option(AD_ENABLE_PIQP     "Build piqp_cpp Python bindings"    ON)
-option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"    ON)
-option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"   ON)
+option(AD_ENABLE_PIQP     "Build piqp_cpp Python bindings"    OFF)
+option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"    OFF)
+option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"   OFF)
 option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"       ON)
-option(AD_ENABLE_L1CORE   "Build l1core Python bindings"      ON)
-option(AD_ENABLE_CHOLMOD  "Enable HYKKT via SuiteSparse"      ON)
+option(AD_ENABLE_L1CORE   "Build l1core Python bindings"      OFF)
+option(AD_ENABLE_CHOLMOD  "Enable HYKKT via SuiteSparse"      OFF)
 option(AD_ENABLE_SPECTRA  "Fetch and enable Spectra via CPM"  ON)
 option(AD_ENABLE_GUROBI   "Enable GUROBI linkage"             OFF)
 
@@ -42,6 +42,14 @@ endif()
 # ------------------------------------------------------------------
 # Dependencies
 # ------------------------------------------------------------------
+
+cpmaddpackage(
+  NAME stdexec
+  GITHUB_REPOSITORY NVIDIA/stdexec
+  GIT_TAG main
+  OPTIONS "STDEXEC_BUILD_TESTS OFF" "STDEXEC_BUILD_EXAMPLES OFF" "STDEXEC_BUILD_BENCHMARKS OFF" "STDEXEC_BUILD_DOCS OFF" "BUILD_TESTING OFF"
+)
+
 
 # fmt
 find_package(fmt CONFIG QUIET)
@@ -351,6 +359,8 @@ endif()
 if(AD_ENABLE_QDLDL)
   ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
 endif()
+
+target_include_directories(foreforest PRIVATE ${stdexec_SOURCE_DIR}/include)
 
 # ------------------------------------------------------------------
 # Summary
