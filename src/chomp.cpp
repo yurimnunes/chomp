@@ -39,6 +39,7 @@
 
 #include "../include/ip.h"
 #include "../include/sqp.h"
+#include "../include/model.h"
 
 namespace nb = nanobind;
 using nb::arg;
@@ -213,12 +214,14 @@ public:
             mode_ = (theta0 > std::max(ip_switch_theta, 10.0 * tol_feas)) ? "ip" : "sqp";
         }
 
+        ModelC *m = new ModelC(f, c_ineq_list, c_eq_list, n_, lb_or_none, ub_or_none);
+
         // IP stepper + state
         ip_state_   = IPState();                    // default-init
-        ip_stepper_ = new InteriorPointStepper(cfg_, hess_);
+        ip_stepper_ = new InteriorPointStepper(cfg_, hess_, m);
 
         // SQP stepper
-        sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_);
+        sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_, m);
 
         // Trackers
         last_header_row_ = -1;
@@ -271,7 +274,7 @@ private:
     // ---- steps --------------------------------------------------------------
     SolverInfo ip_step_(int it) {
         auto [x_out, lam_out, nu_out, info] =
-            ip_stepper_->step(model_, x_, lam_, nu_, it, ip_state_);
+            ip_stepper_->step(x_, lam_, nu_, it, ip_state_);
         if (info.accepted) {
             x_   = std::move(x_out);
             lam_ = std::move(lam_out);
@@ -282,7 +285,7 @@ private:
 
     SolverInfo sqp_step_(int it) {
         auto [x_out, lam_out, nu_out, info] =
-            sqp_stepper_->step(model_, x_, lam_, nu_, it);
+            sqp_stepper_->step(x_, lam_, nu_, it);
 
         if (info.accepted) {
             if (get_bool_attr_or(cfg_, "use_watchdog", false)) {

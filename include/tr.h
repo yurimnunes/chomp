@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "filter.h"
+#include "model.h"
 
 namespace nb = nanobind;
 #include "definitions.h"
@@ -635,8 +636,8 @@ public:
                    const std::optional<dvec> &bineq = std::nullopt,
                    const std::optional<dmat> &Aeq = std::nullopt,
                    const std::optional<dvec> &beq = std::nullopt,
-                   const std::optional<nb::object> &model = std::nullopt,
-                   const BoxCtx &box = {}, double mu = 0.0,
+                   ModelC *model = nullptr, const BoxCtx &box = {},
+                   double mu = 0.0,
                    const std::optional<double> &f_old = std::nullopt,
                    const HContext &HC = {}) {
         box_ = box;
@@ -644,13 +645,14 @@ public:
                            model, box.x, box.lb, box.ub, mu, f_old);
     }
 
+    ModelC *model_ = nullptr; // for callbacks
     // Convenience wrappers kept for ABI
     TRResult solve_dense(const dmat &H, const dvec &g,
                          const std::optional<dmat> &Aineq = std::nullopt,
                          const std::optional<dvec> &bineq = std::nullopt,
                          const std::optional<dmat> &Aeq = std::nullopt,
                          const std::optional<dvec> &beq = std::nullopt,
-                         const std::optional<nb::object> &model = std::nullopt,
+                         ModelC *model = nullptr,
                          const std::optional<dvec> &x = std::nullopt,
                          const std::optional<dvec> &lb = std::nullopt,
                          const std::optional<dvec> &ub = std::nullopt,
@@ -674,7 +676,7 @@ public:
                           const std::optional<dvec> &bineq = std::nullopt,
                           const std::optional<dmat> &Aeq = std::nullopt,
                           const std::optional<dvec> &beq = std::nullopt,
-                          const std::optional<nb::object> &model = std::nullopt,
+                          ModelC *model = nullptr,
                           const std::optional<dvec> &x = std::nullopt,
                           const std::optional<dvec> &lb = std::nullopt,
                           const std::optional<dvec> &ub = std::nullopt,
@@ -707,7 +709,6 @@ private:
     double delta_;
     mutable double current_kkt_residual_ =
         std::numeric_limits<double>::quiet_NaN();
-    mutable nb::object global_model = nb::none();
 
     // --------------- metric core (single path) ---------------
     template <class Mat>
@@ -896,29 +897,26 @@ private:
 
         double stationarity = tr_norm_(gradL);
 
-        nb::list need;
-
-        need.append("cI");
-        need.append("cE");
+        std::vector<std::string> need_str{"cI", "cE"};
+        global_model->eval_all(box_.x.value(), need_str);
 
         // Assuming `global_model` is an nb::object (or deference a pointer you
         // store)
-        nb::dict out = call_eval_all_dict(global_model, box_.x.value(), need);
+        // nb::dict out = call_eval_all_dict(global_model, box_.x.value(),
+        // need);
 
         double cons = 0.0;
         if (Aeq && Aeq->size()) {
             // get cE from model if possible
-            const auto cE_ = to_dense_optional<dvec>(
-                out.contains("cE") ? nb::handle(out["cE"]) : nb::none());
+            const auto cE_ = global_model->get_cE();
             if (cE_) {
-                cons += cE_->norm();
+                cons += cE_.value().norm();
             }
         }
 
-        const auto cI_ = to_dense_optional<dvec>(
-            out.contains("cI") ? nb::handle(out["cI"]) : nb::none());
+        const auto cI_ = global_model->get_cI();
         if (cI_)
-            cons += cI_->cwiseMax(0.0).norm();
+            cons += cI_.value().cwiseMax(0.0).norm();
 
         double compl_ = 0.0;
         if (cI_ && lam.size() > 0) {
@@ -1054,18 +1052,19 @@ private:
         return Pproj;
     }
 
+    ModelC *global_model = nullptr;
     // ---------------- core solve ----------------
     [[nodiscard]] TRResult core_solve_(
         const LinOp &Hop, const dvec &g, const std::optional<dmat> &Aineq,
         const std::optional<dvec> &bineq, const std::optional<dmat> &Aeq,
         const std::optional<dvec> &beq, const std::optional<spmat> &sparseH,
-        const std::optional<dmat> &denseH,
-        const std::optional<nb::object> &model, const std::optional<dvec> &x,
-        const std::optional<dvec> &lb, const std::optional<dvec> &ub, double mu,
+        const std::optional<dmat> &denseH, ModelC *model,
+        const std::optional<dvec> &x, const std::optional<dvec> &lb,
+        const std::optional<dvec> &ub, double mu,
         const std::optional<double> &f_old_opt) {
 
-        global_model = model ? *model : nb::none();
-        
+        global_model = model ? model : nullptr;
+
         TRInfo info;
 
         dvec lam(Aineq ? (int)Aineq->rows() : 0);
@@ -1144,7 +1143,7 @@ private:
         // SOC
         if (model && box_.x) {
             auto soc = soc_correction_(
-                *model, *box_.x, p, Hop, denseH, sparseH, lam, mu,
+                model, *box_.x, p, Hop, denseH, sparseH, lam, mu,
                 /*wE*/ 10.0, /*wI*/ 1.0, /*tolE*/ 1e-8, /*violI*/ 0.0,
                 /*reg*/ 1e-12, /*sigma0*/ cfg_.metric_shift, box_.lb, box_.ub);
             if (soc.applied) {
@@ -1165,8 +1164,8 @@ private:
         if (model) {
             if (!f_old) {
                 try {
-                    if (nb::hasattr(*model, "f_current"))
-                        f_old = nb::cast<double>((*model).attr("f_current"));
+                    if (model->get_f())
+                        f_old = model->get_f().value();
                     else if (box_.x)
                         f_old = eval_model_f_theta_(model, box_.x,
                                                     dvec::Zero(g.size()))
@@ -1235,7 +1234,6 @@ private:
         ret.nu = std::move(nu);
 
         // reset global model
-        global_model = nb::none();
         return ret;
     }
 
@@ -1682,8 +1680,7 @@ private:
 
     // --------------- model eval ---------------
     [[nodiscard]] std::pair<std::optional<double>, std::optional<double>>
-    eval_model_f_theta_(const std::optional<nb::object> &model,
-                        const std::optional<dvec> &x,
+    eval_model_f_theta_(ModelC *model, const std::optional<dvec> &x,
                         const dvec &s = dvec()) const {
         if (!model)
             return {std::nullopt, std::nullopt};
@@ -1694,27 +1691,12 @@ private:
             // nb::gil_scoped_acquire gil;
 
             // Ask only for 'f' to keep eval_all light
-            nb::list need;
-            need.append(nb::str("f"));
+            std::vector<std::string> need{"f"};
 
-            nb::object out_obj =
-                model->attr("eval_all")(xt, nb::arg("components") = need);
+            model->eval_all(xt, need);
 
-            if (!nb::isinstance<nb::dict>(out_obj)) {
-                return {std::nullopt, std::nullopt};
-            }
-            nb::dict out = nb::cast<nb::dict>(out_obj);
-
-            static const nb::str k_f("f");
-            std::optional<double> f, th;
-
-            if (out.contains(k_f)) {
-                f = nb::cast<double>(out[k_f]);
-            }
-
-            if (nb::hasattr(*model, "constraint_violation")) {
-                th = nb::cast<double>(model->attr("constraint_violation")(xt));
-            }
+            auto f = model->get_f();
+            auto th = model->constraint_violation(xt);
 
             return {f, th};
         } catch (const nb::python_error &) {
@@ -1727,9 +1709,8 @@ private:
     // --------------- backtracking ---------------
     [[nodiscard]] std::tuple<bool, dvec, std::string, std::optional<double>,
                              std::optional<double>>
-    _backtrack_on_reject_(const std::optional<nb::object> &model,
-                          const std::optional<dvec> &x, const dvec &s,
-                          const std::optional<dvec> &lb,
+    _backtrack_on_reject_(ModelC *model, const std::optional<dvec> &x,
+                          const dvec &s, const std::optional<dvec> &lb,
                           const std::optional<dvec> &ub, double delta,
                           std::optional<double> base_f, int max_tries = 3) {
         static constexpr std::array<double, 3> alphas{0.5, 0.25, 0.125};
@@ -1789,7 +1770,7 @@ private:
     }
 
     [[nodiscard]] SOCResult
-    soc_correction_(const nb::object &model, const dvec &x, const dvec &p,
+    soc_correction_(ModelC *model, const dvec &x, const dvec &p,
                     const LinOp &Hop, const std::optional<dmat> &Hdense,
                     const std::optional<spmat> &Hsparse, const dvec &lam_ineq,
                     double mu, double wE, double wI, double tolE, double violI,
@@ -1803,37 +1784,22 @@ private:
 
         SOCResult R{dvec::Zero(p.size()), false, NAN, NAN};
         const dvec x_trial = x + p;
+        std::vector<std::string> expected_keys = {"cE", "cI", "JE", "JI"};
+        model->eval_all(x_trial, expected_keys);
 
-        // ---- Python calls need the GIL ----
-        nb::list need;
-        need.append(nb::str("cI"));
-        need.append(nb::str("cE"));
-        need.append(nb::str("JI"));
-        need.append(nb::str("JE"));
-
-        nb::dict out = call_eval_all_dict(model, x_trial, need);
-
-        double theta0;
-        {
-            // nb::gil_scoped_acquire gil;
-            theta0 =
-                nb::cast<double>(model.attr("constraint_violation")(x_trial));
-        }
+        double theta0 = model->constraint_violation(x_trial);
         R.theta0 = theta0;
         if (theta0 <= cfg_.constraint_tol)
             return R;
 
-        // Keys as nb::str for nanobind
-        static const nb::str k_cE("cE"), k_cI("cI"), k_JE("JE"), k_JI("JI");
+        auto mI = model->get_mI();
+        auto mE = model->get_mE();
+        const int n = model->get_n();
 
-        const auto cE_ = to_dense_optional<dvec>(
-            out.contains(k_cE) ? nb::handle(out[k_cE]) : nb::none());
-        const auto cI_ = to_dense_optional<dvec>(
-            out.contains(k_cI) ? nb::handle(out[k_cI]) : nb::none());
-        const auto JE_ = to_dense_optional<dmat>(
-            out.contains(k_JE) ? nb::handle(out[k_JE]) : nb::none());
-        const auto JI_ = to_dense_optional<dmat>(
-            out.contains(k_JI) ? nb::handle(out[k_JI]) : nb::none());
+        dmat JI_ = (mI > 0) ? model->get_JI().value() : dmat(mI, n);
+        dmat JE_ = (mE > 0) ? model->get_JE().value() : dmat(mE, n);
+        dvec cI_ = (mI > 0) ? model->get_cI().value() : dvec::Zero(mI);
+        dvec cE_ = (mE > 0) ? model->get_cE().value() : dvec::Zero(mE);
 
         jacobian_condition_ =
             estimate_jacobian_condition_(JE_, JI_, cI_, cfg_.constraint_tol);
@@ -1857,8 +1823,7 @@ private:
         double theta1;
         {
             // nb::gil_scoped_acquire gil;
-            theta1 = nb::cast<double>(
-                model.attr("constraint_violation")(x_trial + q));
+            theta1 = model->constraint_violation(x_trial + q);
         }
         R.theta1 = theta1;
 

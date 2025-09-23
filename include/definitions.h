@@ -4,10 +4,51 @@
 #include <nanobind/eigen/dense.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
+#include <variant>
+#include <unordered_map>
+#include <string>
+#include <optional>
+#include <stdexcept>
+#include <string_view>
+#include <cstring> // std::memcpy
 
 using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
+
+// The value type your map stores (adjust if yours differs)
+using Val = std::variant<double, dvec, dmat, spmat>;
+using Dict = std::unordered_map<std::string, Val>;
+
+// ---------- small helpers ----------
+template <class T>
+inline const T& must_get(const Dict& d, std::string_view key) {
+    auto it = d.find(std::string(key));
+    if (it == d.end())
+        throw std::out_of_range(std::string("key not found: ") + std::string(key));
+    return std::get<T>(it->second);            // throws if wrong alternative
+}
+
+inline bool has_key(const Dict& d, std::string_view key) {
+    return d.find(std::string(key)) != d.end();
+}
+
+// Accept either dense or sparse and always return sparse
+inline spmat to_spmat(const Val& v, int rows, int cols) {
+    return std::visit([&](auto&& M) -> spmat {
+        using T = std::decay_t<decltype(M)>;
+        if constexpr (std::is_same_v<T, spmat>) {
+            return M;
+        } else if constexpr (std::is_same_v<T, dmat>) {
+            spmat S(rows, cols);
+            // Eigen: use sparseView for efficient conversion
+            S = M.sparseView();
+            return S;
+        } else {
+            throw std::runtime_error("Expected (dense|sparse) matrix variant");
+        }
+    }, v);
+}
 
 namespace nb = nanobind;
 using namespace nb::literals;

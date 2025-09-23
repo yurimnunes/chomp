@@ -1435,9 +1435,74 @@ void ADGraph::adoptSubgraph(const ADNodePtr &root) {
             if (in)
                 stack.push_back(in);
     }
-    //peepholeSimplify_();
+    // peepholeSimplify_();
 
     markDirty_();
+}
+
+// In ADGraph.cpp
+
+ADNodePtr ADGraph::adoptSubgraphAndReturnRoot(const ADNodePtr& root_src) {
+    if (!root_src) return nullptr;
+
+    // 1) Collect reachable nodes from root_src in topological order (post-order)
+    struct PtrHash { size_t operator()(const ADNode* p) const noexcept {
+        return std::hash<const void*>{}(p);
+    }};
+    struct PtrEq { bool operator()(const ADNode* a, const ADNode* b) const noexcept {
+        return a == b;
+    }};
+
+    std::unordered_set<const ADNode*, PtrHash, PtrEq> visited;
+    visited.reserve(512);
+    std::vector<const ADNode*> order;
+    order.reserve(512);
+
+    std::function<void(const ADNode*)> dfs = [&](const ADNode* u) {
+        if (!u || !visited.insert(u).second) return;
+        for (const auto& in : u->inputs) dfs(in.get());
+        order.push_back(u); // children first
+    };
+    dfs(root_src.get());
+
+    // 2) Clone nodes without wiring inputs yet
+    std::unordered_map<const ADNode*, ADNodePtr, PtrHash, PtrEq> clone;
+    clone.reserve(order.size() * 2);
+
+    for (const ADNode* u : order) {
+        // Deep-copy the node metadata but NOT the inputs (we wire after)
+        auto v = std::make_shared<ADNode>(*u);
+        v->inputs.clear();
+
+        // If you maintain per-graph IDs, assign a new one here (via addNode):
+        addNode(v); // must set v->id and register in this graph
+
+        // Optional: clean per-run caches/epochs if your ADNode has them
+        // v->val_epoch = v->dot_epoch = v->grad_epoch = 0; etc.
+
+        if (v->type == Operator::Var && !v->name.empty())
+            nodeVariables[v->name] = v;
+
+        clone.emplace(u, v);
+    }
+
+    // 3) Wire inputs to the cloned counterparts
+    for (const ADNode* u : order) {
+        ADNodePtr& v = clone[u];
+        v->inputs.reserve(u->inputs.size());
+        for (const auto& in : u->inputs) {
+            auto it = clone.find(in.get());
+            // in must be reachable (we built from DFS), assert for safety:
+            if (it != clone.end()) v->inputs.push_back(it->second);
+        }
+        // If you keep any nodeIndex_ mapping by pointer, update it here
+        // nodeIndex_[v.get()] = v;  // adjust to your layout
+        markDirty_(v.get());
+    }
+
+    markDirty_();          // graph-level dirty
+    rebuildCache_();       // cheap cache rebuild if you have one
+    return clone[root_src.get()];
 }
 
 void ADGraph::updateNodeIndex_() {
@@ -2113,169 +2178,380 @@ void ADGraph::computeForwardPassAndDotLanesTogether() {
         std::cerr << "Warning: cycle or dangling inputs in AD graph.\n";
 }
 // Call this after adoptSubgraph(...) or right before heavy evaluation.
-void ADGraph::peepholeSimplify_() {
-    // we only *read* the current topo; rebuild if stale,
-    // but we won't touch cache_.adj/radj directly here.
-    if (cache_.dirty) rebuildCache_();
+// Centralized symbolic simplification for ADGraph class
+void ADGraph::simplifyExpression(std::vector<ADNodePtr>& outputs) {
+    auto is_commutative = [](Operator op) -> bool {
+        return op == Operator::Add || op == Operator::Multiply || op == Operator::Max;
+    };
 
-    auto make_cte = [&](double v) -> ADNodePtr {
+    auto make_const = [&](double v) -> ADNodePtr {
         auto c = std::make_shared<ADNode>();
         c->type = Operator::cte;
         c->value = v;
-        addNode(c);                   // ensure it’s in nodes & has an id later
+        addNode(c);
         return c;
     };
 
-    // helpers that mutate u *without* touching u->id
-    auto fold_unary_into = [&](ADNode* u, auto f) {
-        if (u->inputs.size() == 1 && u->inputs[0] && u->inputs[0]->type == Operator::cte) {
-            const double x = u->inputs[0]->value;
-            u->type = Operator::cte;
-            u->value = f(x);
-            u->inputs.clear();
-            return true;
-        }
-        return false;
+    auto rebuild_ptr_map = [&]() -> std::unordered_map<ADNode*, ADNodePtr> {
+        std::unordered_map<ADNode*, ADNodePtr> m;
+        m.reserve(nodes.size() * 2);
+        for (auto &sp : nodes) if (sp) m.emplace(sp.get(), sp);
+        return m;
     };
 
-    auto fold_binary_cte_into = [&](ADNode* u) {
-        if (u->inputs.size() != 2) return false;
-        auto &A = u->inputs[0];
-        auto &B = u->inputs[1];
-        if (!A || !B || A->type != Operator::cte || B->type != Operator::cte) return false;
-
-        const double a = A->value, b = B->value;
-        double y = 0.0;
-        switch (u->type) {
-            case Operator::Add:      y = a + b; break;
-            case Operator::Subtract: y = a - b; break;
-            case Operator::Multiply: y = a * b; break;
-            case Operator::Divide:   y = (b != 0.0) ? (a / b) : 0.0; break;
-            case Operator::Max:      y = (a >= b) ? a : b; break;
-            default: return false;
-        }
-        u->type = Operator::cte;
-        u->value = y;
-        u->inputs.clear();
-        return true;
+    auto make_id_maps = [&]() {
+        std::unordered_map<ADNode*, int> idx;
+        idx.reserve(nodes.size() * 2);
+        for (int i = 0; i < (int)nodes.size(); ++i)
+            if (nodes[i]) idx[nodes[i].get()] = i;
+        return idx;
     };
 
-    // walk current topo; mutate nodes in place
-    for (ADNode* u : cache_.topo) {
-        if (!u) continue;
+    auto get_stable_id = [&](ADNode *u,
+                             const std::unordered_map<ADNode*, int> &ptr2idx) -> int {
+        if (u && u->id >= 0) return u->id; // prefer stable id if you have one
+        auto it = ptr2idx.find(u);
+        return (it == ptr2idx.end()) ? -1 : it->second;
+    };
 
-        // constant folds for simple unaries
-        switch (u->type) {
-            case Operator::Sin:   if (fold_unary_into(u, +[](double x){return std::sin(x);} )) continue; break;
-            case Operator::Cos:   if (fold_unary_into(u, +[](double x){return std::cos(x);} )) continue; break;
-            case Operator::Tan:   if (fold_unary_into(u, +[](double x){return std::tan(x);} )) continue; break;
-            case Operator::Exp:   if (fold_unary_into(u, +[](double x){return std::exp(x);} )) continue; break;
-            case Operator::Log:   if (fold_unary_into(u, +[](double x){return std::log(x > 0 ? x : 1e-16);} )) continue; break;
-            case Operator::Tanh:  if (fold_unary_into(u, +[](double x){return std::tanh(x);} )) continue; break;
-            case Operator::Relu:  if (fold_unary_into(u, +[](double x){return x > 0 ? x : 0;} )) continue; break;
-            default: break;
+    auto build_signature = [&](ADNode *u,
+                               const std::unordered_map<ADNode*, int> &ptr2idx) -> std::string {
+        std::string s;
+        s.reserve(64);
+        s.append(std::to_string((int)u->type)).push_back('|');
+
+        if (u->type == Operator::cte) {
+            s.append("c|").append(std::to_string(u->value));
+            return s;
+        }
+        if (u->type == Operator::Var) {
+            s.append("v|").append(std::to_string(get_stable_id(u, ptr2idx)));
+            return s;
         }
 
-        // algebraic cleanup for Add / Multiply (flatten + remove identities)
-        if (u->type == Operator::Add) {
-            if (u->inputs.empty()) { u->type = Operator::cte; u->value = 0.0; continue; }
+        s.append(std::to_string((int)u->inputs.size())).push_back('|');
+        std::vector<int> child_ids;
+        child_ids.reserve(u->inputs.size());
+        for (auto &inp : u->inputs) child_ids.push_back(get_stable_id(inp.get(), ptr2idx));
+        if (is_commutative(u->type)) std::sort(child_ids.begin(), child_ids.end());
+        for (int id : child_ids) { s.append(std::to_string(id)); s.push_back(','); }
+        return s;
+    };
 
-            std::vector<ADNodePtr> flat;
-            flat.reserve(u->inputs.size());
-            double csum = 0.0;
+    auto replace_uses = [&](ADNode *from,
+                            ADNode *to,
+                            const std::unordered_map<ADNode*, ADNodePtr> &ptr2sp) {
+        auto it_sp = ptr2sp.find(to);
+        if (it_sp == ptr2sp.end()) return;
+        const ADNodePtr &to_sp = it_sp->second;
 
-            for (auto &in : u->inputs) {
-                if (!in) continue;
-                if (in->type == Operator::cte) {
-                    csum += in->value;
-                } else if (in->type == Operator::Add) {
-                    // flatten one level
-                    for (auto &q : in->inputs) if (q) flat.push_back(q);
+        // Update all node inputs
+        for (auto &n : nodes) {
+            if (!n) continue;
+            bool touched = false;
+            for (auto &inp : n->inputs) {
+                if (inp && inp.get() == from) { inp = to_sp; touched = true; }
+            }
+            if (touched) markDirty_(n.get());
+        }
+    };
+
+    // Also patch the outputs if they point to `from`
+    auto replace_in_outputs = [&](ADNode *from,
+                                  ADNode *to,
+                                  const std::unordered_map<ADNode*, ADNodePtr> &ptr2sp) {
+        auto it_sp = ptr2sp.find(to);
+        if (it_sp == ptr2sp.end()) return;
+        const ADNodePtr &to_sp = it_sp->second;
+
+        for (auto &r : outputs) {
+            if (r && r.get() == from) r = to_sp;
+        }
+    };
+
+    bool changed = true;
+    int iterations = 0;
+    const int maxIterations = 10;
+
+    while (changed && iterations < maxIterations) {
+        changed = false;
+        iterations++;
+
+        if (cache_.dirty) rebuildCache_();
+
+        auto ptr2sp  = rebuild_ptr_map();
+        auto ptr2idx = make_id_maps();
+        std::unordered_map<std::string, ADNode*> cse_map; // fresh per pass
+
+        std::vector<ADNode*> topo = cache_.topo;
+
+        for (ADNode *u : topo) {
+            if (!u) continue;
+            if (ptr2sp.find(u) == ptr2sp.end()) continue; // node was removed
+
+            // ---------- Constant folding ----------
+            auto all_const = [&]() {
+                if (u->inputs.empty()) return false;
+                for (auto &inp : u->inputs) if (!inp || inp->type != Operator::cte) return false;
+                return true;
+            }();
+
+            if (all_const) {
+                double result = 0.0;
+                bool canFold  = true;
+                auto arity_is = [&](size_t k){ return u->inputs.size() == k; };
+                auto in = [&](int i){ return u->inputs[i]->value; };
+
+                switch (u->type) {
+                    case Operator::Add: { double s=0.0; for (auto &i:u->inputs) s+=i->value; result=s; break; }
+                    case Operator::Multiply: { double p=1.0; for (auto &i:u->inputs) p*=i->value; result=p; break; }
+                    case Operator::Subtract: if (arity_is(2)) result = in(0)-in(1); else canFold=false; break;
+                    case Operator::Divide:   if (arity_is(2) && in(1)!=0.0) result = in(0)/in(1); else canFold=false; break;
+                    case Operator::Max:      if (arity_is(2)) result = std::max(in(0),in(1)); else canFold=false; break;
+                    case Operator::Sin:      if (arity_is(1)) result = std::sin(in(0)); else canFold=false; break;
+                    case Operator::Cos:      if (arity_is(1)) result = std::cos(in(0)); else canFold=false; break;
+                    case Operator::Tan:      if (arity_is(1)) result = std::tan(in(0)); else canFold=false; break;
+                    case Operator::Exp:      if (arity_is(1)) result = std::exp(in(0)); else canFold=false; break;
+                    case Operator::Log:      if (arity_is(1) && in(0)>0.0) result = std::log(in(0)); else canFold=false; break;
+                    case Operator::Tanh:     if (arity_is(1)) result = std::tanh(in(0)); else canFold=false; break;
+                    case Operator::Relu:     if (arity_is(1)) result = std::max(0.0,in(0)); else canFold=false; break;
+                    case Operator::Gelu:     if (arity_is(1)) { double x=in(0); result = x*0.5*(1.0+std::erf(x*0.7071067811865475)); } else canFold=false; break;
+                    case Operator::Silu:     if (arity_is(1)) { double x=in(0); result = x/(1.0+std::exp(-x)); } else canFold=false; break;
+                    default: canFold=false;
+                }
+
+                if (canFold) {
+                    u->type = Operator::cte;
+                    u->value = result;
+                    u->inputs.clear();
+                    markDirty_(u);
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // ---------- Algebraic simplifications ----------
+            auto replace_with = [&](const ADNodePtr &src) {
+                u->type = src->type;
+                u->value = src->value;
+                u->inputs = src->inputs;
+                markDirty_(u);
+                changed = true;
+            };
+
+            switch (u->type) {
+                case Operator::Add: {
+                    if (u->inputs.empty()) {
+                        u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                        markDirty_(u); changed = true; break;
+                    }
+                    std::vector<ADNodePtr> newInputs;
+                    newInputs.reserve(u->inputs.size());
+                    double constSum = 0.0; bool hasConst = false;
+
+                    for (auto &inp : u->inputs) {
+                        if (!inp) continue;
+                        if (inp->type == Operator::cte) {
+                            constSum += inp->value; hasConst = true;
+                        } else if (inp->type == Operator::Add) {
+                            for (auto &nested : inp->inputs) if (nested) newInputs.push_back(nested);
+                            changed = true;
+                        } else {
+                            newInputs.push_back(inp);
+                        }
+                    }
+                    if (hasConst && constSum != 0.0) {
+                        newInputs.push_back(make_const(constSum));
+                        changed = true;
+                    }
+                    std::unordered_map<ADNode*, int> counts;
+                    counts.reserve(newInputs.size()*2);
+                    for (auto &inp : newInputs) counts[inp.get()]++;
+                    std::vector<ADNodePtr> merged; merged.reserve(newInputs.size());
+                    for (auto &kv : counts) {
+                        ADNode *term = kv.first; int c = kv.second;
+                        if (c == 1) {
+                            merged.push_back(ptr2sp[term]);
+                        } else {
+                            auto coeff = make_const((double)c);
+                            auto mult  = std::make_shared<ADNode>();
+                            mult->type = Operator::Multiply;
+                            mult->inputs = {coeff, ptr2sp[term]};
+                            addNode(mult);
+                            merged.push_back(mult);
+                            changed = true;
+                        }
+                    }
+                    if (merged.empty()) {
+                        u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                        markDirty_(u); changed = true;
+                    } else if (merged.size() == 1) {
+                        replace_with(merged[0]);
+                    } else if (merged != u->inputs) {
+                        u->inputs = std::move(merged);
+                        markDirty_(u); changed = true;
+                    }
+                    break;
+                }
+
+                case Operator::Multiply: {
+                    if (u->inputs.empty()) {
+                        u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
+                        markDirty_(u); changed = true; break;
+                    }
+                    std::vector<ADNodePtr> newInputs;
+                    newInputs.reserve(u->inputs.size());
+                    double constProd = 1.0; bool hasConst=false, hasZero=false;
+
+                    for (auto &inp : u->inputs) {
+                        if (!inp) continue;
+                        if (inp->type == Operator::cte) {
+                            if (inp->value == 0.0) { hasZero = true; break; }
+                            if (inp->value != 1.0) { constProd *= inp->value; hasConst = true; }
+                            if (inp->value != 1.0) changed = true;
+                        } else if (inp->type == Operator::Multiply) {
+                            for (auto &nested : inp->inputs) if (nested) newInputs.push_back(nested);
+                            changed = true;
+                        } else {
+                            newInputs.push_back(inp);
+                        }
+                    }
+                    if (hasZero) {
+                        u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                        markDirty_(u); changed = true; break;
+                    }
+                    if (hasConst && constProd != 1.0) {
+                        newInputs.insert(newInputs.begin(), make_const(constProd));
+                        changed = true;
+                    }
+                    if (newInputs.empty()) {
+                        u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
+                        markDirty_(u); changed = true;
+                    } else if (newInputs.size() == 1) {
+                        replace_with(newInputs[0]);
+                    } else if (newInputs != u->inputs) {
+                        u->inputs = std::move(newInputs);
+                        markDirty_(u); changed = true;
+                    }
+                    break;
+                }
+
+                case Operator::Subtract: {
+                    if (u->inputs.size() == 2) {
+                        auto &a = u->inputs[0]; auto &b = u->inputs[1];
+                        if (b && b->type == Operator::cte && b->value == 0.0) {
+                            replace_with(a);
+                        } else if (a && b && a.get() == b.get()) {
+                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        }
+                    }
+                    break;
+                }
+
+                case Operator::Divide: {
+                    if (u->inputs.size() == 2) {
+                        auto &a = u->inputs[0]; auto &b = u->inputs[1];
+                        if (b && b->type == Operator::cte && b->value == 1.0) {
+                            replace_with(a);
+                        } else if (a && a->type == Operator::cte && a->value == 0.0) {
+                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        } else if (a && b && a.get() == b.get()) {
+                            u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        }
+                    }
+                    break;
+                }
+
+                case Operator::Sin:
+                    if (u->inputs.size() == 1) {
+                        auto &x = u->inputs[0];
+                        if (x && x->type == Operator::cte && x->value == 0.0) {
+                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        }
+                    }
+                    break;
+
+                case Operator::Cos:
+                    if (u->inputs.size() == 1) {
+                        auto &x = u->inputs[0];
+                        if (x && x->type == Operator::cte && x->value == 0.0) {
+                            u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        }
+                    }
+                    break;
+
+                case Operator::Exp:
+                    if (u->inputs.size() == 1) {
+                        auto &x = u->inputs[0];
+                        if (x && x->type == Operator::cte && x->value == 0.0) {
+                            u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        } else if (x && x->type == Operator::Log && x->inputs.size() == 1) {
+                            replace_with(x->inputs[0]); // exp(log(y)) = y
+                        }
+                    }
+                    break;
+
+                case Operator::Log:
+                    if (u->inputs.size() == 1) {
+                        auto &x = u->inputs[0];
+                        if (x && x->type == Operator::cte && x->value == 1.0) {
+                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+                            markDirty_(u); changed = true;
+                        } else if (x && x->type == Operator::Exp && x->inputs.size() == 1) {
+                            replace_with(x->inputs[0]); // log(exp(y)) = y
+                        }
+                    }
+                    break;
+
+                default: break;
+            }
+
+            // ---------- CSE (and root remap) ----------
+            if (u->type != Operator::Var && u->type != Operator::cte) {
+                std::string sig = build_signature(u, ptr2idx);
+                auto it = cse_map.find(sig);
+                if (it != cse_map.end() && it->second != u) {
+                    ADNode *canonical = it->second;
+                    replace_uses(u, canonical, ptr2sp);
+                    replace_in_outputs(u, canonical, ptr2sp); // keep outputs pointing to the canonical
+                    changed = true;
                 } else {
-                    flat.push_back(in);
-                }
-            }
-
-            // append the constant if needed
-            if (csum != 0.0) flat.push_back(make_cte(csum));
-
-            if (flat.empty()) {
-                u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-            } else if (flat.size() == 1) {
-                // replace u with "passthrough" to that op (without copying id)
-                ADNodePtr a = flat[0];
-                u->type   = a->type;
-                u->value  = a->value;
-                u->inputs = a->inputs;   // share children by ptr
-                // DO NOT touch u->id
-            } else {
-                // stable order for better CSE; pointer address is fine
-                std::sort(flat.begin(), flat.end());
-                u->inputs.swap(flat);
-            }
-            continue;
-        }
-
-        if (u->type == Operator::Multiply) {
-            if (u->inputs.empty()) { u->type = Operator::cte; u->value = 1.0; continue; }
-
-            std::vector<ADNodePtr> flat;
-            flat.reserve(u->inputs.size());
-            double cprod = 1.0;
-            bool hasZero = false;
-
-            for (auto &in : u->inputs) {
-                if (!in) continue;
-                if (in->type == Operator::cte) {
-                    if (in->value == 0.0) { hasZero = true; break; }
-                    if (in->value == 1.0) continue;
-                    cprod *= in->value;
-                } else if (in->type == Operator::Multiply) {
-                    for (auto &q : in->inputs) if (q) flat.push_back(q);
-                } else {
-                    flat.push_back(in);
-                }
-            }
-
-            if (hasZero) { u->type = Operator::cte; u->value = 0.0; u->inputs.clear(); continue; }
-            if (cprod != 1.0) flat.push_back(make_cte(cprod));
-
-            if (flat.empty()) {
-                u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
-            } else if (flat.size() == 1) {
-                ADNodePtr a = flat[0];
-                u->type   = a->type;
-                u->value  = a->value;
-                u->inputs = a->inputs;
-            } else {
-                std::sort(flat.begin(), flat.end());
-                u->inputs.swap(flat);
-            }
-            continue;
-        }
-
-        // binary full-folds (cte, cte) for remaining ops
-        (void) fold_binary_cte_into(u);
-
-        // light identities:
-        if (u->type == Operator::Subtract && u->inputs.size()==2) {
-            auto &a = u->inputs[0]; auto &b = u->inputs[1];
-            if (b && b->type == Operator::cte && b->value == 0.0) {
-                // u = a - 0 -> passthrough
-                if (a) { u->type=a->type; u->value=a->value; u->inputs=a->inputs; }
-            }
-        }
-        if (u->type == Operator::Divide && u->inputs.size()==2) {
-            auto &a = u->inputs[0]; auto &b = u->inputs[1];
-            if (b && b->type == Operator::cte) {
-                if (b->value == 1.0 && a) { u->type=a->type; u->value=a->value; u->inputs=a->inputs; }
-                else if (a && a->type==Operator::cte && b->value != 0.0) {
-                    u->type=Operator::cte; u->value=a->value / b->value; u->inputs.clear();
+                    cse_map.emplace(std::move(sig), u);
                 }
             }
         }
+
+        if (changed) rebuildCacheFull_();
     }
 
-    // graph structure changed; do a **full** rebuild to recompute ids/edges
+    // ---------- Final cleanup: keep everything reachable from outputs ----------
+    std::unordered_set<ADNode*> reachable;
+    reachable.reserve(nodes.size() * 2);
+
+    std::function<void(ADNode*)> dfs = [&](ADNode *node) {
+        if (!node || reachable.count(node)) return;
+        reachable.insert(node);
+        for (auto &inp : node->inputs) if (inp) dfs(inp.get());
+    };
+
+    // anchor from outputs
+    for (auto &r : outputs) if (r) dfs(r.get());
+    // also keep your original anchors if you want
+    for (const auto &kv : nodeVariables) if (kv.second) dfs(kv.second.get());
+    for (const auto &kv : nodeIndex_)    if (kv.second) dfs(kv.second.get());
+
+    nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
+                   [&](const ADNodePtr &sp) {
+                       return sp && (reachable.find(sp.get()) == reachable.end());
+                   }),
+                nodes.end());
+
     rebuildCacheFull_();
 }
+

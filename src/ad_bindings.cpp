@@ -1,5 +1,5 @@
 // ad.cpp — nanobind + NumPy fast paths + GIL release (C++23, de-duplicated)
-
+#pragma once
 #include <nanobind/eigen/dense.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -447,6 +447,7 @@ static inline Compiled compile_to_graph(nb::object f, size_t arity,
         throw std::invalid_argument("compile: function returned None");
     auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
     out.g->adoptSubgraph(expr->node);
+    // out.g->simplifyExpression();
     out.root = expr->node;
     return out;
 }
@@ -532,6 +533,22 @@ public:
         return fval;
     }
 
+    [[gnu::hot]] double value_eigen(const Eigen::VectorXd &x) {
+        if ((size_t)x.size() != var_nodes.size()) [[unlikely]]
+            throw std::invalid_argument("GradFn.value: wrong input length");
+        for (size_t i = 0; i < var_nodes.size(); ++i)
+            var_nodes[i]->value = x[i]; // implicit cast double <- scalar
+
+        double fval;
+        {
+            nb::gil_scoped_release nogil;
+            g->resetForwardPass();
+            g->computeForwardPass();
+            fval = expr_root->value;
+        }
+        return fval;
+    }
+
     [[gnu::hot]] std::pair<double, Arr1D> value_grad_numpy(Arr1D x_in) {
         auto x = as_span_1d(x_in);
         if (x.size() != var_nodes.size()) [[unlikely]]
@@ -555,6 +572,33 @@ public:
         double *gd = grad.data();
         for (size_t i = 0; i < var_nodes.size(); ++i)
             gd[i] = var_nodes[i]->gradient;
+        return {fval, std::move(grad)};
+    }
+
+    [[gnu::hot]] std::pair<double, Eigen::VectorXd>
+    value_grad_eigen(const Eigen::VectorXd &x_in) {
+        // convert x_in to span 1d
+        auto x = std::span<const double>(x_in.data(), (size_t)x_in.size());
+        if ((size_t)x.size() != var_nodes.size()) [[unlikely]]
+            throw std::invalid_argument(
+                "GradFn.value_grad: wrong input length");
+        for (size_t i = 0; i < var_nodes.size(); ++i)
+            var_nodes[i]->value = x[i]; // implicit cast double <- scalar
+
+        double fval;
+        {
+            nb::gil_scoped_release nogil;
+            g->resetGradients();
+            g->resetForwardPass();
+            g->computeForwardPass();
+            fval = expr_root->value;
+            set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
+                            g->cur_grad_epoch_, 1.0);
+            g->initiateBackwardPass(expr_root);
+        }
+        Eigen::VectorXd grad(var_nodes.size());
+        for (size_t i = 0; i < var_nodes.size(); ++i)
+            grad[i] = var_nodes[i]->gradient;
         return {fval, std::move(grad)};
     }
 
@@ -810,8 +854,10 @@ public:
         add_lin(cE_funs, nu_nodes);
 
         L_root = acc;
-        g->initializeNodeVariables();
         build_permutations_once_();
+
+        g->initializeNodeVariables();
+        /// g->simplifyExpression();
 
         {
             nb::gil_scoped_release nogil;
@@ -914,6 +960,66 @@ public:
                 for (size_t gi = 0; gi < n; ++gi) {
                     const size_t xi = (size_t)g2x_[gi];
                     Hd[xi * n + col_x] = Y[gi * L + j];
+                }
+            }
+        }
+        return H;
+    }
+
+    Eigen::MatrixXd hess_eigen(const Eigen::Ref<const Eigen::VectorXd> &x_in,
+                               const Eigen::Ref<const Eigen::VectorXd> &lam_in,
+                               const Eigen::Ref<const Eigen::VectorXd> &nu_in) {
+        // If you already have a native (non-numpy) set_state(), call it here.
+        // Otherwise, keep this call, or add a thin overload that forwards to
+        // internal buffers.
+        set_state_eigen(
+            x_in, lam_in,
+            nu_in); // implement this or replace with set_state_numpy wrapper
+
+        const size_t n = x_nodes.size();
+        Eigen::MatrixXd H(n, n); // column-major by default
+
+        build_permutations_once_();
+
+        constexpr size_t L = 16; // block size (columns per sweep)
+        // Row-major scratch to match your existing "ld = L" layout and indexing
+        // (gi*L + j)
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+            V(n, L);
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+            Y(n, L);
+
+        for (size_t base = 0; base < n; base += L) {
+            const size_t k = std::min(L, n - base);
+
+            // Build a block of k basis vectors in graph-order (g) with
+            // row-major layout
+            V.setZero();
+            for (size_t j = 0; j < k; ++j) {
+                const size_t xj = base + j; // x-index of this column
+                const int gij = x2g_[xj];   // corresponding graph index
+                V(static_cast<Eigen::Index>(gij),
+                  static_cast<Eigen::Index>(j)) = 1.0;
+            }
+
+            {
+                // Perform k Hessian·v products at once (no GIL, native code)
+                nb::gil_scoped_release nogil;
+                // Arguments mirror your original:
+                //   (root, V.data(), ldV=L, Y.data(), ldY=L, k_cols)
+                g->hessianMultiVectorProduct(L_root, V.data(), L, Y.data(), L,
+                                             k);
+            }
+
+            // Scatter back to H columns in x-order using g2x_ permutation
+            for (size_t j = 0; j < k; ++j) {
+                const size_t col_x = base + j;
+                for (size_t gi = 0; gi < n; ++gi) {
+                    const size_t xi = static_cast<size_t>(g2x_[gi]);
+                    H(static_cast<Eigen::Index>(xi),
+                      static_cast<Eigen::Index>(col_x)) =
+                        Y(static_cast<Eigen::Index>(gi),
+                          static_cast<Eigen::Index>(j));
                 }
             }
         }
@@ -1185,6 +1291,57 @@ batch_value_grad_from_gradfns(const std::vector<std::shared_ptr<GradFn>> &gfs,
             for (ssize_t i = 0; i < n; ++i)
                 Jd[(size_t)j * (size_t)n + (size_t)i] =
                     gf->var_nodes[(size_t)i]->gradient;
+        }
+    }
+
+    return {std::move(vals), std::move(J)};
+}
+using dvec = Eigen::VectorXd;
+using dmat = Eigen::MatrixXd;
+
+static inline std::pair<dvec, dmat> batch_value_grad_from_gradfns_eigen(
+    const std::vector<std::shared_ptr<GradFn>> &gfs, const dvec &x) {
+    const Eigen::Index m = static_cast<Eigen::Index>(gfs.size());
+    const Eigen::Index n = x.size();
+
+    if (m == 0) {
+        return {dvec(0), dmat(0, n)}; // zero-row Jacobian with n cols
+    }
+
+    // sanity: all arities must match x.size()
+    for (const auto &gf : gfs) {
+        if (!gf)
+            throw std::invalid_argument("batch_valgrad: null GradFn");
+        if (static_cast<Eigen::Index>(gf->var_nodes.size()) != n)
+            throw std::invalid_argument("batch_valgrad: inconsistent arity");
+    }
+
+    dvec vals(m);
+    dmat J(m, n);
+
+    {
+        nb::gil_scoped_release nogil;
+
+        for (Eigen::Index j = 0; j < m; ++j) {
+            auto &gf = gfs[static_cast<size_t>(j)];
+
+            // set inputs
+            for (Eigen::Index i = 0; i < n; ++i)
+                gf->var_nodes[static_cast<size_t>(i)]->value = x[i];
+
+            // fused value+grad
+            gf->g->resetGradients();
+            gf->g->resetForwardPass();
+            gf->g->computeForwardPass();
+            vals[j] = gf->expr_root->value;
+
+            set_epoch_value(gf->expr_root->gradient, gf->expr_root->grad_epoch,
+                            gf->g->cur_grad_epoch_, 1.0);
+            gf->g->initiateBackwardPass(gf->expr_root);
+
+            // copy gradient row j
+            for (Eigen::Index i = 0; i < n; ++i)
+                J(j, i) = gf->var_nodes[static_cast<size_t>(i)]->gradient;
         }
     }
 

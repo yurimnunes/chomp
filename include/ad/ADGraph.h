@@ -246,6 +246,15 @@ struct ADGraph {
     void deleteNode(const ADNodePtr &node);
     void addNode(const ADNodePtr &node);
     void makeNodesUnique();
+    // In ADGraph.h
+    void simplifyExpression(std::vector<ADNodePtr> &outputs);
+    inline void simplifyExpression(ADNodePtr &root) {
+        std::vector<ADNodePtr> outs{root};
+        simplifyExpression(outs);
+        root = outs[0];
+    }
+
+    ADNodePtr adoptSubgraphAndReturnRoot(const ADNodePtr &root_src);
 
     void computeForwardPassAndDotLanesTogether();
 

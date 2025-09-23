@@ -18,6 +18,7 @@
 
 #include "../include/tr.h" // TrustRegionManager, TRConfig, TRResult, TRInfo
 #include "definitions.h"
+#include "model.h"
 
 namespace nb = nanobind;
 using dvec = Eigen::VectorXd;
@@ -115,68 +116,52 @@ public:
     // Single constructor: builds native TrustRegionManager from cfg
     explicit SQPStepper(nb::object cfg, nb::object hess_mgr,
                         nb::object qp_solver, nb::object regularizer,
-                        nb::object restoration)
+                        nb::object restoration, ModelC *model = nullptr)
         : cfg_(std::move(cfg)), hess_(std::move(hess_mgr)),
           qp_(std::move(qp_solver)), reg_(std::move(regularizer)),
-          rest_(std::move(restoration)), tr_(build_tr_config_from_cfg_(cfg_)) {
+          rest_(std::move(restoration)), tr_(build_tr_config_from_cfg_(cfg_)),
+          model_(model) {
         init_misc_();
     }
-    std::tuple<dvec, dvec, dvec, SolverInfo> step(nb::object model,
-                                                  const dvec &x_in,
-                                                  const dvec &lam_in,
-                                                  const dvec &nu_in, int it) {
+
+    std::shared_ptr<regx::Regularizer> regularizer_ =
+        std::make_shared<regx::Regularizer>();
+
+    ModelC *model_ = nullptr; // optional ModelC pointer for AD Hessians
+
+    std::tuple<dvec, dvec, dvec, SolverInfo>
+    step(const dvec &x_in, const dvec &lam_in, const dvec &nu_in, int it) {
         // ---- 0) Box clipping ----
-        std::optional<dvec> lb = get_opt_vec_attr(model, "lb");
-        std::optional<dvec> ub = get_opt_vec_attr(model, "ub");
+        std::optional<dvec> lb = model_->get_lb();
+        std::optional<dvec> ub = model_->get_ub();
+        auto mI = model_->get_mI();
+        auto mE = model_->get_mE();
+        auto n = model_->get_n();
         dvec x = clip_box(x_in, lb, ub);
 
         // ---- 1) Evaluate once at x ----
-        nb::list need;
-        need.append(nb::str("f"));
-        need.append(nb::str("g"));
-        need.append(nb::str("cI"));
-        need.append(nb::str("JI"));
-        need.append(nb::str("cE"));
-        need.append(nb::str("JE"));
+        std::vector<std::string> need_strs = {"f", "g", "JI", "JE", "cI", "cE"};
 
-        nb::object d0_obj = model.attr("eval_all")(x, "components"_a = need);
-        nb::dict d0 = nb::cast<nb::dict>(d0_obj);
+        model_->eval_all(x, need_strs);
 
-        // cache string keys (avoids repeated temporary construction)
-        static const nb::str k_f("f"), k_g("g"), k_JI("JI"), k_JE("JE"),
-            k_cI("cI"), k_cE("cE");
+        const double f0 = model_->get_f().value();
+        const dvec g0 = model_->get_g().value();
 
-        const double f0 = nb::cast<double>(d0[k_f]);
-        const dvec g0 = nb::cast<dvec>(d0[k_g]);
+        spmat JI =
+            (mI > 0) ? model_->get_JI().value().sparseView() : spmat(mI, n);
+        spmat JE =
+            (mE > 0) ? model_->get_JE().value().sparseView() : spmat(mE, n);
+        dvec cI = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
+        dvec cE = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
 
-        auto JI = opt_mat_from_py(get_or_none(d0, "JI"));
-        auto JE = opt_mat_from_py(get_or_none(d0, "JE"));
-        auto cI = opt_vec_from_py(get_or_none(d0, "cI"));
-        auto cE = opt_vec_from_py(get_or_none(d0, "cE"));
-
-        const double theta0 =
-            nb::cast<double>(model.attr("constraint_violation")(x));
+        const double theta0 = model_->constraint_violation(x);
 
         // ---- 2) Lagrangian Hessian + regularization ----
-        nb::object H_raw_py =
-            model.attr("lagrangian_hessian")(x, lam_in, nu_in);
-        const double tr_delta_at_call = tr_.get_delta();
-        const double gnorm = g0.norm();
+        auto H_obj = model_->hess(x, lam_in, nu_in);
+        spmat H0 = H_obj.sparseView();
 
-        nb::object reg_out =
-            reg_.attr("regularize")(H_raw_py, it, gnorm, tr_delta_at_call);
-
-        // `regularize` may return H or (H, meta). Handle both.
-        nb::object H_psd_py;
-        if (nb::isinstance<nb::tuple>(reg_out)) {
-            nb::tuple t = nb::cast<nb::tuple>(reg_out);
-            H_psd_py = (t.size() >= 1) ? t[0] : nb::none();
-        } else {
-            H_psd_py = reg_out;
-        }
-
-        // If H comes as numpy-like; nanobind eigen caster will handle it
-        dmat H = nb::cast<dmat>(H_psd_py);
+        auto [H, reg_info] = regularizer_->regularize(H0, it);
+        H.makeCompressed();
 
         // Optional: set TR metric from H
         const std::string norm_type =
@@ -185,21 +170,22 @@ public:
             tr_.set_metric_from_H_dense(H);
         }
 
+        const double tr_delta_at_call = tr_.get_delta();
+        const double gnorm = g0.norm();
         std::cout << "[SQP] it=" << it << " f=" << f0 << " ||g||=" << gnorm
                   << " theta=" << theta0 << " delta=" << tr_.get_delta()
                   << "\n";
 
         // ---- 3) Native TR solve (dense path) ----
-        TRResult out =
-            tr_.solve_dense(H, g0,
-                            /*A_ineq*/ JI, /*b_ineq*/ cI,
-                            /*A_eq*/ JE, /*b_eq*/ cE,
-                            /*model*/ std::optional<nb::object>(model),
-                            /*x*/ std::optional<dvec>(x),
-                            /*lb*/ lb,
-                            /*ub*/ ub,
-                            /*mu*/ get_attr_or<double>(model, "mu", 0.0),
-                            /*f_old*/ std::optional<double>(f0));
+        TRResult out = tr_.solve_dense(H, g0,
+                                       /*A_ineq*/ JI, /*b_ineq*/ cI,
+                                       /*A_eq*/ JE, /*b_eq*/ cE,
+                                       /*model*/ model_,
+                                       /*x*/ std::optional<dvec>(x),
+                                       /*lb*/ lb,
+                                       /*ub*/ ub,
+                                       /*mu*/ 0.0,
+                                       /*f_old*/ std::optional<double>(f0));
 
         const dvec &p = out.p;
         const dvec &lam_usr = out.lam;
@@ -217,19 +203,18 @@ public:
         // ---- 4) Trial evaluation ----
         const dvec x_trial = x + p;
 
-        nb::object d1_obj =
-            model.attr("eval_all")(x_trial, "components"_a = need);
-        nb::dict d1 = nb::cast<nb::dict>(d1_obj);
+        model_->eval_all(x_trial, need_strs);
 
-        const double f1 = nb::cast<double>(d1[k_f]);
-        const dvec g1 = nb::cast<dvec>(d1[k_g]);
-        auto JE1 = opt_mat_from_py(get_or_none(d1, "JE"));
-        auto JI1 = opt_mat_from_py(get_or_none(d1, "JI"));
-        auto cE1 = opt_vec_from_py(get_or_none(d1, "cE"));
-        auto cI1 = opt_vec_from_py(get_or_none(d1, "cI"));
+        const double f1 = model_->get_f().value();
+        const dvec g1 = model_->get_g().value();
+        spmat JI1 =
+            (mI > 0) ? model_->get_JI().value().sparseView() : spmat(mI, n);
+        spmat JE1 =
+            (mE > 0) ? model_->get_JE().value().sparseView() : spmat(mE, n);
+        dvec cI1 = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
+        dvec cE1 = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
 
-        const double theta1 =
-            nb::cast<double>(model.attr("constraint_violation")(x_trial));
+        const double theta1 = model_->constraint_violation(x_trial);
 
         // Bound multipliers (not returned by TR): zeros for KKT
         dvec zL = dvec::Zero(x.size());
@@ -240,9 +225,9 @@ public:
                                zL, zU, lb, ub);
 
         // ---- 6) Convergence test ----
-        const double cEn = cE ? cE->norm() : 0.0;
+        const double cEn = (model_->get_cE() ? model_->get_cE()->norm() : 0.0);
         const double cIn =
-            cI ? cI->cwiseMax(0.0).lpNorm<Eigen::Infinity>() : 0.0;
+            (model_->get_cI() ? model_->get_cI()->cwiseMax(0.0).lpNorm<Eigen::Infinity>() : 0.0);
         const double g_scale = std::max(1.0, g0.norm() + std::max(cEn, cIn));
 
         const bool converged =
@@ -259,24 +244,25 @@ public:
              get_attr_or<double>(cfg_, "tol_obj_change", 1e-12));
 
         // ---- 7) Optional quasi-Newton update ----
-        const std::string hmode = get_attr_or<std::string>(
-            cfg_, "hessian_mode", std::string("exact"));
-        if (hmode == "bfgs" || hmode == "lbfgs" || hmode == "hybrid") {
-            // Prefer a dedicated model method if available
-            if (nb::hasattr(model, "hessian_update")) {
-                // pass acceptance flag if your model supports it
-                try {
-                    model.attr("hessian_update")(p, g1 - g0,
-                                                 "accepted"_a = tinfo.accepted);
-                } catch (const nb::python_error &) {
-                    // fall back silently to hess_ if model refuses the call
-                    if (nb::hasattr(hess_, "update"))
-                        hess_.attr("update")(p, g1 - g0);
-                }
-            } else if (nb::hasattr(hess_, "update")) {
-                hess_.attr("update")(p, g1 - g0);
-            }
-        }
+        // const std::string hmode = get_attr_or<std::string>(
+        //     cfg_, "hessian_mode", std::string("exact"));
+        // if (hmode == "bfgs" || hmode == "lbfgs" || hmode == "hybrid") {
+        //     // Prefer a dedicated model method if available
+        //     if (nb::hasattr(model, "hessian_update")) {
+        //         // pass acceptance flag if your model supports it
+        //         try {
+        //             model.attr("hessian_update")(p, g1 - g0,
+        //                                          "accepted"_a =
+        //                                          tinfo.accepted);
+        //         } catch (const nb::python_error &) {
+        //             // fall back silently to hess_ if model refuses the call
+        //             if (nb::hasattr(hess_, "update"))
+        //                 hess_.attr("update")(p, g1 - g0);
+        //         }
+        //     } else if (nb::hasattr(hess_, "update")) {
+        //         hess_.attr("update")(p, g1 - g0);
+        //     }
+        // }
 
         // ---- 8) Pack & return ----
         const double step_norm = tinfo.step_norm;

@@ -34,6 +34,8 @@
 #include "linesearch.h"
 #include "regularizer.h"
 
+#include "../src/ad_bindings.cpp" // pyu, pyconv
+#include "model.h"                // Model
 #include <chrono>
 #include <iomanip> // std::setprecision
 
@@ -151,80 +153,44 @@ struct Sigmas {
 // ---------- Helpers ----------
 namespace detail {
 
-[[nodiscard]] inline Bounds get_bounds(const nb::object &model, const dvec &x) {
-    const int n = static_cast<int>(x.size());
-    Bounds B;
-
-    // lb / ub
-    if (pyu::has_attr(model, "lb") && !model.attr("lb").is_none()) {
-        dvec lb_vec = pyconv::to_vec_safe(model.attr("lb"));
-        B.lb = (lb_vec.size() == n) ? std::move(lb_vec)
-                                    : dvec::Constant(n, -consts::INF);
-    } else
-        B.lb = dvec::Constant(n, -consts::INF);
-
-    if (pyu::has_attr(model, "ub") && !model.attr("ub").is_none()) {
-        dvec ub_vec = pyconv::to_vec_safe(model.attr("ub"));
-        B.ub = (ub_vec.size() == n) ? std::move(ub_vec)
-                                    : dvec::Constant(n, +consts::INF);
-    } else
-        B.ub = dvec::Constant(n, +consts::INF);
-
-    B.hasL.assign(n, 0);
-    B.hasU.assign(n, 0);
-    B.sL.resize(n);
-    B.sU.resize(n);
-
-    for (int i = 0; i < n; ++i) {
-        const bool hL = std::isfinite(B.lb[i]);
-        const bool hU = std::isfinite(B.ub[i]);
-        B.hasL[i] = static_cast<uint8_t>(hL);
-        B.hasU[i] = static_cast<uint8_t>(hU);
-        B.sL[i] = hL ? clamp_min(x[i] - B.lb[i], consts::EPS_POS) : 1.0;
-        B.sU[i] = hU ? clamp_min(B.ub[i] - x[i], consts::EPS_POS) : 1.0;
-    }
-    return B;
-}
-
 [[nodiscard]] inline Sigmas
-build_sigmas(const dvec& zL, const dvec& zU, const Bounds& B, 
-                      const dvec& lmb, const dvec& s, const dvec& cI, 
-                      double tau_shift, double bound_shift, bool use_shifted, 
-                      double eps_abs, double cap) {
+build_sigmas(const dvec &zL, const dvec &zU, const Bounds &B, const dvec &lmb,
+             const dvec &s, const dvec &cI, double tau_shift,
+             double bound_shift, bool use_shifted, double eps_abs, double cap) {
     const int n = static_cast<int>(zL.size());
     const int mI = static_cast<int>(s.size());
     Sigmas S;
-    
+
     // Ultra-vectorized Sigma_x computation
     S.Sigma_x = dvec::Zero(n);
-    
+
     if (n > 0) {
         const double shift = use_shifted ? bound_shift : 0.0;
-        
+
         // Convert bounds to Eigen arrays for vectorization
         dvec hasL_float(n), hasU_float(n), sL_vec(n), sU_vec(n);
-        
+
         // Single loop to extract all bound data
         for (int i = 0; i < n; ++i) {
             hasL_float[i] = B.hasL[i] ? 1.0 : 0.0;
-            hasU_float[i] = B.hasU[i] ? 1.0 : 0.0; 
+            hasU_float[i] = B.hasU[i] ? 1.0 : 0.0;
             sL_vec[i] = B.sL[i];
             sU_vec[i] = B.sU[i];
         }
-        
+
         // Fully vectorized computation
         dvec dL = (sL_vec.array() + shift).max(eps_abs);
         dvec dU = (sU_vec.array() + shift).max(eps_abs);
-        
+
         dvec zL_contrib = hasL_float.cwiseProduct(zL.cwiseQuotient(dL));
         dvec zU_contrib = hasU_float.cwiseProduct(zU.cwiseQuotient(dU));
-        
+
         S.Sigma_x = (zL_contrib + zU_contrib).array().max(0.0).min(cap);
     }
-    
+
     // Same vectorized Sigma_s as above
     S.Sigma_s = dvec::Zero(mI);
-    
+
     if (mI > 0) {
         if (use_shifted) {
             dvec d = (s.array() + tau_shift).max(eps_abs);
@@ -235,7 +201,7 @@ build_sigmas(const dvec& zL, const dvec& zU, const Bounds& B,
             S.Sigma_s = (lmb.cwiseQuotient(sv)).array().max(0.0).min(cap);
         }
     }
-    
+
     return S;
 }
 
@@ -361,6 +327,30 @@ inline void cap_bound_duals_sigma_box(dvec &zL, dvec &zU, const Bounds &B,
 // ---------- Main Interior Point Stepper ----------
 class InteriorPointStepper {
 public:
+    Bounds get_bounds(const dvec &x) {
+        const int n = static_cast<int>(x.size());
+        Bounds B;
+
+        // lb / ub
+        B.lb = m_->get_lb().value_or(dvec::Constant(n, -consts::INF));
+        B.ub = m_->get_ub().value_or(dvec::Constant(n, consts::INF));
+
+        B.hasL.assign(n, 0);
+        B.hasU.assign(n, 0);
+        B.sL.resize(n);
+        B.sU.resize(n);
+
+        for (int i = 0; i < n; ++i) {
+            const bool hL = std::isfinite(B.lb[i]);
+            const bool hU = std::isfinite(B.ub[i]);
+            B.hasL[i] = static_cast<uint8_t>(hL);
+            B.hasU[i] = static_cast<uint8_t>(hU);
+            B.sL[i] = hL ? clamp_min(x[i] - B.lb[i], consts::EPS_POS) : 1.0;
+            B.sU[i] = hU ? clamp_min(B.ub[i] - x[i], consts::EPS_POS) : 1.0;
+        }
+        return B;
+    }
+
     IPState st{};
     std::shared_ptr<LineSearcher> ls_;
     std::shared_ptr<regx::Regularizer> regularizer_ =
@@ -374,8 +364,10 @@ public:
     double richardson_tolerance_ = 1e-8;
     int max_richardson_order_ = 3;
 
-    InteriorPointStepper(nb::object cfg, nb::object hess)
-        : cfg_(std::move(cfg)), hess_(std::move(hess)) {
+    ModelC* m_ = nullptr;
+    InteriorPointStepper(nb::object cfg, nb::object hess, ModelC* cfg_model)
+        : cfg_(std::move(cfg)), hess_(std::move(hess)),
+          m_(cfg_model) {
         load_defaults_();
         load_gondzio_defaults_();
         std::shared_ptr<Funnel> funnel = std::shared_ptr<Funnel>();
@@ -414,13 +406,8 @@ public:
         return {refined_dx, error_estimate, converged};
     }
 
-    // Pre-interned Python strings/tuples for hot paths
-    nb::str s_f{"f"}, s_g{"g"}, s_cI{"cI"}, s_cE{"cE"}, s_JI{"JI"}, s_JE{"JE"};
-    nb::tuple comps_all{nb::make_tuple(s_f, s_g, s_cI, s_JI, s_cE, s_JE)};
-    nb::tuple comps_new{nb::make_tuple(s_f, s_g, s_cI, s_cE, s_JI, s_JE)};
-
     std::tuple<dvec, dvec, dvec, SolverInfo>
-    step(nb::object model, const dvec &x, const dvec &lam, const dvec &nu,
+    step(const dvec &x, const dvec &lam, const dvec &nu,
          int it, std::optional<IPState> /*ip_state_opt*/ = std::nullopt) {
 
 #if IP_PROFILE
@@ -429,7 +416,7 @@ public:
 
         // -------------------- Init / state --------------------
         if (!st.initialized) {
-            st = state_from_model_(model, x);
+            st = state_from_model_(x);
         }
         const int n = static_cast<int>(x.size());
         const int mI = st.mI;
@@ -451,52 +438,36 @@ public:
         IP_LAP("init/state");
 
         // -------------------- Evaluate model --------------------
-        nb::dict d0 = nb::cast<nb::dict>(model.attr("eval_all")(x, comps_all));
+        // nb::dict d0 = nb::cast<nb::dict>(model->attr("eval_all")(x,
+        // comps_all));
+        m_->eval_all(x);
         IP_LAP("eval_all(x)");
 
-        const double f = nb::cast<double>(d0[s_f]);
-        dvec g = pyconv::to_vec_safe(d0[s_g]);
+        const double f = m_->get_f().value_or(0.0); // FIX 0
 
-        nb::object cI_o = nb_dict_get(d0, s_cI);
-        nb::object cE_o = nb_dict_get(d0, s_cE);
-        dvec cI = (mI > 0 && !cI_o.is_none()) ? pyconv::to_vec_safe(cI_o)
-                                              : dvec::Zero(mI);
-        dvec cE = (mE > 0 && !cE_o.is_none()) ? pyconv::to_vec_safe(cE_o)
-                                              : dvec::Zero(mE);
+        dvec g = m_->get_g().value_or(dvec::Zero(n)); // FIX 1
+
+        // If mI/mE can be zero, build zeros explicitly on that branch.
+        // Don’t mix a variant with an Eigen expression in the same ternary.
+        dvec cI = (mI > 0) ? m_->get_cI().value() : dvec::Zero(mI);
+        dvec cE = (mE > 0) ? m_->get_cE().value() : dvec::Zero(mE);
         IP_LAP("extract f,g,cI,cE");
 
-        // JI / JE (prefer zero-copy view)
-        spmat JI, JE;
-        nb::object JI_o = nb_dict_get(d0, s_JI);
-        nb::object JE_o = nb_dict_get(d0, s_JE);
+        // For Jacobians, do NOT assign to nb::object. Extract as (dense|sparse)
+        // and normalize. If the producer may return either dense or sparse,
+        // accept both:
+        spmat JI = (mI > 0) ? m_->get_JI().value().sparseView()
+                            : spmat(mI, n); // empty OK
 
-        if (mI > 0 && !JI_o.is_none()) {
-            if (auto v = pyconv::to_sparse_view_any<spmat>(JI_o)) {
-                JI = v->map;
-                JI.makeCompressed();
-            } else {
-                JI = pyconv::to_sparse(JI_o);
-            }
-            if (JI.rows() != mI || JI.cols() != n)
-                throw std::runtime_error("JI dimension mismatch");
-        }
-        if (mE > 0 && !JE_o.is_none()) {
-            if (auto v = pyconv::to_sparse_view_any<spmat>(JE_o)) {
-                JE = v->map;
-                JE.makeCompressed();
-            } else {
-                JE = pyconv::to_sparse(JE_o);
-            }
-            if (JE.rows() != mE || JE.cols() != n)
-                throw std::runtime_error("JE dimension mismatch");
-        }
+        spmat JE =
+            (mE > 0) ? m_->get_JE().value().sparseView() : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE");
 
-        double theta = nb::cast<double>(model.attr("constraint_violation")(x));
+        double theta = m_->constraint_violation(x);
         IP_LAP("constraint_violation(x)");
 
         // -------------------- Bounds & adaptive shifts --------------------
-        Bounds B = detail::get_bounds(model, x);
+        Bounds B = get_bounds(x);
         if (use_shifted && shift_adapt) {
             tau_shift = adaptive_shift_slack_(s, cI, it);
             st.tau_shift = tau_shift;
@@ -586,14 +557,16 @@ public:
                                  use_shifted, eps_abs, cap);
         IP_LAP("build_sigmas");
 
-        nb::object H_obj = pyu::getattr_or<bool>(cfg_, "ip_exact_hessian", true)
-                               ? model.attr("lagrangian_hessian")(
-                                     x, nb::cast(lmb), nb::cast(nuv))
-                               : hess_.attr("get_hessian")(
-                                     model, x, nb::cast(lmb), nb::cast(nuv));
+        // nb::object lag_obj = model->attr("lag_hessian");
+        // LagHessFn *lag_ptr = nb::cast<LagHessFn *>(lag_obj);
+        // auto H_obj = lag_ptr->hess_eigen(x, lmb, nuv);
+
+        auto H_obj = m_->hess(x, lmb, nuv);
+
+        // spmat H0 = pyconv::to_sparse(H_obj);
+        spmat H0 = H_obj.sparseView();
         IP_LAP("get Hessian");
 
-        spmat H0 = pyconv::to_sparse(H_obj);
         auto [H, reg_info] = regularizer_->regularize(H0, it);
         H.makeCompressed();
         IP_LAP("regularize(H)");
@@ -700,7 +673,7 @@ public:
         IP_LAP("richardson refine");
 
         auto ls_res =
-            ls_->search(model, x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), mu,
+            ls_->search(m_, x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), mu,
                         g.dot(dx), theta, alpha_max);
         alpha = std::get<0>(ls_res);
         ls_iters = std::get<1>(ls_res);
@@ -724,11 +697,9 @@ public:
             info.step_norm = (x_new - x).norm();
             info.accepted = true;
             info.converged = false;
-            double f_new =
-                nb::cast<double>(model.attr("eval_all")(x_new, comps_all)[s_f]);
+            double f_new = 0.0; // TODO eval f at x_new?
             info.f = f_new;
-            info.theta =
-                nb::cast<double>(model.attr("constraint_violation")(x_new));
+            info.theta = m_->constraint_violation(x_new);
             info.stat = 0.0;
             info.ineq = 0.0;
             info.eq = 0.0;
@@ -751,35 +722,28 @@ public:
         dvec zL_new = zL + alpha * dzL;
         dvec zU_new = zU + alpha * dzU;
 
-        Bounds Bn = detail::get_bounds(model, x_new);
+        Bounds Bn = get_bounds(x_new);
         detail::cap_bound_duals_sigma_box(zL_new, zU_new, Bn, use_shifted,
                                           bound_shift, mu, 1e10);
         IP_LAP("apply step & cap");
 
-        nb::dict dN =
-            nb::cast<nb::dict>(model.attr("eval_all")(x_new, comps_new));
-        double f_new = nb::cast<double>(dN[s_f]);
-        dvec g_new = pyconv::to_vec_safe(dN[s_g]);
+        m_->eval_all(x_new);
 
-        nb::object cI_n_o = nb_dict_get(dN, s_cI);
-        nb::object cE_n_o = nb_dict_get(dN, s_cE);
-        dvec cI_new = (mI > 0 && !cI_n_o.is_none())
-                          ? pyconv::to_vec_safe(cI_n_o)
-                          : dvec::Zero(mI);
-        dvec cE_new = (mE > 0 && !cE_n_o.is_none())
-                          ? pyconv::to_vec_safe(cE_n_o)
-                          : dvec::Zero(mE);
+        double f_new = m_->get_f().value_or(0.0);         // FIX 0
+        dvec g_new = m_->get_g().value_or(dvec::Zero(n)); // FIX 1
 
-        spmat JI_new, JE_new;
-        nb::object JI_n_o = nb_dict_get(dN, s_JI);
-        nb::object JE_n_o = nb_dict_get(dN, s_JE);
-        if (mI > 0 && !JI_n_o.is_none())
-            JI_new = pyconv::to_sparse(JI_n_o);
-        if (mE > 0 && !JE_n_o.is_none())
-            JE_new = pyconv::to_sparse(JE_n_o);
+        dvec cI_new = (mI > 0) ? m_->get_cI().value() : dvec::Zero(mI); // FIX 3
 
-        double theta_new =
-            nb::cast<double>(model.attr("constraint_violation")(x_new));
+        dvec cE_new = (mE > 0) ? m_->get_cE().value() : dvec::Zero(mE); // FIX 4
+        IP_LAP("extract f,g,cI,cE new");
+
+        spmat JI_new = (mI > 0) ? m_->get_JI().value().sparseView()
+                                : spmat(mI, n); // empty OK
+        spmat JE_new =
+            (mE > 0) ? m_->get_JE().value().sparseView() : spmat(mE, n); // FIX 5
+        IP_LAP("build JI/JE new");
+
+        double theta_new = m_->constraint_violation(x_new);
         IP_LAP("eval_all(x_new)");
 
         // -------------------- KKT residuals (new) --------------------
@@ -816,31 +780,25 @@ public:
         mu = mu_up.mu_new;
         IP_LAP("barrier manager");
 
-        // s = x_{k+1} - x_k  (use a different name to avoid clashing with slack
-        // vector 's')
+        // // s = x_{k+1} - x_k
         // dvec sx = x_new - x;
 
-        // // y = ∇L(x_{k+1},λ_{k+1},ν_{k+1}) − ∇L(x_k,λ_k,ν_k)
-        // // recall: r_d = ∇L − zL + zU  ⇒  ∇L = r_d + zL − zU
-        // dvec gradL_old = r_d + zL - zU;
-        // dvec gradL_new = r_d_new + zL_new - zU_new;
+        // // y = ∇L_{new} - ∇L_{old}, with ∇L = r_d + zL - zU
+        // dvec gradL_old = r_d;// + zL - zU;
+        // dvec gradL_new = r_d_new;// + zL_new - zU_new;
         // dvec yL = gradL_new - gradL_old;
-
+        // // IP_LAP("hessian_update");
         // try {
-        //     // `accepted` is keyword-only in Python, so:
         //     if (step_accepted) {
-        //         // default accepted=True, so just pass (sx, yL)
-        //         model.attr("hessian_update")(nb::cast(sx), nb::cast(yL));
+        //         model->attr("hessian_update")(nb::cast(sx), nb::cast(yL));
         //     } else {
-        //         // explicitly pass accepted=False
         //         nb::dict kw;
         //         kw["accepted"] = nb::bool_(false);
-        //         // nanobind allows kwargs via the call operator with **kw:
-        //         model.attr("hessian_update")(nb::cast(sx), nb::cast(yL),
+        //         model->attr("hessian_update")(nb::cast(sx), nb::cast(yL),
         //         **kw);
         //     }
         // } catch (const nb::python_error &e) {
-        //     // Optional: log and continue without killing the IP iteration
+        //     // optional: log and proceed
         //     // std::cerr << "hessian_update failed: " << e.what() << "\n";
         // }
         // IP_LAP("hessian_update");
@@ -937,35 +895,17 @@ private:
                                            cfg_, "ip_alpha_min", 1e-10)));
     }
 
-    [[nodiscard]] IPState state_from_model_(const nb::object &model,
-                                            const dvec &x) {
+    [[nodiscard]] IPState state_from_model_(const dvec &x) {
         IPState s{};
-        s.mI = pyu::getattr_or<int>(model, "m_ineq", 0);
-        s.mE = pyu::getattr_or<int>(model, "m_eq", 0);
+        s.mI = m_->get_mI();
+        s.mE = m_->get_mE();
 
         // eval_all -> dict (use nb::getattr + nb::cast)
-        nb::object d_obj =
-            model.attr("eval_all")(x, nb::make_tuple("cI", "cE"));
+        m_->eval_all(x, std::vector<std::string>{"cI", "cE"});
+        std::cout << "Initial eval_all done.\n";
 
-        // Try to cast to dict - this might be where the bad cast occurs
-        nb::dict d;
-        try {
-            d = nb::cast<nb::dict>(d_obj);
-        } catch (const std::exception &e) {
-            // If direct cast fails, try accessing as dict-like object
-            if (PyDict_Check(d_obj.ptr())) {
-                d = nb::borrow<nb::dict>(d_obj);
-            } else {
-                throw std::runtime_error(
-                    "eval_all did not return a dict-like object");
-            }
-        }
-
-        // cI from dict (wrap accessor into nb::object before checks/casts)
-        nb::object cI_obj = nb_dict_get(d, s_cI);
-
-        dvec cI = (s.mI > 0 && !cI_obj.is_none()) ? pyconv::to_vec_safe(cI_obj)
-                                                  : dvec::Zero(s.mI);
+        dvec cI = (s.mI > 0) ? m_->get_cI().value() : dvec::Zero(s.mI);
+        std::cout << "Initial cI done.\n";
         const double mu0 =
             clamp_min(pyu::getattr_or<double>(cfg_, "ip_mu_init", 1e-2), 1e-12);
         const bool use_shifted =
@@ -993,7 +933,7 @@ private:
 
         s.nu = (s.mE > 0) ? dvec::Zero(s.mE) : dvec();
 
-        Bounds B = detail::get_bounds(model, x);
+        Bounds B = get_bounds(x);
         s.zL = dvec::Zero(x.size());
         s.zU = dvec::Zero(x.size());
 
