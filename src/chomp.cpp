@@ -218,7 +218,7 @@ public:
         ip_stepper_ = new InteriorPointStepper(cfg_, hess_);
 
         // SQP stepper
-        // sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_);
+        sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_);
 
         // Trackers
         last_header_row_ = -1;
@@ -238,7 +238,7 @@ public:
             if (mode_ == "ip") {
                 info = ip_step_(k);
             } else if (mode_ == "sqp") {
-                // info = sqp_step_(k);
+                info = sqp_step_(k);
             } else if (mode_ == "dfo") {
                 // DFO not wired here; keep placeholder behavior
                 info.accepted = false;
@@ -280,20 +280,20 @@ private:
         return info;
     }
 
-    // SolverInfo sqp_step_(int it) {
-    //     auto [x_out, lam_out, nu_out, info] =
-    //         sqp_stepper_->step(model_, x_, lam_, nu_, it);
+    SolverInfo sqp_step_(int it) {
+        auto [x_out, lam_out, nu_out, info] =
+            sqp_stepper_->step(model_, x_, lam_, nu_, it);
 
-    //     if (info.accepted) {
-    //         if (get_bool_attr_or(cfg_, "use_watchdog", false)) {
-    //             watchdog_update_(x_out); // stub (no-op)
-    //         }
-    //         x_   = std::move(x_out);
-    //         lam_ = std::move(lam_out);
-    //         nu_  = std::move(nu_out);
-    //     }
-    //     return info;
-    // }
+        if (info.accepted) {
+            if (get_bool_attr_or(cfg_, "use_watchdog", false)) {
+                watchdog_update_(x_out); // stub (no-op)
+            }
+            x_   = std::move(x_out);
+            lam_ = std::move(lam_out);
+            nu_  = std::move(nu_out);
+        }
+        return info;
+    }
 
     // ---- config defaults ----------------------------------------------------
     void ensure_auto_defaults_(nb::object &cfg) {

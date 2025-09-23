@@ -298,9 +298,12 @@ ad_add_nanobind_module(chomp
   src/ad/Variable.cpp
 )
 ad_use_cholmod(chomp)
-_ad_link_gurobi(chomp)
+# _ad_link_gurobi(chomp)
+# link openmp to chomp if available
+  target_link_libraries(chomp PRIVATE OpenMP::OpenMP_CXX)# Spectra::Spectra)
 
-find_package(TBB COMPONENTS tbb)
+
+  find_package(TBB COMPONENTS tbb)
 if(TARGET TBB::tbb)
   target_link_libraries(chomp PRIVATE TBB::tbb)
 else()

@@ -21,10 +21,8 @@
 #include <vector>
 
 #include "filter.h"
-#include <pybind11/eigen.h>
-#include <pybind11/pybind11.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 #include "definitions.h"
 
 // -----------------------------------------------------------------------------
@@ -637,7 +635,7 @@ public:
                    const std::optional<dvec> &bineq = std::nullopt,
                    const std::optional<dmat> &Aeq = std::nullopt,
                    const std::optional<dvec> &beq = std::nullopt,
-                   const std::optional<py::object> &model = std::nullopt,
+                   const std::optional<nb::object> &model = std::nullopt,
                    const BoxCtx &box = {}, double mu = 0.0,
                    const std::optional<double> &f_old = std::nullopt,
                    const HContext &HC = {}) {
@@ -652,7 +650,7 @@ public:
                          const std::optional<dvec> &bineq = std::nullopt,
                          const std::optional<dmat> &Aeq = std::nullopt,
                          const std::optional<dvec> &beq = std::nullopt,
-                         const std::optional<py::object> &model = std::nullopt,
+                         const std::optional<nb::object> &model = std::nullopt,
                          const std::optional<dvec> &x = std::nullopt,
                          const std::optional<dvec> &lb = std::nullopt,
                          const std::optional<dvec> &ub = std::nullopt,
@@ -676,7 +674,7 @@ public:
                           const std::optional<dvec> &bineq = std::nullopt,
                           const std::optional<dmat> &Aeq = std::nullopt,
                           const std::optional<dvec> &beq = std::nullopt,
-                          const std::optional<py::object> &model = std::nullopt,
+                          const std::optional<nb::object> &model = std::nullopt,
                           const std::optional<dvec> &x = std::nullopt,
                           const std::optional<dvec> &lb = std::nullopt,
                           const std::optional<dvec> &ub = std::nullopt,
@@ -709,7 +707,7 @@ private:
     double delta_;
     mutable double current_kkt_residual_ =
         std::numeric_limits<double>::quiet_NaN();
-    mutable py::object global_model = py::none();
+    mutable nb::object global_model = nb::none();
 
     // --------------- metric core (single path) ---------------
     template <class Mat>
@@ -898,29 +896,27 @@ private:
 
         double stationarity = tr_norm_(gradL);
 
-        py::list need;
+        nb::list need;
 
         need.append("cI");
         need.append("cE");
 
-        // Call eval_all(x, components=need)
-        py::dict out =
-            (*global_model)
-                .attr("eval_all")(box_.x.value(), py::arg("components") = need)
-                .cast<py::dict>();
+        // Assuming `global_model` is an nb::object (or deference a pointer you
+        // store)
+        nb::dict out = call_eval_all_dict(global_model, box_.x.value(), need);
 
         double cons = 0.0;
         if (Aeq && Aeq->size()) {
             // get cE from model if possible
             const auto cE_ = to_dense_optional<dvec>(
-                out.contains("cE") ? py::handle(out["cE"]) : py::none());
+                out.contains("cE") ? nb::handle(out["cE"]) : nb::none());
             if (cE_) {
                 cons += cE_->norm();
             }
         }
 
         const auto cI_ = to_dense_optional<dvec>(
-            out.contains("cI") ? py::handle(out["cI"]) : py::none());
+            out.contains("cI") ? nb::handle(out["cI"]) : nb::none());
         if (cI_)
             cons += cI_->cwiseMax(0.0).norm();
 
@@ -1064,12 +1060,12 @@ private:
         const std::optional<dvec> &bineq, const std::optional<dmat> &Aeq,
         const std::optional<dvec> &beq, const std::optional<spmat> &sparseH,
         const std::optional<dmat> &denseH,
-        const std::optional<py::object> &model, const std::optional<dvec> &x,
+        const std::optional<nb::object> &model, const std::optional<dvec> &x,
         const std::optional<dvec> &lb, const std::optional<dvec> &ub, double mu,
         const std::optional<double> &f_old_opt) {
 
-        global_model = model ? *model : py::none();
-
+        global_model = model ? *model : nb::none();
+        
         TRInfo info;
 
         dvec lam(Aineq ? (int)Aineq->rows() : 0);
@@ -1169,8 +1165,8 @@ private:
         if (model) {
             if (!f_old) {
                 try {
-                    if (py::hasattr(*model, "f_current"))
-                        f_old = py::float_((*model).attr("f_current"));
+                    if (nb::hasattr(*model, "f_current"))
+                        f_old = nb::cast<double>((*model).attr("f_current"));
                     else if (box_.x)
                         f_old = eval_model_f_theta_(model, box_.x,
                                                     dvec::Zero(g.size()))
@@ -1237,6 +1233,9 @@ private:
         ret.info = std::move(info);
         ret.lam = std::move(lam);
         ret.nu = std::move(nu);
+
+        // reset global model
+        global_model = nb::none();
         return ret;
     }
 
@@ -1683,21 +1682,44 @@ private:
 
     // --------------- model eval ---------------
     [[nodiscard]] std::pair<std::optional<double>, std::optional<double>>
-    eval_model_f_theta_(const std::optional<py::object> &model,
+    eval_model_f_theta_(const std::optional<nb::object> &model,
                         const std::optional<dvec> &x,
                         const dvec &s = dvec()) const {
         if (!model)
             return {std::nullopt, std::nullopt};
+
         const dvec xt = x ? (*x + s) : s;
+
         try {
-            const py::dict out = (*model).attr("eval_all")(xt).cast<py::dict>();
+            // nb::gil_scoped_acquire gil;
+
+            // Ask only for 'f' to keep eval_all light
+            nb::list need;
+            need.append(nb::str("f"));
+
+            nb::object out_obj =
+                model->attr("eval_all")(xt, nb::arg("components") = need);
+
+            if (!nb::isinstance<nb::dict>(out_obj)) {
+                return {std::nullopt, std::nullopt};
+            }
+            nb::dict out = nb::cast<nb::dict>(out_obj);
+
+            static const nb::str k_f("f");
             std::optional<double> f, th;
-            if (out.contains("f"))
-                f = py::float_(out["f"]);
-            if (py::hasattr(*model, "constraint_violation"))
-                th = py::float_((*model).attr("constraint_violation")(xt));
+
+            if (out.contains(k_f)) {
+                f = nb::cast<double>(out[k_f]);
+            }
+
+            if (nb::hasattr(*model, "constraint_violation")) {
+                th = nb::cast<double>(model->attr("constraint_violation")(xt));
+            }
+
             return {f, th};
-        } catch (...) {
+        } catch (const nb::python_error &) {
+            // Propagate as "no value" on Python-side errors; avoids crashing
+            // C++
             return {std::nullopt, std::nullopt};
         }
     }
@@ -1705,7 +1727,7 @@ private:
     // --------------- backtracking ---------------
     [[nodiscard]] std::tuple<bool, dvec, std::string, std::optional<double>,
                              std::optional<double>>
-    _backtrack_on_reject_(const std::optional<py::object> &model,
+    _backtrack_on_reject_(const std::optional<nb::object> &model,
                           const std::optional<dvec> &x, const dvec &s,
                           const std::optional<dvec> &lb,
                           const std::optional<dvec> &ub, double delta,
@@ -1758,21 +1780,6 @@ private:
         double theta0 = NAN, theta1 = NAN;
     };
 
-    template <class T>
-    static std::optional<T> to_dense_optional(const py::handle &obj) {
-        if (!obj || obj.is_none())
-            return std::nullopt;
-        try {
-            if constexpr (std::is_same_v<T, dmat>) {
-                if (py::hasattr(obj, "toarray"))
-                    return obj.attr("toarray")().cast<dmat>();
-            }
-            return obj.cast<T>();
-        } catch (...) {
-            return std::nullopt;
-        }
-    }
-
     [[nodiscard]] dvec clip_correction_to_radius_(const dvec &s,
                                                   const dvec &q) const {
         if (tr_norm_(s + q) <= delta_ + 1e-14 || tr_norm_(q) <= 1e-16)
@@ -1782,34 +1789,51 @@ private:
     }
 
     [[nodiscard]] SOCResult
-    soc_correction_(const py::object &model, const dvec &x, const dvec &p,
+    soc_correction_(const nb::object &model, const dvec &x, const dvec &p,
                     const LinOp &Hop, const std::optional<dmat> &Hdense,
                     const std::optional<spmat> &Hsparse, const dvec &lam_ineq,
                     double mu, double wE, double wI, double tolE, double violI,
                     double reg, double sigma0, const std::optional<dvec> &lb,
                     const std::optional<dvec> &ub) {
-
+        (void)Hop;
         (void)lam_ineq;
-        (void)mu; // unused knobs here but kept for API parity
+        (void)mu;
+        (void)lb;
+        (void)ub; // not used here
 
         SOCResult R{dvec::Zero(p.size()), false, NAN, NAN};
         const dvec x_trial = x + p;
-        const py::dict out = model.attr("eval_all")(x_trial).cast<py::dict>();
 
-        const double theta0 =
-            model.attr("constraint_violation")(x_trial).cast<double>();
+        // ---- Python calls need the GIL ----
+        nb::list need;
+        need.append(nb::str("cI"));
+        need.append(nb::str("cE"));
+        need.append(nb::str("JI"));
+        need.append(nb::str("JE"));
+
+        nb::dict out = call_eval_all_dict(model, x_trial, need);
+
+        double theta0;
+        {
+            // nb::gil_scoped_acquire gil;
+            theta0 =
+                nb::cast<double>(model.attr("constraint_violation")(x_trial));
+        }
         R.theta0 = theta0;
         if (theta0 <= cfg_.constraint_tol)
             return R;
 
+        // Keys as nb::str for nanobind
+        static const nb::str k_cE("cE"), k_cI("cI"), k_JE("JE"), k_JI("JI");
+
         const auto cE_ = to_dense_optional<dvec>(
-            out.contains("cE") ? py::handle(out["cE"]) : py::none());
+            out.contains(k_cE) ? nb::handle(out[k_cE]) : nb::none());
         const auto cI_ = to_dense_optional<dvec>(
-            out.contains("cI") ? py::handle(out["cI"]) : py::none());
+            out.contains(k_cI) ? nb::handle(out[k_cI]) : nb::none());
         const auto JE_ = to_dense_optional<dmat>(
-            out.contains("JE") ? py::handle(out["JE"]) : py::none());
+            out.contains(k_JE) ? nb::handle(out[k_JE]) : nb::none());
         const auto JI_ = to_dense_optional<dmat>(
-            out.contains("JI") ? py::handle(out["JI"]) : py::none());
+            out.contains(k_JI) ? nb::handle(out[k_JI]) : nb::none());
 
         jacobian_condition_ =
             estimate_jacobian_condition_(JE_, JI_, cI_, cfg_.constraint_tol);
@@ -1818,23 +1842,27 @@ private:
                                    std::max(reg, cfg_.jacobian_reg_min), sigma0,
                                    Hdense, Hsparse);
 
-        // limit within SOC radius and TR
+        // Limit within SOC radius and TR metric
         const double soc_radius = cfg_.soc_radius_fraction * delta_;
         const double qn = tr_norm_(q);
         if (qn > soc_radius && qn > 1e-16)
             q *= (soc_radius / qn);
+
         q = clip_correction_to_radius_(p, q);
 
-        // box
+        // Enforce box (if any)
         if (box_.active())
             q = box_.enforce_correction(x_trial, q);
 
-        const double theta1 =
-            model.attr("constraint_violation")(x_trial + q).cast<double>();
+        double theta1;
+        {
+            // nb::gil_scoped_acquire gil;
+            theta1 = nb::cast<double>(
+                model.attr("constraint_violation")(x_trial + q));
+        }
         R.theta1 = theta1;
 
-        const bool accept = soc_acceptance_test_(theta0, theta1);
-        if (accept) {
+        if (soc_acceptance_test_(theta0, theta1)) {
             R.q = q;
             R.applied = true;
             if (cfg_.soc_use_funnel)

@@ -479,12 +479,12 @@ class Model:
                     JE_rows = np.empty((self.m_eq, n), dtype=float)
                 
                 if "cE" in want_set or "JE" in want_set:
-                    for j, ge in enumerate(self.cE_grads):
-                        val, row = ge.value_grad(x)  # <-- NEW: fused call
-                        if cE_vals is not None:
-                            cE_vals[j] = val
-                        if JE_rows is not None:
-                            JE_rows[j, :] = row
+                    vals, rows = AD.batch_valgrad(self.cE_grads, x)  # <-- NEW: fused batch call
+                        # val, row = ge.value_grad(x)  # <-- NEW: fused call
+                    if cE_vals is not None:
+                        cE_vals = vals
+                    if JE_rows is not None:
+                        JE_rows = rows
                 else:
                     # twp passes
                     for j, ge in enumerate(self.cE_grads):

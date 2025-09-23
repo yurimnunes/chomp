@@ -247,6 +247,10 @@ struct ADGraph {
     void addNode(const ADNodePtr &node);
     void makeNodesUnique();
 
+    void computeForwardPassAndDotLanesTogether();
+
+    void peepholeSimplify_();
+
     // ---------------------------- Introspection
     // -------------------------------
     std::string getExpression(const ADNodePtr &node);

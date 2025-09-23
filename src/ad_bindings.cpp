@@ -1,5 +1,6 @@
-// ad.cpp — nanobind + NumPy fast paths + GIL release (C++23 optimized)
+// ad.cpp — nanobind + NumPy fast paths + GIL release (C++23, de-duplicated)
 
+#include <nanobind/eigen/dense.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/function.h>
@@ -12,7 +13,6 @@
 #include "../include/ad/Definitions.h"
 #include "../include/ad/Expression.h"
 #include "../include/ad/Variable.h"
-#include <nanobind/eigen/dense.h>
 
 #include <Eigen/Dense>
 
@@ -35,6 +35,10 @@
 #include <utility>
 #include <vector>
 
+// if you use tsl::robin_* elsewhere, keep includes in your project build.
+#include "../../third_party/robin_map.h"
+#include "../../third_party/robin_set.h"
+
 namespace nb = nanobind;
 using namespace nb::literals;
 
@@ -43,14 +47,18 @@ static std::pmr::unsynchronized_pool_resource g_pool{
     {.max_blocks_per_chunk = 256, .largest_required_pool_block = 8192}};
 thread_local std::pmr::vector<double> tl_scratch{&g_pool};
 
-// ---------- Compile-time type checks ----------
+// ---------- Concepts ----------
 template <typename T>
 concept Numeric = std::is_arithmetic_v<T>;
 
 template <typename T>
 concept PyHandle = std::same_as<T, nb::handle> || std::same_as<T, nb::object>;
 
-// ---------- Hot path helpers (force inline + likely/unlikely) ----------
+// ---------- ndarray aliases ----------
+using Arr1D = nb::ndarray<double, nb::shape<-1>, nb::c_contig>;
+using Arr2D = nb::ndarray<double, nb::shape<-1, -1>, nb::c_contig>;
+
+// ---------- small hot helpers ----------
 [[gnu::always_inline, gnu::hot]]
 static inline bool is_number(const nb::handle &h) noexcept {
     return nb::isinstance<nb::float_>(h) || nb::isinstance<nb::int_>(h);
@@ -58,41 +66,14 @@ static inline bool is_number(const nb::handle &h) noexcept {
 
 [[gnu::always_inline, gnu::hot]]
 static inline bool is_sequence(const nb::handle &h) noexcept {
-    // Accept list/tuple as "sequence"; explicitly exclude str
     return nb::isinstance<nb::list>(h) || nb::isinstance<nb::tuple>(h);
 }
-
-[[gnu::always_inline]]
-static inline nb::tuple to_tuple(const std::vector<nb::object> &vec) {
-    nb::list temp;
-    for (const auto &item : vec) {
-        temp.append(item);
-    }
-    return nb::tuple(temp);
-}
-
-// Optimized epoch bumping with memory ordering
-template <Numeric T>
-[[gnu::always_inline]]
-static inline void bump_epoch(T &e) noexcept {
-    ++e;
-}
-
-template <Numeric T>
-[[gnu::always_inline]]
-static inline void bump_epoch(std::atomic<T> &e) noexcept {
-    e.fetch_add(1, std::memory_order_acq_rel);
-}
-
-// ---------- NumPy ndarray aliases (C-contiguous float64) ----------
-using Arr1D = nb::ndarray<double, nb::shape<-1>, nb::c_contig>;
-using Arr2D = nb::ndarray<double, nb::shape<-1, -1>, nb::c_contig>;
 
 [[gnu::always_inline, gnu::hot]]
 static inline std::span<const double> as_span_1d(const Arr1D &a) {
     if (a.ndim() != 1) [[unlikely]]
         throw std::invalid_argument("expected 1D float64 array");
-    return {a.data(), static_cast<size_t>(a.shape(0))};
+    return {a.data(), (size_t)a.shape(0)};
 }
 
 [[gnu::always_inline]]
@@ -102,7 +83,6 @@ static inline std::pair<ssize_t, ssize_t> shape_2d(const Arr2D &a) {
     return {a.shape(0), a.shape(1)};
 }
 
-// Helper to create numpy arrays
 [[gnu::always_inline]]
 static inline Arr1D create_zeros_1d(ssize_t n) {
     auto numpy = nb::module_::import_("numpy");
@@ -117,10 +97,17 @@ static inline Arr2D create_zeros_2d(ssize_t m, ssize_t n) {
         numpy.attr("zeros")(nb::make_tuple(m, n), "dtype"_a = "float64"));
 }
 
-// ---------- Expression construction (optimized allocations) ----------
 [[gnu::always_inline]]
-static inline ADNodePtr make_const_node(const ADGraphPtr &g,
-                                        double v) noexcept {
+static inline nb::tuple to_tuple(const std::vector<nb::object> &vec) {
+    nb::list temp;
+    for (const auto &item : vec)
+        temp.append(item);
+    return nb::tuple(temp);
+}
+
+// ---------- AD builders ----------
+[[gnu::always_inline]]
+static inline ADNodePtr make_const_node(const ADGraphPtr &g, double v) {
     auto n = std::make_shared<ADNode>();
     n->type = Operator::cte;
     n->value = v;
@@ -149,21 +136,17 @@ make_expr_from_number(double val, const ADGraphPtr &g) {
     return make_const_expr(val, g);
 }
 
-// Optimized conversion with early returns
 [[gnu::hot]]
 static inline std::shared_ptr<Expression> as_expression(const nb::handle &h,
                                                         const ADGraphPtr &g) {
     if (nb::isinstance<Expression>(h)) [[likely]]
         return nb::cast<std::shared_ptr<Expression>>(h);
-
     if (nb::isinstance<Variable>(h)) [[likely]] {
         auto v = nb::cast<std::shared_ptr<Variable>>(h);
         return make_expr_from_variable(v, g);
     }
-
     if (is_number(h)) [[likely]]
         return make_expr_from_number(nb::cast<double>(h), g);
-
     throw std::invalid_argument(
         "Argument must be Expression, Variable, int, or float.");
 }
@@ -173,15 +156,59 @@ static inline std::shared_ptr<Expression>
 ensure_expression(const nb::handle &ret, const ADGraphPtr &g) {
     if (nb::isinstance<Expression>(ret)) [[likely]]
         return nb::cast<std::shared_ptr<Expression>>(ret);
-
     if (is_number(ret)) [[likely]]
         return make_expr_from_number(nb::cast<double>(ret), g);
-
     throw std::invalid_argument(
         "Function must return Expression or a numeric value.");
 }
 
-// ---------- Optimized unary ops with fast dispatch ----------
+// ---------- Python call helpers (tuple/list policy) ----------
+enum class ArgPolicy : uint8_t { Tuple, List };
+
+template <ArgPolicy P, typename Callable>
+[[gnu::always_inline]]
+static inline nb::object call_py_fn(Callable &&f,
+                                    const std::vector<nb::object> &args) {
+    if constexpr (P == ArgPolicy::Tuple) {
+        nb::tuple t = to_tuple(args);
+        return f(*t);
+    } else {
+        nb::list lst;
+        for (auto &a : args)
+            lst.append(a);
+        return f(lst);
+    }
+}
+
+// ---------- Input setters (templated) ----------
+template <typename Vec, typename Span>
+[[gnu::always_inline, gnu::hot]]
+static inline void set_inputs_from_span(Vec &nodes, Span x) {
+    if (x.size() != nodes.size()) [[unlikely]]
+        throw std::invalid_argument("wrong input length");
+    for (size_t i = 0; i < nodes.size(); ++i)
+        nodes[i]->value = x[i];
+}
+
+template <typename Vec>
+[[gnu::always_inline, gnu::hot]]
+static inline void set_inputs_from_arr(Vec &nodes, const Arr1D &xin) {
+    set_inputs_from_span(nodes, as_span_1d(xin));
+}
+
+template <typename Vec>
+[[gnu::always_inline, gnu::hot]]
+static inline void set_inputs_from_seq(Vec &nodes, const nb::object &x) {
+    if (!is_sequence(x)) [[unlikely]]
+        throw std::invalid_argument("expected a list/tuple");
+    nb::sequence sx = nb::cast<nb::sequence>(x);
+    if ((size_t)nb::len(sx) != nodes.size()) [[unlikely]]
+        throw std::invalid_argument("wrong input length");
+    for (size_t i = 0; i < nodes.size(); ++i)
+        nodes[i]->value = nb::cast<double>(sx[i]);
+}
+
+// ---------- Unary ops ----------
 [[gnu::always_inline]]
 static inline double apply_unary_op(Operator op, double x) noexcept {
     switch (op) {
@@ -202,11 +229,12 @@ static inline double apply_unary_op(Operator op, double x) noexcept {
     case Operator::Silu:
         return x / (1.0 + std::exp(-x));
     case Operator::Gelu: {
-        constexpr double c = 0.7978845608028654; // sqrt(2/π)
+        // tanh approx (kept to match your symbolic)
+        constexpr double c = 0.7978845608028654; // sqrt(2/pi)
         return 0.5 * x * (1.0 + std::tanh(c * (x + 0.044715 * x * x * x)));
     }
     default:
-        return x; // Identity fallback
+        return x;
     }
 }
 
@@ -232,30 +260,24 @@ unary_from_variable(Operator op, const std::shared_ptr<Variable> &v) {
 
 [[gnu::hot]]
 static inline nb::object unary_dispatch(nb::object x, Operator op) {
-    // Fast path for numbers with optimized switch
-    if (is_number(x)) [[likely]] {
-        const double a = nb::cast<double>(x);
-        return nb::float_(apply_unary_op(op, a));
-    }
-
+    if (is_number(x)) [[likely]]
+        return nb::float_(apply_unary_op(op, nb::cast<double>(x)));
     if (nb::isinstance<Expression>(x)) [[likely]]
         return nb::cast(unary_from_expression(
             op, nb::cast<std::shared_ptr<Expression>>(x)));
-
     if (nb::isinstance<Variable>(x))
         return nb::cast(
             unary_from_variable(op, nb::cast<std::shared_ptr<Variable>>(x)));
-
     throw std::invalid_argument(
         "Argument must be Expression, Variable, int, or float.");
 }
 
-// ---------- Optimized pow helpers with bit manipulation ----------
+// ---------- pow helpers ----------
 [[gnu::always_inline]]
 static inline bool _is_effectively_int(double p, double &pr_out) noexcept {
     const double pr = std::round(p);
     if (std::isfinite(pr) &&
-        std::fabs(p - pr) <= 1e-12 * std::max(1.0, std::fabs(p))) [[likely]] {
+        std::fabs(p - pr) <= 1e-12 * std::max(1.0, std::fabs(p))) {
         pr_out = pr;
         return true;
     }
@@ -273,44 +295,34 @@ static inline ADNodePtr mul_node(const ADGraphPtr &g, const ADNodePtr &a,
     return m;
 }
 
-// Optimized exponentiation using binary exponentiation
 [[gnu::hot]]
 static inline ADNodePtr pow_pos_node(const ADGraphPtr &g, const ADNodePtr &base,
                                      long long e) {
-    if (e == 1) [[likely]]
+    if (e == 1)
         return base;
-    if (e == 2) [[likely]]
+    if (e == 2)
         return mul_node(g, base, base);
-
-    ADNodePtr result = base;
-    ADNodePtr cur = base;
-
-    // Skip the first bit since we already have base^1
+    ADNodePtr result = base, cur = base;
     e >>= 1;
-
     while (e > 0) {
-        cur = mul_node(g, cur, cur); // Square
-        if (e & 1) [[unlikely]]
+        cur = mul_node(g, cur, cur);
+        if (e & 1)
             result = mul_node(g, result, cur);
         e >>= 1;
     }
-
     return result;
 }
 
 [[gnu::hot]]
 static inline ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
                                   long long e) {
-    if (e == 0) [[unlikely]]
+    if (e == 0)
         return make_const_node(g, 1.0);
-    if (e > 0) [[likely]]
+    if (e > 0)
         return pow_pos_node(g, base, e);
-
-    // e < 0: Check for division by zero at compile time if possible
-    if (base->type == Operator::cte && base->value == 0.0) [[unlikely]]
+    if (base->type == Operator::cte && base->value == 0.0)
         throw std::domain_error(
             "x**p: base == 0 and integer p < 0 is undefined.");
-
     auto den = pow_pos_node(g, base, -e);
     auto num = make_const_node(g, 1.0);
     auto div = std::make_shared<ADNode>();
@@ -321,33 +333,28 @@ static inline ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
     return div;
 }
 
-// Optimized pow with precomputed constants
 [[gnu::hot]]
 static inline std::shared_ptr<Expression> expr_pow_any(nb::object x, double p) {
     ADGraphPtr g;
     std::shared_ptr<Expression> ex;
-
-    if (nb::isinstance<Expression>(x)) [[likely]] {
+    if (nb::isinstance<Expression>(x)) {
         ex = nb::cast<std::shared_ptr<Expression>>(x);
         g = ex->graph ? ex->graph : std::make_shared<ADGraph>();
     } else {
         g = std::make_shared<ADGraph>();
         ex = as_expression(x, g);
     }
-
-    if (ex->node) [[likely]]
+    if (ex->node)
         g->adoptSubgraph(ex->node);
 
     double pr = 0.0;
-    if (_is_effectively_int(p, pr)) [[likely]] {
+    if (_is_effectively_int(p, pr)) {
         auto out = std::make_shared<Expression>(g);
-        out->node = powi_node(g, ex->node, static_cast<long long>(pr));
+        out->node = powi_node(g, ex->node, (long long)pr);
         return out;
     }
 
-    // Non-integer: exp(p*log(x)) with domain check
     if (ex->node && ex->node->type == Operator::cte && ex->node->value <= 0.0)
-        [[unlikely]]
         throw std::domain_error("x**p with non-integer p requires base > 0.");
 
     auto e_log = std::make_shared<Expression>(g);
@@ -371,19 +378,16 @@ static inline std::shared_ptr<Expression> expr_pow_any(nb::object x, double p) {
 [[gnu::always_inline]]
 static inline std::shared_ptr<Expression>
 scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
-    if (s <= 0.0) [[unlikely]]
+    if (s <= 0.0)
         throw std::domain_error("scalar ** Expression requires base > 0");
-
     ADGraphPtr g = x->graph ? x->graph : std::make_shared<ADGraph>();
-    if (x->node) [[likely]]
+    if (x->node)
         g->adoptSubgraph(x->node);
-
     auto e_mul = std::make_shared<Expression>(g);
     e_mul->node->type = Operator::Multiply;
     e_mul->node->addInput(x->node);
     e_mul->node->addInput(make_const_node(g, std::log(s)));
     g->addNode(e_mul->node);
-
     auto e_exp = std::make_shared<Expression>(g);
     e_exp->node->type = Operator::Exp;
     e_exp->node->addInput(e_mul->node);
@@ -391,25 +395,22 @@ scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
     return e_exp;
 }
 
-// ---------- max dispatch ----------
+// ---------- max ----------
 [[gnu::hot]]
 static inline nb::object binary_max_dispatch(nb::object x, nb::object y) {
     const bool nx = is_number(x), ny = is_number(y);
-    if (nx && ny) [[likely]] {
+    if (nx && ny) {
         const double a = nb::cast<double>(x), b = nb::cast<double>(y);
         return nb::float_(a >= b ? a : b);
     }
-
     ADGraphPtr g = std::make_shared<ADGraph>();
-    auto ex = as_expression(x, g);
-    auto ey = as_expression(y, g);
+    auto ex = as_expression(x, g), ey = as_expression(y, g);
     if (ex->graph)
         g = ex->graph;
     if (ey->graph)
         g = ey->graph;
     g->adoptSubgraph(ex->node);
     g->adoptSubgraph(ey->node);
-
     auto out = std::make_shared<Expression>(g);
     out->node->type = Operator::Max;
     out->node->addInput(ex->node);
@@ -418,199 +419,91 @@ static inline nb::object binary_max_dispatch(nb::object x, nb::object y) {
     return nb::cast(out);
 }
 
-// ---------- Function call helpers ----------
-template <typename Callable>
-static inline nb::object
-call_python_function(Callable &&f, const std::vector<nb::object> &args) {
-    nb::tuple args_tuple = to_tuple(args);
-    return f(*args_tuple);
-}
-
-template <typename Callable>
-static inline nb::object
-call_python_function_with_list(Callable &&f,
-                               const std::vector<nb::object> &args) {
-    nb::list args_list;
-    for (const auto &arg : args) {
-        args_list.append(arg);
-    }
-    return f(args_list);
-}
-
-// ============================================================================
-//          Compiled Value / Gradient / Hessian (NumPy fast paths)
-// ============================================================================
-class ValFn {
-public:
+// ---------- Common compiler for Grad/Hess ----------
+struct Compiled {
     ADGraphPtr g;
-    ADNodePtr expr_root;
-    std::vector<ADNodePtr> var_nodes;
-    bool vector_mode;
-    nb::object python_func;
-
-    [[gnu::pure]]
-    std::string expr_str() const {
-        return (g && expr_root) ? g->getExpression(expr_root) : std::string{};
-    }
-
-    ValFn(nb::object f, size_t arity, bool vector_input)
-        : g(std::make_shared<ADGraph>()), vector_mode(vector_input),
-          python_func(f) {
-        std::vector<nb::object> expr_args;
-        expr_args.reserve(arity);
-        var_nodes.reserve(arity);
-
-        for (size_t i = 0; i < arity; ++i) {
-            auto vx = std::make_shared<Variable>("", 0.0);
-            auto ex = std::make_shared<Expression>(vx, 1.0, g);
-            var_nodes.push_back(ex->node);
-            expr_args.emplace_back(nb::cast(ex));
-        }
-
-        nb::object ret = vector_mode
-                             ? call_python_function_with_list(f, expr_args)
-                             : call_python_function(f, expr_args);
-
-        if (ret.is_none()) [[unlikely]]
-            throw std::invalid_argument(
-                "compile_value: function returned None");
-
-        auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
-        g->adoptSubgraph(expr->node);
-        expr_root = expr->node;
-        g->initializeNodeVariables();
-    }
-
-    [[gnu::hot]]
-    double operator()(Arr1D x_in) {
-        auto x = as_span_1d(x_in);
-        if (x.size() != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("ValFn: wrong input length");
-
-        for (size_t i = 0; i < x.size(); ++i)
-            var_nodes[i]->value = x[i];
-
-        double fval;
-        {
-            nb::gil_scoped_release nogil;
-            g->resetForwardPass();
-            g->computeForwardPass();
-            fval = expr_root->value;
-        }
-        return fval;
-    }
-
-    double call_seq(nb::object xseq) {
-        if (!is_sequence(xseq)) [[unlikely]]
-            throw std::invalid_argument("ValFn: expected list/tuple");
-
-        nb::sequence s = nb::cast<nb::sequence>(xseq);
-        if (static_cast<size_t>(nb::len(s)) != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("ValFn: wrong input length");
-
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = nb::cast<double>(s[i]);
-
-        double fval;
-        {
-            nb::gil_scoped_release nogil;
-            g->resetForwardPass();
-            g->computeForwardPass();
-            fval = expr_root->value;
-        }
-        return fval;
-    }
+    ADNodePtr root;
+    std::vector<ADNodePtr> vars;
 };
 
+template <ArgPolicy P>
+[[gnu::hot]]
+static inline Compiled compile_to_graph(nb::object f, size_t arity,
+                                        bool vector_input) {
+    Compiled out;
+    out.g = std::make_shared<ADGraph>();
+    std::vector<nb::object> expr_args;
+    expr_args.reserve(arity);
+    out.vars.reserve(arity);
+    for (size_t i = 0; i < arity; ++i) {
+        auto v = std::make_shared<Variable>("", 0.0);
+        auto e = std::make_shared<Expression>(v, 1.0, out.g);
+        out.vars.push_back(e->node);
+        expr_args.emplace_back(nb::cast(e));
+    }
+    nb::object ret = vector_input ? call_py_fn<ArgPolicy::List>(f, expr_args)
+                                  : call_py_fn<P>(f, expr_args);
+    if (ret.is_none()) [[unlikely]]
+        throw std::invalid_argument("compile: function returned None");
+    auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
+    out.g->adoptSubgraph(expr->node);
+    out.root = expr->node;
+    return out;
+}
+
+// ---------- GradFn ----------
 class GradFn {
 public:
     ADGraphPtr g;
     ADNodePtr expr_root;
     std::vector<ADNodePtr> var_nodes;
-    bool vector_mode;
+    bool vector_mode{};
     nb::object python_func;
 
-    [[gnu::pure]]
-    std::string expr_str() const {
+    [[gnu::pure]] std::string expr_str() const {
         return (g && expr_root) ? g->getExpression(expr_root) : std::string{};
     }
 
-      // NEW: fused (f, grad) in one forward+reverse
-    [[gnu::hot]]
-    std::pair<double, Arr1D> value_grad_numpy(Arr1D x_in) {
-        auto x = as_span_1d(x_in);
-        const ssize_t n = static_cast<ssize_t>(x.size());
-        if (static_cast<size_t>(n) != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("GradFn.value_grad: wrong input length");
-
-        // set inputs
-        for (ssize_t i = 0; i < n; ++i)
-            var_nodes[static_cast<size_t>(i)]->value =
-                x[static_cast<size_t>(i)];
-
-        double fval;
-        {
-            nb::gil_scoped_release nogil;
-            // one forward
-            g->resetGradients();     // reset grads (also bumps epoch)
-            g->resetForwardPass();   // bump value epoch
-            g->computeForwardPass(); // compute all primals
-
-            // capture f(x) before backward
-            fval = expr_root->value;
-
-            // one reverse
-            set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
-                            g->cur_grad_epoch_, 1.0);
-            g->initiateBackwardPass(expr_root);
-        }
-
-        // pack gradient in input order
-        Arr1D grad = create_zeros_1d(n);
-        double* gd = grad.data();
-        for (ssize_t i = 0; i < n; ++i)
-            gd[i] = var_nodes[static_cast<size_t>(i)]->gradient;
-
-        return {fval, std::move(grad)};
-    }
-    
     GradFn(nb::object f, size_t arity, bool vector_input)
-        : g(std::make_shared<ADGraph>()), vector_mode(vector_input),
-          python_func(f) {
-        std::vector<nb::object> expr_args;
-        expr_args.reserve(arity);
-        var_nodes.reserve(arity);
-
-        for (size_t i = 0; i < arity; ++i) {
-            auto vx = std::make_shared<Variable>("", 0.0);
-            auto ex = std::make_shared<Expression>(vx, 1.0, g);
-            var_nodes.push_back(ex->node);
-            expr_args.emplace_back(nb::cast(ex));
-        }
-        nb::object ret = vector_mode
-                             ? call_python_function_with_list(f, expr_args)
-                             : call_python_function(f, expr_args);
-
-        if (ret.is_none()) [[unlikely]]
-            throw std::invalid_argument(
-                "compile_gradient: function returned None");
-
-        auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
-        g->adoptSubgraph(expr->node);
-        expr_root = expr->node;
+        : vector_mode(vector_input), python_func(f) {
+        auto C = compile_to_graph<ArgPolicy::Tuple>(f, arity, vector_input);
+        g = C.g;
+        expr_root = C.root;
+        var_nodes = std::move(C.vars);
     }
 
+    // Fast path: write (f, grad) into external buffers; no Python, no GIL.
     [[gnu::hot]]
-    Arr1D call_numpy(Arr1D x_in) {
-        auto x = as_span_1d(x_in);
-        const ssize_t n = static_cast<ssize_t>(x.size());
-        if (static_cast<size_t>(n) != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("GradFn: wrong input length");
+    void value_grad_into_nogil(const double *x, std::size_t n, double *f_out,
+                               double *g_out) {
+        if (n != var_nodes.size())
+            throw std::invalid_argument(
+                "value_grad_into_nogil: wrong input length");
 
-        for (ssize_t i = 0; i < n; ++i)
-            var_nodes[static_cast<size_t>(i)]->value =
-                x[static_cast<size_t>(i)];
+        // Set inputs
+        for (std::size_t i = 0; i < n; ++i)
+            var_nodes[i]->value = x[i];
 
+        // Pure C++ AD; safe without GIL
+        g->resetGradients();     // also bumps grad epoch
+        g->resetForwardPass();   // bump value epoch
+        g->computeForwardPass(); // compute primals
+        const double fval = expr_root->value;
+
+        set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
+                        g->cur_grad_epoch_, 1.0);
+        g->initiateBackwardPass(expr_root);
+
+        if (g_out) {
+            for (std::size_t i = 0; i < n; ++i)
+                g_out[i] = var_nodes[i]->gradient;
+        }
+        if (f_out)
+            *f_out = fval;
+    }
+
+    [[gnu::hot]] Arr1D call_numpy(Arr1D x_in) {
+        set_inputs_from_arr(var_nodes, x_in);
         {
             nb::gil_scoped_release nogil;
             g->resetGradients();
@@ -619,23 +512,16 @@ public:
                             g->cur_grad_epoch_, 1.0);
             g->initiateBackwardPass(expr_root);
         }
-
+        const ssize_t n = (ssize_t)var_nodes.size();
         Arr1D out = create_zeros_1d(n);
         double *om = out.data();
         for (ssize_t i = 0; i < n; ++i)
-            om[i] = var_nodes[static_cast<size_t>(i)]->gradient;
+            om[i] = var_nodes[(size_t)i]->gradient;
         return out;
     }
 
-    [[gnu::hot]]
-    double value_numpy(Arr1D x_in) {
-        auto x = as_span_1d(x_in);
-        if (x.size() != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("GradFn.value: wrong input length");
-
-        for (size_t i = 0; i < x.size(); ++i)
-            var_nodes[i]->value = x[i];
-
+    [[gnu::hot]] double value_numpy(Arr1D x_in) {
+        set_inputs_from_arr(var_nodes, x_in);
         double fval;
         {
             nb::gil_scoped_release nogil;
@@ -646,18 +532,34 @@ public:
         return fval;
     }
 
-    nb::list operator()(nb::object x) {
-        if (!is_sequence(x)) [[unlikely]]
+    [[gnu::hot]] std::pair<double, Arr1D> value_grad_numpy(Arr1D x_in) {
+        auto x = as_span_1d(x_in);
+        if (x.size() != var_nodes.size()) [[unlikely]]
             throw std::invalid_argument(
-                "GradFn: expected a list/tuple of numbers");
+                "GradFn.value_grad: wrong input length");
+        for (size_t i = 0; i < x.size(); ++i)
+            var_nodes[i]->value = x[i];
 
-        nb::sequence seq = nb::cast<nb::sequence>(x);
-        if (static_cast<size_t>(nb::len(seq)) != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("GradFn: wrong length");
-
+        double fval;
+        {
+            nb::gil_scoped_release nogil;
+            g->resetGradients();
+            g->resetForwardPass();
+            g->computeForwardPass();
+            fval = expr_root->value;
+            set_epoch_value(expr_root->gradient, expr_root->grad_epoch,
+                            g->cur_grad_epoch_, 1.0);
+            g->initiateBackwardPass(expr_root);
+        }
+        Arr1D grad = create_zeros_1d((ssize_t)var_nodes.size());
+        double *gd = grad.data();
         for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = nb::cast<double>(seq[i]);
+            gd[i] = var_nodes[i]->gradient;
+        return {fval, std::move(grad)};
+    }
 
+    nb::list operator()(nb::object x) {
+        set_inputs_from_seq(var_nodes, x);
         {
             nb::gil_scoped_release nogil;
             g->resetGradients();
@@ -666,79 +568,44 @@ public:
                             g->cur_grad_epoch_, 1.0);
             g->initiateBackwardPass(expr_root);
         }
-
         nb::list out;
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            out.append(nb::float_(var_nodes[i]->gradient));
+        for (auto &nd : var_nodes)
+            out.append(nb::float_(nd->gradient));
         return out;
     }
 };
 
+// ---------- HessFn ----------
 class HessFn {
 public:
     ADGraphPtr g;
     ADNodePtr expr_root;
     std::vector<ADNodePtr> var_nodes;
-    bool vector_mode;
-    std::pmr::vector<double> seed;
+    bool vector_mode{};
+    std::pmr::vector<double> seed{&g_pool};
     nb::object python_func;
 
-    [[gnu::pure]]
-    std::string expr_str() const {
+    [[gnu::pure]] std::string expr_str() const {
         return (g && expr_root) ? g->getExpression(expr_root) : std::string{};
     }
 
     HessFn(nb::object f, size_t arity, bool vector_input)
-        : g(std::make_shared<ADGraph>()), vector_mode(vector_input),
-          seed(arity, 0.0, &g_pool), python_func(f) {
-        std::vector<nb::object> expr_args;
-        expr_args.reserve(arity);
-        var_nodes.reserve(arity);
-
-        for (size_t i = 0; i < arity; ++i) {
-            auto vx = std::make_shared<Variable>("", 0.0);
-            auto ex = std::make_shared<Expression>(vx, 1.0, g);
-            var_nodes.push_back(ex->node);
-            expr_args.emplace_back(nb::cast(ex));
-        }
-
-        nb::object ret = vector_mode
-                             ? call_python_function_with_list(f, expr_args)
-                             : call_python_function(f, expr_args);
-
-        if (ret.is_none()) [[unlikely]]
-            throw std::invalid_argument(
-                "compile_hessian: function returned None");
-
-        auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
-        g->adoptSubgraph(expr->node);
-        expr_root = expr->node;
+        : vector_mode(vector_input), python_func(f) {
+        auto C = compile_to_graph<ArgPolicy::Tuple>(f, arity, vector_input);
+        g = C.g;
+        expr_root = C.root;
+        var_nodes = std::move(C.vars);
+        seed.assign(arity, 0.0);
         g->initializeNodeVariables();
     }
 
     void set_inputs_seq(const nb::object &x) {
-        if (!is_sequence(x)) [[unlikely]]
-            throw std::invalid_argument("HessFn: expected a list/tuple");
-
-        nb::sequence sx = nb::cast<nb::sequence>(x);
-        if (static_cast<size_t>(nb::len(sx)) != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("HessFn: wrong input length");
-
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = nb::cast<double>(sx[i]);
+        set_inputs_from_seq(var_nodes, x);
     }
-
-    void set_inputs_arr(const Arr1D &x_in) {
-        auto x = as_span_1d(x_in);
-        if (x.size() != var_nodes.size()) [[unlikely]]
-            throw std::invalid_argument("HessFn: wrong input length");
-
-        for (size_t i = 0; i < var_nodes.size(); ++i)
-            var_nodes[i]->value = x[i];
-    }
+    void set_inputs_arr(const Arr1D &x) { set_inputs_from_arr(var_nodes, x); }
 
     [[gnu::hot]]
-    std::pmr::vector<double> hvp_once(const std::span<const double> v) {
+    std::pmr::vector<double> hvp_once(std::span<const double> v) {
         const size_t n = var_nodes.size();
         if (v.size() != n) [[unlikely]]
             throw std::invalid_argument("HessFn.hvp_once: v wrong length");
@@ -746,11 +613,9 @@ public:
         {
             nb::gil_scoped_release nogil;
             g->resetTangents();
-            for (size_t i = 0; i < n; ++i) {
-                auto &nd = var_nodes[i];
-                set_epoch_value(nd->dot, nd->dot_epoch, g->cur_dot_epoch_,
-                                v[i]);
-            }
+            for (size_t i = 0; i < n; ++i)
+                set_epoch_value(var_nodes[i]->dot, var_nodes[i]->dot_epoch,
+                                g->cur_dot_epoch_, v[i]);
             g->resetForwardPass();
             g->computeForwardPassWithDotLanes();
             g->resetGradients();
@@ -772,15 +637,13 @@ public:
     Arr2D call_numpy(Arr1D x_in) {
         set_inputs_arr(x_in);
         const size_t n = var_nodes.size();
-
         {
             nb::gil_scoped_release nogil;
             g->resetForwardPass();
             g->computeForwardPass();
         }
 
-        Arr2D H =
-            create_zeros_2d(static_cast<ssize_t>(n), static_cast<ssize_t>(n));
+        Arr2D H = create_zeros_2d((ssize_t)n, (ssize_t)n);
         double *data = H.data();
         for (size_t j = 0; j < n; ++j) {
             std::fill(seed.begin(), seed.end(), 0.0);
@@ -795,14 +658,14 @@ public:
     nb::list operator()(nb::object x) {
         set_inputs_seq(x);
         const size_t n = var_nodes.size();
-
         {
             nb::gil_scoped_release nogil;
             g->resetForwardPass();
             g->computeForwardPass();
         }
 
-        std::pmr::vector<std::pmr::vector<double>> Hm(
+        // PMR-backed matrix to limit churn
+        std::pmr::vector<std::pmr::vector<double>> H(
             n, std::pmr::vector<double>(n, 0.0, &g_pool), &g_pool);
 
         for (size_t j = 0; j < n; ++j) {
@@ -810,14 +673,13 @@ public:
             seed[j] = 1.0;
             auto col = hvp_once(seed);
             for (size_t i = 0; i < n; ++i)
-                Hm[i][j] = col[i];
+                H[i][j] = col[i];
         }
-
         nb::list mat;
         for (size_t i = 0; i < n; ++i) {
             nb::list row;
             for (size_t j = 0; j < n; ++j)
-                row.append(nb::float_(Hm[i][j]));
+                row.append(nb::float_(H[i][j]));
             mat.append(row);
         }
         return mat;
@@ -829,12 +691,9 @@ public:
         auto v = as_span_1d(v_in);
         if (v.size() != var_nodes.size()) [[unlikely]]
             throw std::invalid_argument("HessFn.hvp: wrong vector length");
-
         auto Hv = hvp_once(v);
-        Arr1D out = create_zeros_1d(static_cast<ssize_t>(v.size()));
-        double *om = out.data();
-        for (ssize_t i = 0; i < static_cast<ssize_t>(v.size()); ++i)
-            om[i] = Hv[static_cast<size_t>(i)];
+        Arr1D out = create_zeros_1d((ssize_t)v.size());
+        std::memcpy(out.data(), Hv.data(), Hv.size() * sizeof(double));
         return out;
     }
 
@@ -843,17 +702,15 @@ public:
         if (!is_sequence(v)) [[unlikely]]
             throw std::invalid_argument(
                 "HessFn.hvp: expected list/tuple for v");
-
         nb::sequence sv = nb::cast<nb::sequence>(v);
         const size_t n = var_nodes.size();
-        if (static_cast<size_t>(nb::len(sv)) != n) [[unlikely]]
+        if ((size_t)nb::len(sv) != n) [[unlikely]]
             throw std::invalid_argument("HessFn.hvp: wrong vector length");
 
         tl_scratch.clear();
         tl_scratch.reserve(n);
         for (size_t i = 0; i < n; ++i)
             tl_scratch.push_back(nb::cast<double>(sv[i]));
-
         auto Hv = hvp_once(tl_scratch);
         nb::list out;
         for (size_t i = 0; i < n; ++i)
@@ -862,16 +719,14 @@ public:
     }
 };
 
+// ---------- Lagrangian Hessian (unchanged logic; minor DRY) ----------
 class LagHessFn {
 public:
     using dvec = Eigen::VectorXd;
-    using dmat = Eigen::MatrixXd;
-    std::vector<int> x2g_; // x_nodes index -> graph order k
-    std::vector<int> g2x_; // graph order k -> x_nodes index
+    std::vector<int> x2g_, g2x_;
     ADGraphPtr g;
     ADNodePtr L_root;
     std::vector<ADNodePtr> x_nodes, lam_nodes, nu_nodes;
-
     nb::object f_fun;
     std::vector<nb::object> cI_funs, cE_funs;
     bool vector_mode{};
@@ -880,7 +735,7 @@ public:
     void build_permutations_once_() {
         if (order_ready_)
             return;
-        g->initializeNodeVariables(); // one-time
+        g->initializeNodeVariables();
         const size_t n = x_nodes.size();
         x2g_.assign(n, -1);
         g2x_.assign(n, -1);
@@ -889,18 +744,17 @@ public:
             if (k < 0 || (size_t)k >= n)
                 throw std::runtime_error("bad order");
             x2g_[i] = k;
-            g2x_[k] = static_cast<int>(i);
+            g2x_[k] = (int)i;
         }
         order_ready_ = true;
     }
 
-    // ---------------------- construction ----------------------
     LagHessFn(nb::object f, const std::vector<nb::object> &cI,
               const std::vector<nb::object> &cE, size_t arity,
               bool vector_input)
         : g(std::make_shared<ADGraph>()), f_fun(f), cI_funs(cI), cE_funs(cE),
           vector_mode(vector_input) {
-        // placeholders for x
+        // build placeholders
         std::vector<nb::object> args;
         args.reserve(arity);
         x_nodes.reserve(arity);
@@ -911,19 +765,8 @@ public:
             args.emplace_back(nb::cast(e));
         }
 
-        auto call_tuple = [&](nb::object f, const std::vector<nb::object> &a) {
-            nb::tuple t = to_tuple(a);
-            return f(*t);
-        };
-        auto call_list = [&](nb::object f, const std::vector<nb::object> &a) {
-            nb::list lst;
-            for (auto &o : a)
-                lst.append(o);
-            return f(lst);
-        };
-
-        nb::object f_ret =
-            vector_mode ? call_list(f_fun, args) : call_tuple(f_fun, args);
+        auto f_ret = vector_mode ? call_py_fn<ArgPolicy::List>(f_fun, args)
+                                 : call_py_fn<ArgPolicy::Tuple>(f_fun, args);
         if (f_ret.is_none())
             throw std::invalid_argument("LagHessFn: f returned None");
         auto f_expr = nb::cast<std::shared_ptr<Expression>>(f_ret);
@@ -937,14 +780,14 @@ public:
                 if (!fi.is_valid())
                     continue;
                 nb::object ci_ret =
-                    vector_mode ? call_list(fi, args) : call_tuple(fi, args);
+                    vector_mode ? call_py_fn<ArgPolicy::List>(fi, args)
+                                : call_py_fn<ArgPolicy::Tuple>(fi, args);
                 if (ci_ret.is_none())
                     throw std::invalid_argument(
                         "LagHessFn: constraint returned None");
                 auto ce = nb::cast<std::shared_ptr<Expression>>(ci_ret);
                 g->adoptSubgraph(ce->node);
-                auto lam = std::make_shared<ADNode>(); // multiplier (cte, value
-                                                       // set in set_state)
+                auto lam = std::make_shared<ADNode>();
                 lam->type = Operator::cte;
                 lam->value = 0.0;
                 g->addNode(lam);
@@ -967,12 +810,9 @@ public:
         add_lin(cE_funs, nu_nodes);
 
         L_root = acc;
-
-        // Important: do NOT try to set node->order here; ADGraph will assign.
-        g->initializeNodeVariables(); // make sure variables are indexed
+        g->initializeNodeVariables();
         build_permutations_once_();
 
-        // and a first forward so values exist before first HVP
         {
             nb::gil_scoped_release nogil;
             g->resetForwardPass();
@@ -980,7 +820,6 @@ public:
         }
     }
 
-    // ---------------------- state setting ----------------------
     void set_state_eigen(const dvec &x, const dvec &lam, const dvec &nu) {
         if ((size_t)x.size() != x_nodes.size())
             throw std::invalid_argument("set_state_eigen: x size mismatch");
@@ -988,14 +827,12 @@ public:
             (size_t)nu.size() != nu_nodes.size())
             throw std::invalid_argument(
                 "set_state_eigen: multiplier size mismatch");
-
         for (size_t i = 0; i < x_nodes.size(); ++i)
             x_nodes[i]->value = x[i];
         for (size_t i = 0; i < lam_nodes.size(); ++i)
             lam_nodes[i]->value = lam[i];
         for (size_t i = 0; i < nu_nodes.size(); ++i)
             nu_nodes[i]->value = nu[i];
-
         nb::gil_scoped_release nogil;
         g->resetForwardPass();
         g->computeForwardPass();
@@ -1015,15 +852,7 @@ public:
         set_state_eigen(xe, le, ne);
     }
 
-    // ---------------------- remap helpers ----------------------
-    // ADGraph assigns variable 'order' in its own (unordered) map order.
-    // We must (1) permute v from our x_nodes order -> graph order before
-    // calling, and (2) permute results from graph order -> our x_nodes order
-    // afterwards.
-    void refresh_orders_() const {
-        // calling initializeNodeVariables() assigns fresh orders consistently
-        g->initializeNodeVariables();
-    }
+    void refresh_orders_() const { g->initializeNodeVariables(); }
 
     std::vector<double> x_to_graph_order_(std::span<const double> v_x) const {
         const size_t n = x_nodes.size();
@@ -1041,126 +870,69 @@ public:
         return w_x;
     }
 
-    // ---------------------- single HVP (NumPy) ----------------------
     Arr1D hvp_numpy(Arr1D x_in, Arr1D lam_in, Arr1D nu_in, Arr1D v_in) {
         set_state_numpy(x_in, lam_in, nu_in);
-
-        // Ensure orders are fresh & consistent with ADGraph
         build_permutations_once_();
-
-        // pack v in x-order -> graph-order
         std::span<const double> vx{v_in.data(), (size_t)v_in.shape(0)};
         auto v_g = x_to_graph_order_(vx);
-
         std::vector<double> Hv_g;
         {
             nb::gil_scoped_release nogil;
             Hv_g = g->hessianVectorProduct(L_root, v_g);
         }
-        // map back to x-order
         auto Hv_x = graph_to_x_order_(Hv_g);
-
         Arr1D out = create_zeros_1d((ssize_t)Hv_x.size());
         std::memcpy(out.data(), Hv_x.data(), Hv_x.size() * sizeof(double));
         return out;
     }
 
-    // ---------------------- single HVP (C++ fast path) ----------------------
-    // y = H(x,lam,nu) * v  ; both v and y are in *x_nodes* order
-    void hvp_into_nogil(const double *v, double *y) {
-        const size_t n = x_nodes.size();
-        if (!v || !y)
-            throw std::invalid_argument("hvp_into_nogil: null pointer");
-
-        build_permutations_once_();
-
-        std::vector<double> v_x(n), v_g, Hv_g, Hv_x;
-        v_x.assign(v, v + n);
-        v_g = x_to_graph_order_(std::span<const double>(v_x.data(), n));
-
-        {
-            nb::gil_scoped_release nogil;
-            Hv_g = g->hessianVectorProduct(L_root, v_g);
-        }
-        Hv_x = graph_to_x_order_(Hv_g);
-        std::memcpy(y, Hv_x.data(), n * sizeof(double));
-    }
-
-    // ---------------------- full Hessian via repeated HVP
-    // ----------------------
     Arr2D hess_numpy(Arr1D x_in, Arr1D lam_in, Arr1D nu_in) {
         set_state_numpy(x_in, lam_in, nu_in);
-
         const size_t n = x_nodes.size();
         Arr2D H = create_zeros_2d((ssize_t)n, (ssize_t)n);
         double *Hd = H.data();
 
-        // Ensure stable variable ordering and permutations
-        build_permutations_once_(); // fills x2g_ and g2x_
-
-        // Choose a lane batch size (tune: 8/16 often good; graph will handle
-        // <=k)
+        build_permutations_once_();
         const size_t L = 16;
-
-        // Workspace for k RHS and k outputs in **graph order** with lane-inner
-        // layout
-        std::vector<double> V(n * L, 0.0);
-        std::vector<double> Y(n * L, 0.0);
+        std::vector<double> V(n * L, 0.0), Y(n * L, 0.0);
 
         for (size_t base = 0; base < n; base += L) {
             const size_t k = std::min(L, n - base);
-
-            // Build k unit vectors directly in graph order:
-            // column j corresponds to x-index (base + j) => graph id
-            // x2g_[base+j]
             std::fill(V.begin(), V.end(), 0.0);
             for (size_t j = 0; j < k; ++j) {
                 const size_t xj = base + j;
                 const int gij = x2g_[xj];
-                V[size_t(gij) * L + j] = 1.0; // lane-inner: (node i, lane j)
+                V[(size_t)gij * L + j] = 1.0;
             }
-
-            // Batched HVP in graph order (ldV/ldY = L lanes)
             {
                 nb::gil_scoped_release nogil;
-                g->hessianMultiVectorProduct(L_root, V.data(), /*ldV=*/L,
-                                             Y.data(), /*ldY=*/L, k);
+                g->hessianMultiVectorProduct(L_root, V.data(), L, Y.data(), L,
+                                             k);
             }
-
-            // Scatter each column j back to x order without extra copies
             for (size_t j = 0; j < k; ++j) {
                 const size_t col_x = base + j;
                 for (size_t gi = 0; gi < n; ++gi) {
-                    const size_t xi = g2x_[gi];
-                    Hd[xi * n + col_x] = Y[gi * L + j]; // write H[xi, col_x]
+                    const size_t xi = (size_t)g2x_[gi];
+                    Hd[xi * n + col_x] = Y[gi * L + j];
                 }
             }
         }
-
         return H;
     }
 
-    // ---------------------- block HVP (loop over columns)
-    // ---------------------- V: (n,k) in x-order; returns Y: (n,k) in x-order
     Arr2D hvp_multi_numpy(Arr1D x_in, Arr1D lam_in, Arr1D nu_in, Arr2D V_in) {
         set_state_numpy(x_in, lam_in, nu_in);
-
-        auto shape2 = [](const Arr2D &a) {
-            return std::pair<ssize_t, ssize_t>(a.shape(0), a.shape(1));
-        };
-        auto [n, k] = shape2(V_in);
+        auto [n, k] = shape_2d(V_in);
         if ((size_t)n != x_nodes.size())
             throw std::invalid_argument("hvp_multi: V.rows() != nvars");
 
         Arr2D Y = create_zeros_2d(n, k);
         double *Yd = Y.data();
         const double *Vd = V_in.data();
-
         build_permutations_once_();
 
         std::vector<double> v_x((size_t)n), v_g, Hy_g, Hy_x;
         for (ssize_t j = 0; j < k; ++j) {
-            // read column j (C-contig, so stride is n)
             for (ssize_t i = 0; i < n; ++i)
                 v_x[(size_t)i] = Vd[(size_t)i * (size_t)k + (size_t)j];
             v_g = x_to_graph_order_(
@@ -1177,20 +949,18 @@ public:
     }
 };
 
-// ---------- Optimized cache with better hash and reduced contention ----------
+// ---------- Caches ----------
 struct FnKey {
     PyObject *f;
     size_t arity;
     bool vector;
-
     constexpr bool operator==(const FnKey &o) const noexcept {
         return f == o.f && arity == o.arity && vector == o.vector;
     }
 };
-
 struct FnKeyHash {
-    [[gnu::always_inline]]
-    constexpr size_t operator()(const FnKey &k) const noexcept {
+    [[gnu::always_inline]] constexpr size_t
+    operator()(const FnKey &k) const noexcept {
         size_t h = std::bit_cast<size_t>(k.f);
         h ^= h >> 30;
         h *= 0xbf58476d1ce4e5b9ULL;
@@ -1198,20 +968,16 @@ struct FnKeyHash {
         h *= 0x94d049bb133111ebULL;
         h ^= h >> 31;
         h ^= k.arity + 0x9e3779b97f4a7c15ULL;
-        h ^= static_cast<size_t>(k.vector) << 1;
+        h ^= (size_t)k.vector << 1;
         return h;
     }
 };
 
-thread_local tsl::robin_map<FnKey, std::shared_ptr<ValFn>, FnKeyHash>
-    tl_val_cache;
 thread_local tsl::robin_map<FnKey, std::shared_ptr<GradFn>, FnKeyHash>
     tl_grad_cache;
 thread_local tsl::robin_map<FnKey, std::shared_ptr<HessFn>, FnKeyHash>
     tl_hess_cache;
-
 static std::shared_mutex g_cache_mtx;
-static tsl::robin_map<FnKey, std::weak_ptr<ValFn>, FnKeyHash> g_val_cache;
 static tsl::robin_map<FnKey, std::weak_ptr<GradFn>, FnKeyHash> g_grad_cache;
 static tsl::robin_map<FnKey, std::weak_ptr<HessFn>, FnKeyHash> g_hess_cache;
 
@@ -1222,38 +988,24 @@ cache_get_or_make(TLMap &tl_map, GlobalMap &g_map, const FnKey &k,
                   Maker &&make) {
     if (auto it = tl_map.find(k); it != tl_map.end()) [[likely]]
         return it->second;
-
     {
         std::shared_lock rlk(g_cache_mtx);
-        if (auto it = g_map.find(k); it != g_map.end()) {
+        if (auto it = g_map.find(k); it != g_map.end())
             if (auto sp = it->second.lock()) {
                 tl_map[k] = sp;
                 return sp;
             }
-        }
     }
-
     std::unique_lock wlk(g_cache_mtx);
-    if (auto it = g_map.find(k); it != g_map.end()) {
+    if (auto it = g_map.find(k); it != g_map.end())
         if (auto sp = it->second.lock()) {
             tl_map[k] = sp;
             return sp;
         }
-    }
-
     auto sp = make();
     g_map[k] = sp;
     tl_map[k] = sp;
     return sp;
-}
-
-[[gnu::always_inline]]
-static inline std::shared_ptr<ValFn> get_or_make_val(nb::object f, size_t n,
-                                                     bool vec) {
-    FnKey k{f.ptr(), n, vec};
-    return cache_get_or_make<ValFn>(tl_val_cache, g_val_cache, k, [&] {
-        return std::make_shared<ValFn>(f, n, vec);
-    });
 }
 
 [[gnu::always_inline]]
@@ -1274,133 +1026,72 @@ static inline std::shared_ptr<HessFn> get_or_make_hess(nb::object f, size_t n,
     });
 }
 
-// ---------- Immediate / high-level APIs (optimized) ----------
-[[gnu::hot]]
-static double py_value(nb::object f, nb::args xs) {
-    auto g = std::make_shared<ADGraph>();
-
-    if (nb::len(xs) == 1 && is_sequence(xs[0])) [[likely]] {
-        nb::sequence seq = nb::borrow<nb::sequence>(xs[0]);
-        const size_t n = nb::len(seq);
-        std::vector<nb::object> expr_elems;
-        expr_elems.reserve(n);
-
-        for (size_t i = 0; i < n; ++i)
-            expr_elems.emplace_back(nb::cast(as_expression(seq[i], g)));
-
-        auto ret = call_python_function_with_list(f, expr_elems);
-        auto expr = ensure_expression(ret, g);
-
-        nb::gil_scoped_release nogil;
-        return expr->evaluate();
-    }
-
-    std::vector<nb::object> expr_args;
-    expr_args.reserve(nb::len(xs));
-    for (size_t i = 0; i < nb::len(xs); ++i)
-        expr_args.emplace_back(nb::cast(as_expression(xs[i], g)));
-
-    auto ret = call_python_function(f, expr_args);
-    auto expr = ensure_expression(ret, g);
-
-    nb::gil_scoped_release nogil;
-    return expr->evaluate();
-}
-
-[[gnu::hot]]
-static double py_value_numpy(nb::object f, Arr1D x_in) {
-    auto x = as_span_1d(x_in);
-    auto vf = get_or_make_val(f, x.size(), /*vector_input=*/true);
-    return (*vf)(x_in);
-}
-
+// ---------- Immediate / high-level APIs ----------
 [[gnu::hot]]
 static nb::list py_gradient(nb::object f, nb::args xs) {
     auto g = std::make_shared<ADGraph>();
 
+    auto push_expr_from_item = [&](nb::handle item, size_t idx,
+                                   std::vector<nb::object> &dst,
+                                   std::vector<std::string> &names) {
+        if (nb::isinstance<Variable>(item)) {
+            auto v = nb::cast<std::shared_ptr<Variable>>(item);
+            names[idx] = v->getName();
+            dst.emplace_back(nb::cast(make_expr_from_variable(v, g)));
+        } else if (is_number(item)) {
+            const double val = nb::cast<double>(item);
+            auto vx =
+                std::make_shared<Variable>("x" + std::to_string(idx), val);
+            names[idx] = vx->getName();
+            dst.emplace_back(nb::cast(make_expr_from_variable(vx, g)));
+        } else if (nb::isinstance<Expression>(item)) {
+            auto e = nb::cast<std::shared_ptr<Expression>>(item);
+            g->adoptSubgraph(e->node);
+            dst.emplace_back(nb::cast(e));
+        } else {
+            throw std::invalid_argument(
+                "gradient: args must be Variable / Expression / number.");
+        }
+    };
+
+    std::vector<nb::object> expr_args;
+    std::vector<std::string> var_names;
+
     if (nb::len(xs) == 1 && is_sequence(xs[0])) [[likely]] {
         nb::sequence seq = nb::borrow<nb::sequence>(xs[0]);
         const size_t n = nb::len(seq);
-        std::vector<nb::object> expr_elems;
-        expr_elems.reserve(n);
-        std::vector<std::string> var_names(n);
-
-        for (size_t i = 0; i < n; ++i) {
-            nb::handle item = seq[i];
-            if (nb::isinstance<Variable>(item)) [[likely]] {
-                auto v = nb::cast<std::shared_ptr<Variable>>(item);
-                var_names[i] = v->getName();
-                expr_elems.emplace_back(
-                    nb::cast(make_expr_from_variable(v, g)));
-            } else if (is_number(item)) [[likely]] {
-                const double val = nb::cast<double>(item);
-                auto vx =
-                    std::make_shared<Variable>("x" + std::to_string(i), val);
-                var_names[i] = vx->getName();
-                expr_elems.emplace_back(
-                    nb::cast(make_expr_from_variable(vx, g)));
-            } else if (nb::isinstance<Expression>(item)) {
-                auto e = nb::cast<std::shared_ptr<Expression>>(item);
-                g->adoptSubgraph(e->node);
-                expr_elems.emplace_back(nb::cast(e));
-            } else [[unlikely]] {
-                throw std::invalid_argument("gradient: elements must be "
-                                            "Variable / Expression / number.");
-            }
-        }
-
-        auto ret = call_python_function_with_list(f, expr_elems);
+        expr_args.reserve(n);
+        var_names.resize(n);
+        for (size_t i = 0; i < n; ++i)
+            push_expr_from_item(seq[i], i, expr_args, var_names);
+        auto ret = call_py_fn<ArgPolicy::List>(f, expr_args);
         auto expr = ensure_expression(ret, g);
         tsl::robin_map<std::string, double> grad_map;
-
         {
             nb::gil_scoped_release nogil;
             grad_map = expr->computeGradient();
         }
-
         nb::list out;
         for (size_t i = 0; i < n; ++i) {
             double gi = 0.0;
-            if (!var_names[i].empty()) [[likely]] {
+            if (!var_names[i].empty())
                 if (auto it = grad_map.find(var_names[i]); it != grad_map.end())
                     gi = it->second;
-            }
             out.append(nb::float_(gi));
         }
         return out;
     }
 
-    // Handle positional arguments case
+    // positional case
     const size_t n = nb::len(xs);
-    std::vector<nb::object> expr_args;
     expr_args.reserve(n);
-    std::vector<std::string> var_names(n);
+    var_names.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        push_expr_from_item(xs[i], i, expr_args, var_names);
 
-    for (size_t i = 0; i < n; ++i) {
-        const auto &a = xs[i];
-        if (nb::isinstance<Variable>(a)) [[likely]] {
-            auto v = nb::cast<std::shared_ptr<Variable>>(a);
-            var_names[i] = v->getName();
-            expr_args.emplace_back(nb::cast(make_expr_from_variable(v, g)));
-        } else if (is_number(a)) [[likely]] {
-            const double val = nb::cast<double>(a);
-            auto vx = std::make_shared<Variable>("x" + std::to_string(i), val);
-            var_names[i] = vx->getName();
-            expr_args.emplace_back(nb::cast(make_expr_from_variable(vx, g)));
-        } else if (nb::isinstance<Expression>(a)) {
-            auto e = nb::cast<std::shared_ptr<Expression>>(a);
-            g->adoptSubgraph(e->node);
-            expr_args.emplace_back(nb::cast(e));
-        } else [[unlikely]] {
-            throw std::invalid_argument(
-                "gradient: args must be Variable / Expression / number.");
-        }
-    }
-
-    auto ret = call_python_function(f, expr_args);
+    auto ret = call_py_fn<ArgPolicy::Tuple>(f, expr_args);
     auto expr = ensure_expression(ret, g);
     tsl::robin_map<std::string, double> grad_map;
-
     {
         nb::gil_scoped_release nogil;
         grad_map = expr->computeGradient();
@@ -1409,16 +1100,15 @@ static nb::list py_gradient(nb::object f, nb::args xs) {
     nb::list out;
     for (size_t i = 0; i < n; ++i) {
         double gi = 0.0;
-        if (!var_names[i].empty()) [[likely]] {
+        if (!var_names[i].empty())
             if (auto it = grad_map.find(var_names[i]); it != grad_map.end())
                 gi = it->second;
-        }
         out.append(nb::float_(gi));
     }
     return out;
 }
 
-// Fused value+grad (ndarray) - more efficient than separate calls
+// fused value+grad (cached)
 [[gnu::hot]]
 static std::pair<double, Arr1D> py_value_grad_numpy(nb::object f, Arr1D x_in) {
     auto x = as_span_1d(x_in);
@@ -1442,12 +1132,128 @@ static Arr2D py_hessian_numpy(nb::object f, Arr1D x_in) {
     return hf->call_numpy(x_in);
 }
 
-// ============================================================================
-//                                 Module
-// ============================================================================
+// ---------- Batch fused value+grad over many GradFn ----------
+
+// Overload 1: list of compiled GradFn
+[[gnu::hot]]
+static std::pair<Arr1D, Arr2D>
+batch_value_grad_from_gradfns(const std::vector<std::shared_ptr<GradFn>> &gfs,
+                              Arr1D x_in) {
+    const auto x = as_span_1d(x_in);
+    const ssize_t m = (ssize_t)gfs.size();
+    if (m == 0) {
+        return {create_zeros_1d(0), create_zeros_2d(0, (ssize_t)x.size())};
+    }
+    // sanity: all arities must match x.size()
+    for (const auto &gf : gfs) {
+        if (!gf)
+            throw std::invalid_argument("batch_valgrad: null GradFn");
+        if (gf->var_nodes.size() != (size_t)x.size())
+            throw std::invalid_argument("batch_valgrad: inconsistent arity");
+    }
+
+    // outputs
+    Arr1D vals = create_zeros_1d(m);
+    Arr2D J = create_zeros_2d(m, (ssize_t)x.size());
+    double *vd = vals.data();
+    double *Jd = J.data();
+    const ssize_t n = (ssize_t)x.size();
+
+    {
+        nb::gil_scoped_release nogil;
+
+        // We still need one forward+reverse per function (distinct graphs),
+        // but we keep everything in C++ and reuse the same x buffer.
+        for (ssize_t j = 0; j < m; ++j) {
+            auto &gf = gfs[(size_t)j];
+
+            // set inputs
+            for (ssize_t i = 0; i < n; ++i)
+                gf->var_nodes[(size_t)i]->value = x[(size_t)i];
+
+            // fused value+grad
+            gf->g->resetGradients();
+            gf->g->resetForwardPass();
+            gf->g->computeForwardPass();
+            vd[j] = gf->expr_root->value;
+
+            set_epoch_value(gf->expr_root->gradient, gf->expr_root->grad_epoch,
+                            gf->g->cur_grad_epoch_, 1.0);
+            gf->g->initiateBackwardPass(gf->expr_root);
+
+            // copy row j
+            for (ssize_t i = 0; i < n; ++i)
+                Jd[(size_t)j * (size_t)n + (size_t)i] =
+                    gf->var_nodes[(size_t)i]->gradient;
+        }
+    }
+
+    return {std::move(vals), std::move(J)};
+}
+
+// Overload 2: list of Python callables (we compile/cache GradFn on the fly)
+[[gnu::hot]]
+static std::pair<Arr1D, Arr2D> batch_value_grad_from_callables(nb::list funcs,
+                                                               Arr1D x_in) {
+    const auto x = as_span_1d(x_in);
+    const ssize_t m = nb::len(funcs);
+    std::vector<std::shared_ptr<GradFn>> gfs;
+    gfs.reserve((size_t)m);
+    for (ssize_t j = 0; j < m; ++j) {
+        nb::object f = funcs[(size_t)j];
+        // cached compiler keyed by (f, n, vector=True)
+        gfs.emplace_back(get_or_make_grad(f, (size_t)x.size(), /*vec=*/true));
+    }
+    return batch_value_grad_from_gradfns(gfs, x_in);
+}
+
+[[gnu::hot]]
+static std::pair<Arr1D, Arr2D> batch_value_grad_numpy(nb::sequence grads,
+                                                      Arr1D x_in) {
+    const std::size_t m = static_cast<std::size_t>(nb::len(grads));
+    auto x = as_span_1d(x_in);
+    const std::size_t n = x.size();
+
+    // Collect raw pointers to compiled GradFn to avoid Python in parallel loop
+    std::vector<GradFn *> gptrs;
+    gptrs.reserve(m);
+    for (std::size_t j = 0; j < m; ++j) {
+        nb::handle h = grads[j];
+        if (!nb::isinstance<GradFn>(h))
+            throw std::invalid_argument(
+                "batch_valgrad: grads must be GradFn objects");
+        gptrs.push_back(nb::cast<std::shared_ptr<GradFn>>(h).get());
+    }
+
+    // Allocate outputs (C-contiguous row-major)
+    Arr1D vals = create_zeros_1d(static_cast<ssize_t>(m));
+    Arr2D J = create_zeros_2d(static_cast<ssize_t>(m), static_cast<ssize_t>(n));
+    double *vals_d = vals.data();
+    double *J_d = J.data(); // row j starts at J_d + j*n
+
+    // Parallelize over rows (each GradFn has its own ADGraph -> thread-safe)
+    {
+        nb::gil_scoped_release nogil;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (std::ptrdiff_t j = 0; j < static_cast<std::ptrdiff_t>(m); ++j) {
+            GradFn *gf = gptrs[static_cast<std::size_t>(j)];
+            double *rowj = J_d + static_cast<std::size_t>(j) * n;
+            double fj = 0.0;
+            gf->value_grad_into_nogil(x.data(), n, &fj, rowj);
+            vals_d[j] = fj;
+        }
+    }
+
+    return {std::move(vals), std::move(J)};
+}
+
+// ---------- Module ----------
 NB_MODULE(ad, m) {
-    m.doc() = "ad optimization and autodiff module (nanobind, NumPy fast "
-              "paths, cached, C++23 optimized)";
+    m.doc() = "ad optimization and autodiff (nanobind, NumPy fast paths, "
+              "cached, C++23, DRY)";
 
     // Variable
     nb::class_<Variable>(m, "Variable")
@@ -1495,7 +1301,7 @@ NB_MODULE(ad, m) {
         .def("__radd__", [](const Expression &a, double s) { return a + s; })
         .def("__rsub__",
              [](const Expression &a, double s) {
-                 auto lhs = make_expr_from_number(s, a.graph);
+                 auto lhs = make_const_expr(s, a.graph);
                  return (*lhs) - a;
              })
         .def("__rmul__", [](const Expression &a, double s) { return a * s; })
@@ -1515,68 +1321,41 @@ NB_MODULE(ad, m) {
             return scalar_pow_expr(s, a);
         });
 
-    // Immediate helpers
-    m.def(
-        "val", [](nb::object f, nb::args xs) { return py_value(f, xs); },
-        "Evaluate f(*xs) or f([xs])");
-
-    // NumPy overloads (cached)
-    m.def(
-        "val", [](nb::object f, Arr1D x) { return py_value_numpy(f, x); },
-        "f"_a, "x"_a, "Evaluate f(x: ndarray) fast path (cached)");
-
+    // immediate APIs
     m.def(
         "valgrad",
         [](nb::object f, Arr1D x) { return py_value_grad_numpy(f, x); }, "f"_a,
-        "x"_a, "Return (f(x), grad f(x)) fast path for ndarray (cached).");
+        "x"_a, "Return (f(x), grad f(x)) fast path (ndarray, cached).");
 
     m.def(
         "hess", [](nb::object f, Arr1D x) { return py_hessian_numpy(f, x); },
-        "f"_a, "x"_a,
-        "Return Hessian at x (ndarray) as ndarray[n,n] (cached).");
+        "f"_a, "x"_a, "Return Hessian at x (ndarray[n,n], cached).");
 
-    // Grad (compat + ndarray)
     m.def(
         "grad", [](nb::object f, nb::args xs) { return py_gradient(f, xs); },
         "Return gradient of f as a list of floats in input order.");
 
     m.def(
         "grad", [](nb::object f, Arr1D x) { return py_gradient_numpy(f, x); },
-        "f"_a, "x"_a,
-        "Return gradient at x (ndarray[float64]) as an ndarray (cached).");
+        "f"_a, "x"_a, "Gradient at x (ndarray[float64], cached).");
 
-    // Unary operations with optimized dispatch
-    m.def(
-        "sin", [](nb::object x) { return unary_dispatch(x, Operator::Sin); },
-        "sin(x)");
-    m.def(
-        "cos", [](nb::object x) { return unary_dispatch(x, Operator::Cos); },
-        "cos(x)");
-    m.def(
-        "tan", [](nb::object x) { return unary_dispatch(x, Operator::Tan); },
-        "tan(x)");
-    m.def(
-        "exp", [](nb::object x) { return unary_dispatch(x, Operator::Exp); },
-        "exp(x)");
-    m.def(
-        "log", [](nb::object x) { return unary_dispatch(x, Operator::Log); },
-        "log(x)");
-    m.def(
-        "tanh", [](nb::object x) { return unary_dispatch(x, Operator::Tanh); },
-        "tanh(x)");
-    m.def(
-        "silu", [](nb::object x) { return unary_dispatch(x, Operator::Silu); },
-        "silu(x) = x * sigmoid(x)");
-    m.def(
-        "relu", [](nb::object x) { return unary_dispatch(x, Operator::Relu); },
-        "relu(x) = max(0,x)");
-    m.def(
-        "softmax",
-        [](nb::object x) { return unary_dispatch(x, Operator::Softmax); },
-        "softmax(x) over provided inputs");
-    m.def(
-        "gelu", [](nb::object x) { return unary_dispatch(x, Operator::Gelu); },
-        "gelu(x)");
+    // unary registrations (DRY via lambda)
+    auto reg_unary = [&](const char *name, Operator op, const char *doc) {
+        m.def(
+            name,
+            [op](nb::object x) { return unary_dispatch(std::move(x), op); },
+            doc);
+    };
+    reg_unary("sin", Operator::Sin, "sin(x)");
+    reg_unary("cos", Operator::Cos, "cos(x)");
+    reg_unary("tan", Operator::Tan, "tan(x)");
+    reg_unary("exp", Operator::Exp, "exp(x)");
+    reg_unary("log", Operator::Log, "log(x)");
+    reg_unary("tanh", Operator::Tanh, "tanh(x)");
+    reg_unary("silu", Operator::Silu, "silu(x) = x * sigmoid(x)");
+    reg_unary("relu", Operator::Relu, "relu(x) = max(0,x)");
+    reg_unary("softmax", Operator::Softmax, "softmax(x) over provided inputs");
+    reg_unary("gelu", Operator::Gelu, "gelu(x)");
 
     // max / pow
     m.def(
@@ -1585,49 +1364,19 @@ NB_MODULE(ad, m) {
         "max(a,b) with subgradient 0.5/0.5 at ties");
     m.def(
         "pow", [](nb::object x, double p) { return expr_pow_any(x, p); },
-        "pow(x,p) builds exp(p*log(x)) symbolically when p not integer");
-
-    // Compiled value
-    nb::class_<ValFn>(m, "ValFn")
-        .def("__call__", &ValFn::operator(), "x"_a,
-             "Evaluate f(x) (ndarray) -> float")
-        .def("expr_str", &ValFn::expr_str)
-        .def("call_seq", &ValFn::call_seq, "x_list"_a,
-             "Evaluate f(x) (list/tuple) -> float")
-        .def("__repr__", [](const ValFn &self) {
-            return "<ValFn expr=" + self.expr_str() + ">";
-        });
-
-    m.def(
-        "sym_val",
-        [](nb::object f, ssize_t arity, bool vector_input) {
-            return std::make_shared<ValFn>(f, static_cast<size_t>(arity),
-                                           vector_input);
-        },
-        "f"_a, "arity"_a, "vector_input"_a = true,
-        "Compile a value function once; returns ValFn.",
-        nb::rv_policy::take_ownership);
-
-    m.def(
-        "sym_val_cached",
-        [](nb::object f, ssize_t arity, bool vector_input) {
-            return get_or_make_val(f, static_cast<size_t>(arity), vector_input);
-        },
-        "f"_a, "arity"_a, "vector_input"_a = true,
-        "Get or compile & cache a ValFn keyed by (f,arity,vector_input).",
-        nb::rv_policy::take_ownership);
+        "pow(x,p) builds exp(p*log(x)) when p is not integer");
 
     // Compiled gradient
     nb::class_<GradFn>(m, "GradFn")
         .def("__call__", &GradFn::call_numpy, "x"_a,
-             "Evaluate gradient at x (ndarray) -> ndarray")
+             "Evaluate gradient at x (ndarray)->ndarray")
         .def("__call__", &GradFn::operator(), "x_list"_a,
-             "Evaluate gradient at x (list/tuple) -> list")
+             "Evaluate gradient at x (list/tuple)->list")
         .def("expr_str", &GradFn::expr_str)
         .def("value", &GradFn::value_numpy, "x"_a,
-             "Evaluate f(x) (ndarray) -> float")
+             "Evaluate f(x) (ndarray)->float")
         .def("value_grad", &GradFn::value_grad_numpy, "x"_a,
-             "Evaluate (f(x), grad f(x)) (ndarray) -> (float, ndarray)")
+             "Return (f(x), grad f(x)) (ndarray)")
         .def("__repr__", [](const GradFn &self) {
             return "<GradFn expr=" + self.expr_str() + ">";
         });
@@ -1635,8 +1384,7 @@ NB_MODULE(ad, m) {
     m.def(
         "sym_grad",
         [](nb::object f, ssize_t arity, bool vector_input) {
-            return std::make_shared<GradFn>(f, static_cast<size_t>(arity),
-                                            vector_input);
+            return std::make_shared<GradFn>(f, (size_t)arity, vector_input);
         },
         "f"_a, "arity"_a, "vector_input"_a = true,
         "Compile a gradient function once; returns GradFn.",
@@ -1649,8 +1397,7 @@ NB_MODULE(ad, m) {
                 throw std::invalid_argument(
                     "gradient_from_example: pass a list/tuple example");
             nb::sequence seq = nb::cast<nb::sequence>(example);
-            return std::make_shared<GradFn>(
-                f, static_cast<size_t>(nb::len(seq)), true);
+            return std::make_shared<GradFn>(f, (size_t)nb::len(seq), true);
         },
         "f"_a, "example"_a,
         "Compile a gradient using a list/tuple example to infer arity.",
@@ -1659,8 +1406,7 @@ NB_MODULE(ad, m) {
     m.def(
         "sym_grad_cached",
         [](nb::object f, ssize_t arity, bool vector_input) {
-            return get_or_make_grad(f, static_cast<size_t>(arity),
-                                    vector_input);
+            return get_or_make_grad(f, (size_t)arity, vector_input);
         },
         "f"_a, "arity"_a, "vector_input"_a = true,
         "Get or compile & cache a GradFn keyed by (f,arity,vector_input).",
@@ -1669,11 +1415,11 @@ NB_MODULE(ad, m) {
     // Compiled Hessian
     nb::class_<HessFn>(m, "HessFn")
         .def("__call__", &HessFn::call_numpy, "x"_a,
-             "Evaluate Hessian at x (ndarray) -> ndarray[n,n]")
+             "Evaluate Hessian at x (ndarray)->ndarray[n,n]")
         .def("__call__", &HessFn::operator(), "x_list"_a,
              "Evaluate Hessian at x (list[list])")
         .def("hvp", &HessFn::hvp_numpy, "x"_a, "v"_a,
-             "HVP at x with v (ndarray) -> ndarray")
+             "HVP at x with v (ndarray)->ndarray")
         .def("expr_str", &HessFn::expr_str)
         .def("__repr__", [](const HessFn &self) {
             return "<HessFn expr=" + self.expr_str() + ">";
@@ -1682,8 +1428,7 @@ NB_MODULE(ad, m) {
     m.def(
         "sym_hess",
         [](nb::object f, ssize_t arity, bool vector_input) {
-            return std::make_shared<HessFn>(f, static_cast<size_t>(arity),
-                                            vector_input);
+            return std::make_shared<HessFn>(f, (size_t)arity, vector_input);
         },
         "f"_a, "arity"_a, "vector_input"_a = true,
         "Compile a Hessian function once; returns HessFn.",
@@ -1696,8 +1441,7 @@ NB_MODULE(ad, m) {
                 throw std::invalid_argument(
                     "hessian_from_example: pass a list/tuple example");
             nb::sequence seq = nb::cast<nb::sequence>(example);
-            return std::make_shared<HessFn>(
-                f, static_cast<size_t>(nb::len(seq)), true);
+            return std::make_shared<HessFn>(f, (size_t)nb::len(seq), true);
         },
         "f"_a, "example"_a,
         "Compile a Hessian using a list/tuple example to infer arity.",
@@ -1706,8 +1450,7 @@ NB_MODULE(ad, m) {
     m.def(
         "sym_hess_cached",
         [](nb::object f, ssize_t arity, bool vector_input) {
-            return get_or_make_hess(f, static_cast<size_t>(arity),
-                                    vector_input);
+            return get_or_make_hess(f, (size_t)arity, vector_input);
         },
         "f"_a, "arity"_a, "vector_input"_a = true,
         "Get or compile & cache a HessFn keyed by (f,arity,vector_input).",
@@ -1721,7 +1464,7 @@ NB_MODULE(ad, m) {
         },
         "f"_a, "cI"_a, "cE"_a, "arity"_a, "vector_input"_a = true);
 
-    // LagHessFn (Lagrangian Hessian builder + HVPs)
+    // Lagrangian Hessian
     nb::class_<LagHessFn>(m, "LagHessFn")
         .def(nb::init<nb::object, const std::vector<nb::object> &,
                       const std::vector<nb::object> &, size_t, bool>(),
@@ -1733,4 +1476,31 @@ NB_MODULE(ad, m) {
              "Return H·v (ndarray[n])")
         .def("hvp_multi_numpy", &LagHessFn::hvp_multi_numpy, "x"_a, "lam"_a,
              "nu"_a, "V"_a, "Return H·V (loops over columns; ndarray[n,k])");
+    // batch fused val+grad
+    m.def(
+        "batch_valgrad",
+        [](const std::vector<std::shared_ptr<GradFn>> &gfs, Arr1D x) {
+            return batch_value_grad_from_gradfns(gfs, x);
+        },
+        "gfs"_a, "x"_a,
+        "Fused (vals, J) for many compiled GradFn at the same x. "
+        "Returns (vals: ndarray[m], J: ndarray[m,n]).");
+
+    m.def(
+        "batch_valgrad",
+        [](nb::list funcs, Arr1D x) {
+            return batch_value_grad_from_callables(funcs, x);
+        },
+        "funcs"_a, "x"_a,
+        "Fused (vals, J) for many Python functions at the same x. "
+        "Functions are compiled/cached to GradFn internally.");
+
+    m.def(
+        "batch_valgrad",
+        [](nb::sequence grads, Arr1D x) {
+            return batch_value_grad_numpy(grads, x);
+        },
+        "grads"_a, "x"_a,
+        "Fused, parallel (f_j(x), grad f_j(x)) for a list of compiled GradFn.\n"
+        "Returns (vals: ndarray[m], J: ndarray[m,n]).");
 }

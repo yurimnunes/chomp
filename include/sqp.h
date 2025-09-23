@@ -6,10 +6,10 @@
 //
 // Build target: module name `sqp_cpp` exposing class `SQPStepper`
 
-#include <pybind11/eigen.h>
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <nanobind/eigen/dense.h>
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include <Eigen/Core>
 #include <optional>
@@ -19,7 +19,7 @@
 #include "../include/tr.h" // TrustRegionManager, TRConfig, TRResult, TRInfo
 #include "definitions.h"
 
-namespace py = pybind11;
+namespace nb = nanobind;
 using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 
@@ -29,147 +29,172 @@ using TrustRegionManager = ::TrustRegionManager;
 using TRResult = ::TRResult;
 using TRInfo = ::TRInfo;
 
-// ------------------------ Small helpers ------------------------ //
-static inline std::optional<dvec> opt_vec_from_py(const py::object &o) {
-    if (o.is_none())
+template <class T>
+static inline std::optional<T> opt_from_py(const nb::handle &h) {
+    if (!h || h.is_none())
         return std::nullopt;
     try {
-        return o.cast<dvec>();
-    } catch (...) {
+        return nb::cast<T>(h);
+    } catch (const nb::cast_error &) {
         return std::nullopt;
     }
 }
 
-static inline std::optional<dmat> opt_mat_from_py(const py::object &o) {
-    if (o.is_none())
+static inline std::optional<dvec> opt_vec_from_py(const nb::handle &h) {
+    return opt_from_py<dvec>(h);
+}
+
+static inline std::optional<dmat> opt_mat_from_py(const nb::handle &h) {
+    return opt_from_py<dmat>(h);
+}
+
+static inline std::optional<dvec> get_opt_vec_attr(const nb::handle &obj,
+                                                   const char *name) {
+    if (!obj || !nb::hasattr(obj, name))
         return std::nullopt;
+
     try {
-        return o.cast<dmat>();
-    } catch (...) {
+        nb::object v = obj.attr(name);
+        if (v.is_none())
+            return std::nullopt;
+
+        auto vec_opt = opt_vec_from_py(v);
+        if (vec_opt && vec_opt->size() == 0)
+            return std::nullopt;
+
+        return vec_opt;
+    } catch (const nb::cast_error &) {
         return std::nullopt;
     }
 }
 
+// Vectorized box clipping: y = min(max(x, lb), ub) where lb/ub may be absent
 static inline dvec clip_box(const dvec &x, const std::optional<dvec> &lb,
                             const std::optional<dvec> &ub) {
     dvec y = x;
-    const int n = (int)x.size();
-    if (lb)
-        for (int i = 0; i < n; ++i)
-            y[i] = std::max(y[i], (*lb)[i]);
-    if (ub)
-        for (int i = 0; i < n; ++i)
-            y[i] = std::min(y[i], (*ub)[i]);
+
+    if (lb) {
+        // Safety: size check (no-throw fast path if sizes match)
+        if (NB_UNLIKELY(lb->size() != x.size()))
+            throw std::invalid_argument("clip_box: lb size mismatch");
+        y = y.cwiseMax(*lb);
+    }
+    if (ub) {
+        if (NB_UNLIKELY(ub->size() != x.size()))
+            throw std::invalid_argument("clip_box: ub size mismatch");
+        y = y.cwiseMin(*ub);
+    }
     return y;
 }
 
+// Get attribute with fallback; works with any castable T.
 template <class T>
-static T get_attr_or(const py::object &obj, const char *name,
-                     const T &fallback) {
-    if (!py::hasattr(obj, name))
+static inline T get_attr_or(const nb::handle &obj, const char *name,
+                            const T &fallback) {
+    if (!obj || !nb::hasattr(obj, name))
         return fallback;
     try {
-        return obj.attr(name).cast<T>();
-    } catch (...) {
+        return nb::cast<T>(obj.attr(name));
+    } catch (const nb::cast_error &) {
         return fallback;
     }
 }
 
-static py::object get_or_none(const py::dict &d, const char *k) {
-    if (d.contains(k))
-        return d[k];
-    return py::none();
+// dict.get(k, None) — but via C++
+// Note: nanobind dict keys should be nb::handle/nb::str, not raw char*
+static inline nb::object get_or_none(const nb::dict &d, const char *k) {
+    nb::str key(k);
+    if (d.contains(key))
+        return nb::object(d[key]); // borrow; nanobind handles ref mgmt
+    return nb::none();
 }
 
 // ------------------------ SQP Stepper (C++) ------------------------ //
 class SQPStepper {
 public:
     // Single constructor: builds native TrustRegionManager from cfg
-    explicit SQPStepper(py::object cfg, py::object hess_mgr,
-                        py::object qp_solver, py::object regularizer,
-                        py::object restoration)
+    explicit SQPStepper(nb::object cfg, nb::object hess_mgr,
+                        nb::object qp_solver, nb::object regularizer,
+                        nb::object restoration)
         : cfg_(std::move(cfg)), hess_(std::move(hess_mgr)),
           qp_(std::move(qp_solver)), reg_(std::move(regularizer)),
           rest_(std::move(restoration)), tr_(build_tr_config_from_cfg_(cfg_)) {
         init_misc_();
     }
-
-    // step(model, x, lam, nu, it) -> (x_trial, lam_user, nu_new, info_dict)
-    std::tuple<dvec, dvec, dvec, SolverInfo> step(py::object model,
+    std::tuple<dvec, dvec, dvec, SolverInfo> step(nb::object model,
                                                   const dvec &x_in,
                                                   const dvec &lam_in,
                                                   const dvec &nu_in, int it) {
         // ---- 0) Box clipping ----
-        std::optional<dvec> lb = get_opt_vec(model, "lb");
-        std::optional<dvec> ub = get_opt_vec(model, "ub");
+        std::optional<dvec> lb = get_opt_vec_attr(model, "lb");
+        std::optional<dvec> ub = get_opt_vec_attr(model, "ub");
         dvec x = clip_box(x_in, lb, ub);
 
         // ---- 1) Evaluate once at x ----
-        py::list need;
-        need.append("f");
-        need.append("g");
-        need.append("cI");
-        need.append("JI");
-        need.append("cE");
-        need.append("JE");
-        py::dict d0 = model.attr("eval_all")(x, py::arg("components") = need)
-                          .cast<py::dict>();
-        const double f0 = d0["f"].cast<double>();
-        const dvec g0 = d0["g"].cast<dvec>();
+        nb::list need;
+        need.append(nb::str("f"));
+        need.append(nb::str("g"));
+        need.append(nb::str("cI"));
+        need.append(nb::str("JI"));
+        need.append(nb::str("cE"));
+        need.append(nb::str("JE"));
+
+        nb::object d0_obj = model.attr("eval_all")(x, "components"_a = need);
+        nb::dict d0 = nb::cast<nb::dict>(d0_obj);
+
+        // cache string keys (avoids repeated temporary construction)
+        static const nb::str k_f("f"), k_g("g"), k_JI("JI"), k_JE("JE"),
+            k_cI("cI"), k_cE("cE");
+
+        const double f0 = nb::cast<double>(d0[k_f]);
+        const dvec g0 = nb::cast<dvec>(d0[k_g]);
+
         auto JI = opt_mat_from_py(get_or_none(d0, "JI"));
         auto JE = opt_mat_from_py(get_or_none(d0, "JE"));
         auto cI = opt_vec_from_py(get_or_none(d0, "cI"));
         auto cE = opt_vec_from_py(get_or_none(d0, "cE"));
+
         const double theta0 =
-            model.attr("constraint_violation")(x).cast<double>();
+            nb::cast<double>(model.attr("constraint_violation")(x));
 
         // ---- 2) Lagrangian Hessian + regularization ----
-        py::object H_raw_py =
+        nb::object H_raw_py =
             model.attr("lagrangian_hessian")(x, lam_in, nu_in);
         const double tr_delta_at_call = tr_.get_delta();
         const double gnorm = g0.norm();
-        py::object reg_out =
-            reg_.attr("regularize")(H_raw_py, it, gnorm, tr_delta_at_call);
-        py::object H_psd_py = py::none();
-        if (py::isinstance<py::tuple>(reg_out)) {
-            py::tuple t = reg_out.cast<py::tuple>();
-            if (t.size() >= 1)
-                H_psd_py = t[0];
-        } else {
-            H_psd_py = reg_out; // fallback
-        }
-        dmat H = H_psd_py.cast<dmat>();
 
-        // If your TR supports ellipse metric from H, set it here:
-        // check if norm is "ellip" in cfg
+        nb::object reg_out =
+            reg_.attr("regularize")(H_raw_py, it, gnorm, tr_delta_at_call);
+
+        // `regularize` may return H or (H, meta). Handle both.
+        nb::object H_psd_py;
+        if (nb::isinstance<nb::tuple>(reg_out)) {
+            nb::tuple t = nb::cast<nb::tuple>(reg_out);
+            H_psd_py = (t.size() >= 1) ? t[0] : nb::none();
+        } else {
+            H_psd_py = reg_out;
+        }
+
+        // If H comes as numpy-like; nanobind eigen caster will handle it
+        dmat H = nb::cast<dmat>(H_psd_py);
+
+        // Optional: set TR metric from H
         const std::string norm_type =
             get_attr_or<std::string>(cfg_, "norm_type", std::string("2"));
-        if (norm_type == "ellip")
-            tr_.set_metric_from_H_dense(H); // uncomment if available/desired
+        if (norm_type == "ellip") {
+            tr_.set_metric_from_H_dense(H);
+        }
 
-        // dopt::DOptConfig cfg;
-        // cfg.dopt_sigma_E = 1e-2;
-        // cfg.dopt_sigma_I = 1e-2;
-        // cfg.dopt_mu_target = 1e-4;
-        // cfg.dopt_scaling = dopt::ScaleMode::Ruiz;
-
-        // dopt::DOptStabilizer stab(cfg);
-
-        // const dopt::dmat *JE_ptr = haveJE ? &JE : nullptr;
-        // const dopt::dmat *JI_ptr = haveJI ? &JI : nullptr;
-        // const dopt::dvec *cE_ptr = havecE ? &cE : nullptr;
-        // const dopt::dvec *cI_ptr = havecI ? &cI : nullptr;
-        // const dopt::dvec *lam_ptr = haveLam ? &lam : nullptr;
-
-        // auto [rE_opt, rI_opt, meta] =
-        //     stab.compute_shifts(JE_ptr, JI_ptr, cE_ptr, cI_ptr, lam_ptr);
+        std::cout << "[SQP] it=" << it << " f=" << f0 << " ||g||=" << gnorm
+                  << " theta=" << theta0 << " delta=" << tr_.get_delta()
+                  << "\n";
 
         // ---- 3) Native TR solve (dense path) ----
         TRResult out =
             tr_.solve_dense(H, g0,
                             /*A_ineq*/ JI, /*b_ineq*/ cI,
                             /*A_eq*/ JE, /*b_eq*/ cE,
-                            /*model*/ std::optional<py::object>(model),
+                            /*model*/ std::optional<nb::object>(model),
                             /*x*/ std::optional<dvec>(x),
                             /*lb*/ lb,
                             /*ub*/ ub,
@@ -177,7 +202,7 @@ public:
                             /*f_old*/ std::optional<double>(f0));
 
         const dvec &p = out.p;
-        const dvec &lam_user = out.lam;
+        const dvec &lam_usr = out.lam;
         const dvec &nu_new = out.nu;
         const TRInfo &tinfo = out.info;
 
@@ -191,32 +216,35 @@ public:
 
         // ---- 4) Trial evaluation ----
         const dvec x_trial = x + p;
-        py::dict d1 =
-            model.attr("eval_all")(x_trial, py::arg("components") = need)
-                .cast<py::dict>();
-        const double f1 = d1["f"].cast<double>();
-        const dvec g1 = d1["g"].cast<dvec>();
+
+        nb::object d1_obj =
+            model.attr("eval_all")(x_trial, "components"_a = need);
+        nb::dict d1 = nb::cast<nb::dict>(d1_obj);
+
+        const double f1 = nb::cast<double>(d1[k_f]);
+        const dvec g1 = nb::cast<dvec>(d1[k_g]);
         auto JE1 = opt_mat_from_py(get_or_none(d1, "JE"));
         auto JI1 = opt_mat_from_py(get_or_none(d1, "JI"));
         auto cE1 = opt_vec_from_py(get_or_none(d1, "cE"));
         auto cI1 = opt_vec_from_py(get_or_none(d1, "cI"));
-        const double theta1 =
-            model.attr("constraint_violation")(x_trial).cast<double>();
 
-        // Bound multipliers from TR: not returned; default to zeros for KKT
-        // (fine).
+        const double theta1 =
+            nb::cast<double>(model.attr("constraint_violation")(x_trial));
+
+        // Bound multipliers (not returned by TR): zeros for KKT
         dvec zL = dvec::Zero(x.size());
         dvec zU = dvec::Zero(x.size());
 
         // ---- 5) KKT residuals at trial ----
-        auto kkt = compute_kkt(g1, JE1, JI1, cE1, cI1, x_trial, nu_new,
-                               lam_user, zL, zU, lb, ub);
+        auto kkt = compute_kkt(g1, JE1, JI1, cE1, cI1, x_trial, nu_new, lam_usr,
+                               zL, zU, lb, ub);
 
         // ---- 6) Convergence test ----
         const double cEn = cE ? cE->norm() : 0.0;
         const double cIn =
             cI ? cI->cwiseMax(0.0).lpNorm<Eigen::Infinity>() : 0.0;
         const double g_scale = std::max(1.0, g0.norm() + std::max(cEn, cIn));
+
         const bool converged =
             ((kkt.stat / g_scale) <=
                  get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
@@ -234,96 +262,82 @@ public:
         const std::string hmode = get_attr_or<std::string>(
             cfg_, "hessian_mode", std::string("exact"));
         if (hmode == "bfgs" || hmode == "lbfgs" || hmode == "hybrid") {
-            if (py::hasattr(hess_, "update")) {
+            // Prefer a dedicated model method if available
+            if (nb::hasattr(model, "hessian_update")) {
+                // pass acceptance flag if your model supports it
+                try {
+                    model.attr("hessian_update")(p, g1 - g0,
+                                                 "accepted"_a = tinfo.accepted);
+                } catch (const nb::python_error &) {
+                    // fall back silently to hess_ if model refuses the call
+                    if (nb::hasattr(hess_, "update"))
+                        hess_.attr("update")(p, g1 - g0);
+                }
+            } else if (nb::hasattr(hess_, "update")) {
                 hess_.attr("update")(p, g1 - g0);
             }
         }
 
         // ---- 8) Pack & return ----
-        const double step_norm = tinfo.step_norm; // TR-provided norm
+        const double step_norm = tinfo.step_norm;
         const double rho =
             std::numeric_limits<double>::quiet_NaN(); // not exposed by TR
         const bool accepted = tinfo.accepted;
-
-        // py::dict kkt_dict = kkt.to_dict();
-        // py::dict tr_info = tr_info_to_dict(tinfo);
 
         SolverInfo info =
             make_info_dict(step_norm, accepted, converged, f1, theta1, kkt, 0,
                            1.0, rho, tr_.get_delta());
         info.delta = tr_.get_delta();
-        // info["tr"] = tr_info;
-
-        return std::make_tuple(x_trial, lam_user, nu_new, info);
+        return std::make_tuple(x_trial, lam_usr, nu_new, info);
     }
 
 private:
     // config and collaborators
-    py::object cfg_, hess_, ls_, qp_, soc_, reg_, rest_;
+    nb::object cfg_, hess_, ls_, qp_, soc_, reg_, rest_;
     TrustRegionManager tr_;
     bool requires_dense_{};
 
-    static TRConfig build_tr_config_from_cfg_(const py::object &cfg) {
-        TRConfig tc; // defaults from your C++ TRConfig (../include/tr.h)
-        // Map selected fields if present.
-        if (py::hasattr(cfg, "delta0"))
-            tc.delta0 = cfg.attr("delta0").cast<double>();
-        if (py::hasattr(cfg, "delta_min"))
-            tc.delta_min = cfg.attr("delta_min").cast<double>();
-        if (py::hasattr(cfg, "delta_max"))
-            tc.delta_max = cfg.attr("delta_max").cast<double>();
-        if (py::hasattr(cfg, "eta1"))
-            tc.eta1 = cfg.attr("eta1").cast<double>();
-        if (py::hasattr(cfg, "eta2"))
-            tc.eta2 = cfg.attr("eta2").cast<double>();
-        if (py::hasattr(cfg, "gamma1"))
-            tc.gamma1 = cfg.attr("gamma1").cast<double>();
-        if (py::hasattr(cfg, "gamma2"))
-            tc.gamma2 = cfg.attr("gamma2").cast<double>();
-        if (py::hasattr(cfg, "zeta"))
-            tc.zeta = cfg.attr("zeta").cast<double>();
-        if (py::hasattr(cfg, "norm_type"))
-            tc.norm_type = cfg.attr("norm_type").cast<std::string>();
-        if (py::hasattr(cfg, "metric_shift"))
-            tc.metric_shift = cfg.attr("metric_shift").cast<double>();
-        if (py::hasattr(cfg, "curvature_aware"))
-            tc.curvature_aware = cfg.attr("curvature_aware").cast<bool>();
-        if (py::hasattr(cfg, "criticality_enabled"))
-            tc.criticality_enabled =
-                cfg.attr("criticality_enabled").cast<bool>();
+    static TRConfig build_tr_config_from_cfg_(const nb::object &cfg) {
+        TRConfig tc; // start with C++ defaults
 
-        // Optional extras (if present in your TRConfig):
-        if (py::hasattr(cfg, "cg_tol"))
-            tc.cg_tol = get_attr_or<double>(cfg, "cg_tol", tc.cg_tol);
-        if (py::hasattr(cfg, "cg_tol_rel"))
-            tc.cg_tol_rel =
-                get_attr_or<double>(cfg, "cg_tol_rel", tc.cg_tol_rel);
-        if (py::hasattr(cfg, "cg_maxiter"))
-            tc.cg_maxiter = get_attr_or<int>(cfg, "cg_maxiter", tc.cg_maxiter);
-        if (py::hasattr(cfg, "neg_curv_tol"))
-            tc.neg_curv_tol =
-                get_attr_or<double>(cfg, "neg_curv_tol", tc.neg_curv_tol);
-        if (py::hasattr(cfg, "box_mode"))
-            tc.box_mode =
-                get_attr_or<std::string>(cfg, "box_mode", tc.box_mode);
-        if (py::hasattr(cfg, "use_prec"))
-            tc.use_prec = get_attr_or<bool>(cfg, "use_prec", tc.use_prec);
-        if (py::hasattr(cfg, "prec_kind"))
-            tc.prec_kind =
-                get_attr_or<std::string>(cfg, "prec_kind", tc.prec_kind);
-        if (py::hasattr(cfg, "ssor_omega"))
-            tc.ssor_omega =
-                get_attr_or<double>(cfg, "ssor_omega", tc.ssor_omega);
+        // nb::gil_scoped_acquire gil;
 
-        // Filter config if exposed under cfg.filter_cfg (optional)
-        if (py::hasattr(cfg, "use_filter"))
-            tc.use_filter = get_attr_or<bool>(cfg, "use_filter", tc.use_filter);
+        // Core TR params
+        tc.delta0 = get_attr_or<double>(cfg, "delta0", tc.delta0);
+        tc.delta_min = get_attr_or<double>(cfg, "delta_min", tc.delta_min);
+        tc.delta_max = get_attr_or<double>(cfg, "delta_max", tc.delta_max);
+        tc.eta1 = get_attr_or<double>(cfg, "eta1", tc.eta1);
+        tc.eta2 = get_attr_or<double>(cfg, "eta2", tc.eta2);
+        tc.gamma1 = get_attr_or<double>(cfg, "gamma1", tc.gamma1);
+        tc.gamma2 = get_attr_or<double>(cfg, "gamma2", tc.gamma2);
+        tc.zeta = get_attr_or<double>(cfg, "zeta", tc.zeta);
+        tc.norm_type = get_attr_or<std::string>(cfg, "norm_type", tc.norm_type);
+        tc.metric_shift =
+            get_attr_or<double>(cfg, "metric_shift", tc.metric_shift);
+        tc.curvature_aware =
+            get_attr_or<bool>(cfg, "curvature_aware", tc.curvature_aware);
+        tc.criticality_enabled = get_attr_or<bool>(cfg, "criticality_enabled",
+                                                   tc.criticality_enabled);
+
+        // Optional extras (present in your TRConfig)
+        tc.cg_tol = get_attr_or<double>(cfg, "cg_tol", tc.cg_tol);
+        tc.cg_tol_rel = get_attr_or<double>(cfg, "cg_tol_rel", tc.cg_tol_rel);
+        tc.cg_maxiter = get_attr_or<int>(cfg, "cg_maxiter", tc.cg_maxiter);
+        tc.neg_curv_tol =
+            get_attr_or<double>(cfg, "neg_curv_tol", tc.neg_curv_tol);
+        tc.box_mode = get_attr_or<std::string>(cfg, "box_mode", tc.box_mode);
+        tc.use_prec = get_attr_or<bool>(cfg, "use_prec", tc.use_prec);
+        tc.prec_kind = get_attr_or<std::string>(cfg, "prec_kind", tc.prec_kind);
+        tc.ssor_omega = get_attr_or<double>(cfg, "ssor_omega", tc.ssor_omega);
+
+        // Filter knob
+        tc.use_filter = get_attr_or<bool>(cfg, "use_filter", tc.use_filter);
 
         return tc;
     }
 
     void init_misc_() {
-        requires_dense_ = py::hasattr(qp_, "requires_dense")
+        requires_dense_ = nb::hasattr(qp_, "requires_dense")
                               ? get_attr_or<bool>(qp_, "requires_dense", false)
                               : false;
         ensure_default("tol_feas", 1e-6);
@@ -337,21 +351,24 @@ private:
     }
 
     template <class T> void ensure_default(const char *name, const T &val) {
-        if (!py::hasattr(cfg_, name))
+        if (!nb::hasattr(cfg_, name))
             cfg_.attr(name) = val;
     }
 
-    static std::optional<dvec> get_opt_vec(const py::object &obj,
-                                           const char *name) {
-        if (!py::hasattr(obj, name))
+    static inline std::optional<dvec> get_opt_vec(const nb::handle &obj,
+                                                  const char *name) {
+        if (!obj || !nb::hasattr(obj, name))
             return std::nullopt;
-        py::object v = obj.attr(name);
-        if (v.is_none())
-            return std::nullopt;
+
         try {
-            return v.cast<dvec>();
-        } catch (...) {
-            return std::nullopt;
+            // nb::gil_scoped_acquire gil; // touching Python
+            nb::object v = obj.attr(name);
+            if (v.is_none())
+                return std::nullopt;
+            return to_dense_optional<dvec>(
+                v); // uses your helper; handles ndarray/sparse
+        } catch (const nb::python_error &) {
+            return std::nullopt; // treat Python-side errors as "absent"
         }
     }
 
@@ -437,45 +454,7 @@ private:
         d.alpha = alpha;
         d.rho = rho;
         d.tr_radius = tr_delta;
-        // Alternative: return as py::dict
-        // py::dict d;
-        // d["step_norm"] = step_norm;
-        // d["accepted"] = accepted;
-        // d["converged"] = converged;
-        // d["f"] = f_val;
-        // d["theta"] = theta;
-        // d["stat"] = kkt["stat"];
-        // d["ineq"] = kkt["ineq"];
-        // d["eq"] = kkt["eq"];
-        // d["comp"] = kkt["comp"];
-        // d["ls_iters"] = ls_iters;
-        // d["alpha"] = alpha;
-        // d["rho"] = rho;
-        // d["tr_radius"] = tr_delta;
+
         return d;
     }
 };
-
-// ------------------------ PYBIND MODULE ------------------------ //
-// PYBIND11_MODULE(sqp_cpp, m) {
-//     m.doc() = "C++23 SQPStepper with pybind11 (native TrustRegionManager)";
-
-//     py::class_<SQPStepper>(m, "SQPStepper")
-//         .def(py::init<py::object, py::object, py::object, py::object,
-//                       py::object>(),
-//              py::arg("cfg"), py::arg("hessian_manager"),
-//              py::arg("qp_solver"), py::arg("regularizer"),
-//              py::arg("restoration"))
-//         .def("step", &SQPStepper::step, py::arg("model"), py::arg("x"),
-//              py::arg("lam"), py::arg("nu"), py::arg("it"),
-//              R"doc(
-//                  Perform one SQP step.
-//                  Args:
-//                    model: Python model object with eval_all,
-//                    constraint_violation, lagrangian_hessian, and optional
-//                    lb/ub attributes x: current point (n,) lam:
-//                    user-inequality multipliers at x (mI,) nu: equality
-//                    multipliers at x (mE,) it: iteration index
-//                  Returns: (x_trial, lam_user, nu_new, info_dict)
-//              )doc");
-// }

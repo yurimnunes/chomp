@@ -42,62 +42,101 @@ using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 
 // ------------------------------ KKT assembly --------------------------
-[[nodiscard]] inline spmat assemble_KKT(const spmat &W, double delta,
+// Faster KKT assembly: single copy of W, no extra diagonal pass, streamed inserts.
+[[nodiscard]] inline spmat assemble_KKT(spmat W, double delta,
                                         const std::optional<spmat> &Gopt,
                                         bool *out_hasE) {
     const int n = W.rows();
-    if (W.cols() != n)
-        throw std::invalid_argument("assemble_KKT: W not square");
+    if (W.cols() != n) throw std::invalid_argument("assemble_KKT: W not square");
+
+    W.makeCompressed();
+
+    // In-place diagonal regularization
+    if (delta != 0.0) {
+        for (int i = 0; i < n; ++i) W.coeffRef(i, i) += delta;
+        W.makeCompressed(); // keep compressed after coeffRef writes
+    }
 
     const bool hasE = Gopt && (Gopt->rows() > 0);
-    if (out_hasE)
-        *out_hasE = hasE;
+    if (out_hasE) *out_hasE = hasE;
 
     if (!hasE) {
-        if (delta == 0.0)
-            return W;
-        spmat I(n, n);
-        I.setIdentity();
-        return (W + delta * I).pruned();
+        return W; // NRVO/move
     }
 
-    const auto &G = *Gopt;
+    const spmat &G = *Gopt;
+    if (G.cols() != n) throw std::invalid_argument("assemble_KKT: G.cols != n");
     const int m = G.rows();
+    const int N = n + m;
 
-    std::vector<Eigen::Triplet<double>> triplets;
-    const size_t est_triplets =
-        W.nonZeros() + 2 * G.nonZeros() + (delta != 0.0 ? n : 0);
-    triplets.reserve(est_triplets);
+    // Precompute row-wise lists for G to stream G^T columns quickly
+    // (right block columns correspond to G rows).
+    std::vector<std::vector<std::pair<int,double>>> Grow(m);
+    Grow.reserve(static_cast<size_t>(m));
+    for (int i = 0; i < m; ++i) Grow.emplace_back();
 
-    std::vector<bool> has_diag(n, false);
-    for (int j = 0; j < W.outerSize(); ++j) {
-        for (spmat::InnerIterator it(W, j); it; ++it) {
-            double val = it.value();
-            if (delta != 0.0 && it.row() == it.col()) {
-                val += delta;
-                has_diag[it.row()] = true;
-            }
-            triplets.emplace_back(it.row(), it.col(), val);
-        }
-    }
-    if (delta != 0.0) {
-        for (int j = 0; j < n; ++j)
-            if (!has_diag[j])
-                triplets.emplace_back(j, j, delta);
-    }
+    // Also count nnz per "right" column for reservation
+    std::vector<int> right_col_nnz(m, 0);
 
+    // Iterate G by columns once; fill:
+    //  - left block "bottom part": column j of K gets entries (n + row_i, j) = G(i,j)
+    //  - right block column (n+i): entries (col_j, n + i) = G(i,j)  (i = row of G)
     for (int j = 0; j < G.outerSize(); ++j) {
         for (spmat::InnerIterator it(G, j); it; ++it) {
-            triplets.emplace_back(it.col(), n + it.row(), it.value()); // G^T
-            triplets.emplace_back(n + it.row(), it.col(), it.value()); // G
+            const int i = it.row();
+            const double v = it.value();
+            Grow[i].emplace_back(j, v);
+            ++right_col_nnz[i];
         }
     }
 
-    spmat K(n + m, n + m);
-    K.setFromTriplets(triplets.begin(), triplets.end());
-    K.makeCompressed();
+    // Reserve per-column nnz estimates
+    Eigen::VectorXi reserve(N);
+    reserve.setZero();
+
+    // Left block columns 0..n-1: W column j + (#entries in G column j)
+    for (int j = 0; j < n; ++j) {
+        int wj = W.outerIndexPtr()[j + 1] - W.outerIndexPtr()[j];
+        // bottom part from G (same j)
+        int gj = 0;
+        for (spmat::InnerIterator it(G, j); it; ++it) ++gj;
+        reserve[j] = wj + gj;
+    }
+    // Right block columns n..n+m-1: per G row i
+    for (int i = 0; i < m; ++i) reserve[n + i] = right_col_nnz[i];
+
+    spmat K(N, N);
+    K.reserve(reserve);
+
+    // Stream columns 0..n-1
+    for (int j = 0; j < n; ++j) {
+        K.startVec(j);
+        // top-left W
+        for (spmat::InnerIterator it(W, j); it; ++it) {
+            K.insertBack(it.row(), j) = it.value();
+        }
+        // bottom-left G (rows shifted by n)
+        for (spmat::InnerIterator it(G, j); it; ++it) {
+            K.insertBack(n + it.row(), j) = it.value();
+        }
+    }
+
+    // Stream columns n..n+m-1 (top-right = G^T; bottom-right = 0)
+    for (int i = 0; i < m; ++i) {
+        const int col = n + i;
+        K.startVec(col);
+        for (const auto &p : Grow[i]) {
+            const int j = p.first;     // original feature column
+            const double v = p.second; // G(i, j)
+            K.insertBack(j, col) = v;  // top-right
+        }
+        // no bottom-right inserts (zero block)
+    }
+
+    K.finalize(); // makeCompressed() implied
     return K;
 }
+
 
 // ------------------------------ QDLDL helpers -------------------------
 [[nodiscard]] inline qdldl23::SparseD32
@@ -158,19 +197,7 @@ eigen_to_upper_csc(const spmat &A, double diag_eps = 0.0) {
     return qdldl23::SparseD32(n, std::move(Ap), std::move(Ai), std::move(Ax));
 }
 
-// ------------------------------ config -------------------------------
-struct ChompConfig {
-    double cg_tol = 1e-6;
-    int cg_maxit = 25;
-    double ip_hess_reg0 = 1e-8;
-    double schur_dense_cutoff = 0.25;
-    std::string prec_type = "ssor"; // "jacobi" | "ssor" | "none"
-    double ssor_omega = 1.0;
-    std::string sym_ordering = "none"; // "amd" | "none"
-    bool use_simd = false;
-    int block_size = 256;
-    bool adaptive_gamma = false;
-};
+
 
 // ------------------------------ SIMD optimized helpers ----------------
 #if defined(__AVX2__)
@@ -505,29 +532,6 @@ cg(const LinOp &A, const dvec &b,
     return {x, info};
 }
 
-// ---------------------------- reusable API ----------------------------
-struct KKTReusable {
-    virtual ~KKTReusable() = default;
-    virtual std::pair<dvec, dvec> solve(const dvec &r1,
-                                        const std::optional<dvec> &r2,
-                                        double cg_tol = 1e-8,
-                                        int cg_maxit = 200) = 0;
-};
-
-// ---------------------------- strategy base ---------------------------
-struct KKTStrategy {
-    virtual ~KKTStrategy() = default;
-    virtual std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>>
-    factor_and_solve(const spmat &W, const std::optional<spmat> &G,
-                     const dvec &r1, const std::optional<dvec> &r2,
-                     const ChompConfig &cfg, std::optional<double> regularizer,
-                     std::unordered_map<std::string, dvec> &cache,
-                     double delta = 0.0,
-                     std::optional<double> gamma = std::nullopt,
-                     bool assemble_schur_if_m_small = true,
-                     bool use_prec = true) = 0;
-    std::string name;
-};
 
 // ------------------------------ HYKKT ---------------------------------
 class HYKKTStrategy final : public KKTStrategy {

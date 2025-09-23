@@ -615,54 +615,69 @@ void ADGraph::computeForwardPassWithDotLanes() {
                     lanes_.dot[abase + l] - lanes_.dot[bbase + l];
             break;
         }
+        // drop-in for n-ary Multiply forward lanes
         case Operator::Multiply: {
             const size_t m = u->inputs.size();
             if (m == 0)
                 break;
-
-            if (m == 2) [[likely]] {
-                const int ia = u->inputs[0]->id, ib = u->inputs[1]->id;
-                const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-                const double aval = u->inputs[0]->value,
-                             bval = u->inputs[1]->value;
-                for (size_t l = 0; l < L; ++l) {
-                    const double ad = lanes_.dot[abase + l];
-                    const double bd = lanes_.dot[bbase + l];
-                    lanes_.dot[ybase + l] = ad * bval + aval * bd;
-                }
+            if (m == 2) { /* keep your fast path */
             } else {
-                // General n-ary product with zero-count optimization
                 ensure_scratch_size(m);
                 ensure_base_size(m);
 
-                size_t zero_count = 0, zero_idx = 0;
-                double prod_nz = 1.0;
+                // Preload scalars and bases (lane-independent)
+                size_t zc = 0, zidx = 0;
                 for (size_t j = 0; j < m; ++j) {
                     const double vj = u->inputs[j]->value;
                     g_scratch_values[j] = vj;
                     g_scratch_bases[j] = lanes_.base(u->inputs[j]->id);
-                    if (vj == 0.0) {
-                        if (++zero_count == 1)
-                            zero_idx = j;
-                    } else {
-                        prod_nz *= vj;
-                    }
+                    if (vj == 0.0 && (++zc == 1))
+                        zidx = j;
                 }
 
+                if (zc >= 2) {
+                    // All zero
+                    std::fill_n(&lanes_.dot[ybase], L, 0.0);
+                    break;
+                }
+
+                if (zc == 1) {
+                    // Only the zero term contributes
+                    double prod_nz = 1.0;
+                    for (size_t j = 0; j < m; ++j)
+                        if (j != zidx)
+                            prod_nz *= g_scratch_values[j];
+                    const size_t zb = g_scratch_bases[zidx];
+                    for (size_t l = 0; l < L; ++l)
+                        lanes_.dot[ybase + l] = lanes_.dot[zb + l] * prod_nz;
+                    break;
+                }
+
+                // zc == 0: use prefix/suffix products (no division in the inner
+                // loop) prefix[i] = v0*...*v_{i-1}, suffix[i] =
+                // v_{i+1}*...*v_{m-1}
+                ensure_scratch_size(3 * m);
+                double *prefix = g_scratch_values.data(); // reuse block 0..m-1
+                double *suffix =
+                    g_scratch_values.data() + m; // reuse block m..2m-1
+                double *contrib = g_scratch_values.data() +
+                                  2 * m; // temp per i (lane-indep coeff)
+
+                prefix[0] = 1.0;
+                for (size_t i = 1; i < m; ++i)
+                    prefix[i] = prefix[i - 1] * u->inputs[i - 1]->value;
+                suffix[m - 1] = 1.0;
+                for (size_t i = m - 1; i-- > 0;)
+                    suffix[i] = suffix[i + 1] * u->inputs[i + 1]->value;
+
+                for (size_t i = 0; i < m; ++i)
+                    contrib[i] = prefix[i] * suffix[i];
+
+                // lanes
                 for (size_t l = 0; l < L; ++l) {
                     double yd = 0.0;
-                    if (zero_count == 0) {
-                        for (size_t j = 0; j < m; ++j) {
-                            const double dj =
-                                lanes_.dot[g_scratch_bases[j] + l];
-                            yd += dj * (prod_nz / g_scratch_values[j]);
-                        }
-                    } else if (zero_count == 1) {
-                        const double dz =
-                            lanes_.dot[g_scratch_bases[zero_idx] + l];
-                        yd = dz * prod_nz;
-                    }
-                    // if zero_count >= 2, yd stays 0
+                    for (size_t i = 0; i < m; ++i)
+                        yd += contrib[i] * lanes_.dot[g_scratch_bases[i] + l];
                     lanes_.dot[ybase + l] = yd;
                 }
             }
@@ -1283,79 +1298,60 @@ std::vector<double> ADGraph::getGradientVector(const ADNodePtr &expr) {
 
 // ------------------------- Multi-RHS HVP (lanes)
 // -----------------------------
-void ADGraph::hessianMultiVectorProduct(const ADNodePtr &outputNode,
-                                        const double *V_ptr, size_t ldV,
-                                        double *Y_ptr, size_t ldY, size_t k) {
-    if (!outputNode)
+void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
+                                        size_t ldV, double *Y, size_t ldY,
+                                        size_t k) {
+    if (!y || k == 0)
         return;
     if (cache_.dirty)
         rebuildCache_();
-
-    // Prepare variable orders
     initializeNodeVariables();
-    const size_t nvars = nodeVariables.size();
-    if (nvars == 0 || k == 0)
+    const size_t n = nodeVariables.size();
+    if (n == 0)
         return;
 
-    // Configure lanes and buffers
     set_num_lanes(k);
     ensureLaneBuffers_();
-    const size_t L = lanes();
 
-    // 1) Reset lanes (no epoch writes)
+    // 1) zero lanes and load V into variable rows
     std::fill(lanes_.dot.begin(), lanes_.dot.end(), 0.0);
     std::fill(lanes_.gdot.begin(), lanes_.gdot.end(), 0.0);
-
-    // 2) Load input multi-vector V into variable nodes' lane dots.
-    //    Layout: element (varIndex i, lane l) at V_ptr[i*ldV + l]
     for (const auto &kv : nodeVariables) {
-        const ADNodePtr &varNode = kv.second;
-        if (!varNode)
+        const auto &var = kv.second;
+        if (!var)
             continue;
-        const int ord = varNode->order;
+        const int ord = var->order;
         if (ord < 0)
             continue;
-
-        const size_t vbase = lanes_.base(varNode->id);
-        // copy k lanes into the row slice
-        for (size_t l = 0; l < k; ++l) {
-            lanes_.dot[vbase + l] = V_ptr[size_t(ord) * ldV + l];
-        }
-        // if L>k, leave the tail at 0.0 (std::fill already did)
+        const size_t vbase = lanes_.base(var->id);
+        for (size_t l = 0; l < k; ++l)
+            lanes_.dot[vbase + l] = V[size_t(ord) * ldV + l];
     }
 
-    // 3) Single scalar forward pass to compute primals (AoS)
+    // 2) fused scalar forward + lane forward
     resetForwardPass();
-    computeForwardPass(); // uses AoS values
+    computeForwardPassAndDotLanesTogether();
 
-    // 4) Lane forward pass (propagate dot across graph)
-    computeForwardPassWithDotLanes();
-
-    // 5) Scalar reverse pass to compute first-order gradients w.r.t vars
+    // 3) scalar reverse to get w = ∂y/∂x
     resetGradients();
-    set_epoch_value(outputNode->gradient, outputNode->grad_epoch,
-                    cur_grad_epoch_, 1.0);
+    set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_, 1.0);
     initiateBackwardPassFused();
 
-    // 6) Lane reverse pass to propagate grad-dot using (w = gradient) & dots
-    // lanes_.gdot is already zeroed above; no epoch seeding necessary.
-    resetGradDotAll(); // keep if it zeroes AoS grad_dot fields only
+    // 4) lane reverse using w and per-lane dots
+    resetGradDotAll();
     initiateBackwardPassFusedLanes();
 
-    // 7) Extract outputs for variable nodes into Y
-    //    Layout: (i,l) -> Y_ptr[i*ldY + l]
+    // 5) gather Y
     for (const auto &kv : nodeVariables) {
-        const ADNodePtr &varNode = kv.second;
-        if (!varNode)
+        const auto &var = kv.second;
+        if (!var)
             continue;
-        const int ord = varNode->order;
+        const int ord = var->order;
         if (ord < 0)
             continue;
-
-        const size_t gbase = lanes_.base(varNode->id);
-        for (size_t l = 0; l < k; ++l) {
-            Y_ptr[size_t(ord) * ldY + l] = lanes_.gdot[gbase + l];
-        }
+        const size_t gbase = lanes_.base(var->id);
+        for (size_t l = 0; l < k; ++l)
+            Y[size_t(ord) * ldY + l] = lanes_.gdot[gbase + l];
     }
 }
 
@@ -1439,6 +1435,8 @@ void ADGraph::adoptSubgraph(const ADNodePtr &root) {
             if (in)
                 stack.push_back(in);
     }
+    //peepholeSimplify_();
+
     markDirty_();
 }
 
@@ -1562,4 +1560,722 @@ ADGraph::rebuildGraphWithUniqueVariables(const ADNodePtr &rootNode) {
     newG->nodeVariables = std::move(vars);
     newG->makeNodesUnique();
     return {newG, newG->nodeVariables};
+}
+
+// Fused forward pass: compute primals AND propagate dot lanes in single
+// traversal
+void ADGraph::computeForwardPassAndDotLanesTogether() {
+    if (cache_.dirty)
+        rebuildCache_();
+
+    const size_t L = lanes(); // lane count
+
+    for (ADNode *u : cache_.topo) {
+        if (!u)
+            continue;
+
+        const int uid = u->id;
+        const size_t ybase = lanes_.base(uid);
+
+        switch (u->type) {
+        case Operator::Var:
+        case Operator::cte:
+            // Variables: value already set, dots already loaded
+            // Constants: value set, dots remain 0
+            break;
+
+        case Operator::Add: {
+            const size_t m = u->inputs.size();
+            if (m == 0)
+                break;
+
+            // FUSED: Compute primal AND dot lanes together
+            double sum_val = 0.0;
+            std::fill_n(&lanes_.dot[ybase], L, 0.0);
+
+            for (const auto &inp : u->inputs) {
+                sum_val += inp->value; // Primal computation
+
+                // Dot lane computation
+                const size_t ibase = lanes_.base(inp->id);
+                for (size_t l = 0; l < L; ++l)
+                    lanes_.dot[ybase + l] += lanes_.dot[ibase + l];
+            }
+
+            u->value = sum_val; // Store primal result
+            break;
+        }
+
+        case Operator::Subtract: {
+            if (u->inputs.size() != 2)
+                break;
+
+            const ADNodePtr &a = u->inputs[0];
+            const ADNodePtr &b = u->inputs[1];
+            const int ia = a->id, ib = b->id;
+            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
+
+            // FUSED: Primal and dot computation
+            u->value = a->value - b->value;
+
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] =
+                    lanes_.dot[abase + l] - lanes_.dot[bbase + l];
+            break;
+        }
+
+        case Operator::Multiply: {
+            const size_t m = u->inputs.size();
+            if (m == 0)
+                break;
+
+            if (m == 2) [[likely]] {
+                const ADNodePtr &a = u->inputs[0];
+                const ADNodePtr &b = u->inputs[1];
+                const int ia = a->id, ib = b->id;
+                const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
+
+                // FUSED: Primal and dot computation
+                const double aval = a->value;
+                const double bval = b->value;
+                u->value = aval * bval;
+
+                for (size_t l = 0; l < L; ++l) {
+                    const double ad = lanes_.dot[abase + l];
+                    const double bd = lanes_.dot[bbase + l];
+                    lanes_.dot[ybase + l] = ad * bval + aval * bd;
+                }
+            } else {
+                // N-ary multiply with fused computation
+                ensure_scratch_size(m);
+                ensure_base_size(m);
+
+                size_t zero_count = 0, zero_idx = 0;
+                double prod_val = 1.0;
+                double prod_nz = 1.0;
+
+                // Single pass: collect values, bases, and compute primal
+                for (size_t j = 0; j < m; ++j) {
+                    const double vj = u->inputs[j]->value;
+                    g_scratch_values[j] = vj;
+                    g_scratch_bases[j] = lanes_.base(u->inputs[j]->id);
+
+                    prod_val *= vj; // Primal product
+
+                    if (vj == 0.0) {
+                        if (++zero_count == 1)
+                            zero_idx = j;
+                    } else {
+                        prod_nz *= vj;
+                    }
+                }
+
+                u->value = prod_val; // Store primal result
+
+                // Dot computation using precomputed values
+                for (size_t l = 0; l < L; ++l) {
+                    double yd = 0.0;
+                    if (zero_count == 0) {
+                        for (size_t j = 0; j < m; ++j) {
+                            const double dj =
+                                lanes_.dot[g_scratch_bases[j] + l];
+                            yd += dj * (prod_nz / g_scratch_values[j]);
+                        }
+                    } else if (zero_count == 1) {
+                        const double dz =
+                            lanes_.dot[g_scratch_bases[zero_idx] + l];
+                        yd = dz * prod_nz;
+                    }
+                    lanes_.dot[ybase + l] = yd;
+                }
+            }
+            break;
+        }
+
+        case Operator::Divide: {
+            if (u->inputs.size() != 2)
+                break;
+
+            const ADNodePtr &a = u->inputs[0];
+            const ADNodePtr &b = u->inputs[1];
+            const int ia = a->id, ib = b->id;
+            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
+
+            const double aval = a->value;
+            const double bval = b->value;
+
+            // FUSED: Primal and dot computation
+            if (bval == 0.0) {
+                u->value = std::numeric_limits<double>::infinity();
+                std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            } else {
+                u->value = aval / bval;
+                const double invb2 = 1.0 / (bval * bval);
+
+                for (size_t l = 0; l < L; ++l) {
+                    const double ad = lanes_.dot[abase + l];
+                    const double bd = lanes_.dot[bbase + l];
+                    lanes_.dot[ybase + l] = (ad * bval - aval * bd) * invb2;
+                }
+            }
+            break;
+        }
+
+        case Operator::Sin: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+
+            // FUSED: Compute sin and cos together (often optimized by compiler)
+            const double sinx = std::sin(xval);
+            const double cosx = std::cos(xval);
+
+            u->value = sinx;
+
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = cosx * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Cos: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+
+            // FUSED: Compute cos and sin together
+            const double cosx = std::cos(xval);
+            const double sinx = std::sin(xval);
+
+            u->value = cosx;
+
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = -sinx * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Tan: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+            const double tanx = std::tan(xval);
+
+            u->value = tanx;
+
+            const double sec2 = 1.0 + tanx * tanx;
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = sec2 * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Exp: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+            const double ex = std::exp(xval);
+
+            u->value = ex; // Primal
+
+            // Dot: both f(x) and f'(x) are exp(x)
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = ex * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Log: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+
+            u->value = std::log(xval);
+
+            if (xval > 0.0) {
+                const double invx = 1.0 / xval;
+                for (size_t l = 0; l < L; ++l)
+                    lanes_.dot[ybase + l] = invx * lanes_.dot[xbase + l];
+            } else {
+                std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            }
+            break;
+        }
+
+        case Operator::Tanh: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+            const double th = std::tanh(xval);
+
+            u->value = th; // Primal
+
+            const double sech2 = 1.0 - th * th; // Derivative
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = sech2 * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Relu: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+
+            // FUSED: Primal and dot computation
+            if (xval > 0.0) {
+                u->value = xval;
+                std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
+            } else {
+                u->value = 0.0;
+                std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            }
+            break;
+        }
+
+        case Operator::Max: {
+            if (u->inputs.size() != 2)
+                break;
+
+            const ADNodePtr &a = u->inputs[0];
+            const ADNodePtr &b = u->inputs[1];
+            const int ia = a->id, ib = b->id;
+            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
+
+            const double aval = a->value;
+            const double bval = b->value;
+
+            // FUSED: Primal and dot computation
+            if (aval >= bval) {
+                u->value = aval;
+                std::copy_n(&lanes_.dot[abase], L, &lanes_.dot[ybase]);
+            } else {
+                u->value = bval;
+                std::copy_n(&lanes_.dot[bbase], L, &lanes_.dot[ybase]);
+            }
+            break;
+        }
+
+        case Operator::Gelu: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            constexpr double inv_sqrt2 = 0.70710678118654752440;
+            constexpr double inv_sqrt2pi = 0.39894228040143267794;
+            const double xval = x->value;
+
+            // FUSED: Compute GELU and its derivative
+            const double erf_term = std::erf(xval * inv_sqrt2);
+            const double Phi = 0.5 * (1.0 + erf_term);
+            const double phi = inv_sqrt2pi * std::exp(-0.5 * xval * xval);
+
+            u->value = xval * Phi; // GELU(x) = x * Φ(x/√2)
+
+            const double f1 = Phi + xval * phi; // f'(x)
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = f1 * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Silu: {
+            if (u->inputs.size() != 1)
+                break;
+
+            const ADNodePtr &x = u->inputs[0];
+            const int ix = x->id;
+            const size_t xbase = lanes_.base(ix);
+
+            const double xval = x->value;
+
+            // FUSED: Compute SiLU and its derivative
+            const double sigmoid = 1.0 / (1.0 + std::exp(-xval));
+
+            u->value = xval * sigmoid; // SiLU(x) = x * σ(x)
+
+            const double sigmoid_prime = sigmoid * (1.0 - sigmoid);
+            const double f1 = sigmoid + xval * sigmoid_prime; // f'(x)
+            for (size_t l = 0; l < L; ++l)
+                lanes_.dot[ybase + l] = f1 * lanes_.dot[xbase + l];
+            break;
+        }
+
+        case Operator::Softmax: {
+            const size_t m = u->inputs.size();
+            if (m == 0)
+                break;
+
+            ensure_scratch_size(m);
+
+            // FUSED: Compute softmax and prepare for dot computation
+            // First pass: find max for numerical stability
+            double mmax = -std::numeric_limits<double>::infinity();
+            for (size_t j = 0; j < m; ++j)
+                mmax = std::max(mmax, u->inputs[j]->value);
+
+            // Second pass: compute exp(x_i - max) and sum
+            double Z = 0.0;
+            for (size_t j = 0; j < m; ++j) {
+                g_scratch_values[j] = std::exp(u->inputs[j]->value - mmax);
+                Z += g_scratch_values[j];
+            }
+
+            // Third pass: normalize to get softmax values
+            for (size_t j = 0; j < m; ++j)
+                g_scratch_values[j] /= Z; // s_j = softmax values
+
+            // Store primal result (assuming this is component 0)
+            const size_t i = 0; // component index (first input)
+            u->value = g_scratch_values[i];
+
+            // Dot computation for softmax derivative
+            const double si = g_scratch_values[i];
+
+            for (size_t l = 0; l < L; ++l) {
+                double avg = 0.0;
+                for (size_t j = 0; j < m; ++j)
+                    avg += g_scratch_values[j] *
+                           lanes_.dot[lanes_.base(u->inputs[j]->id) + l];
+
+                const size_t ibase = lanes_.base(u->inputs[i]->id);
+                const double di = lanes_.dot[ibase + l];
+                lanes_.dot[ybase + l] = si * (di - avg);
+            }
+            break;
+        }
+
+            // case Operator::Abs: {
+            //     if (u->inputs.size() != 1) break;
+
+            //     const ADNodePtr &x = u->inputs[0];
+            //     const int ix = x->id;
+            //     const size_t xbase = lanes_.base(ix);
+
+            //     const double xval = x->value;
+
+            //     // FUSED: Primal and dot computation
+            //     u->value = std::abs(xval);
+
+            //     if (xval > 0.0) {
+            //         std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
+            //     } else if (xval < 0.0) {
+            //         for (size_t l = 0; l < L; ++l)
+            //             lanes_.dot[ybase + l] = -lanes_.dot[xbase + l];
+            //     } else {
+            //         // At x=0, abs is not differentiable; use 0 derivative
+            //         std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            //     }
+            //     break;
+            // }
+
+            // case Operator::Sqrt: {
+            //     if (u->inputs.size() != 1) break;
+
+            //     const ADNodePtr &x = u->inputs[0];
+            //     const int ix = x->id;
+            //     const size_t xbase = lanes_.base(ix);
+
+            //     const double xval = x->value;
+
+            //     if (xval > 0.0) {
+            //         const double sqrtx = std::sqrt(xval);
+            //         u->value = sqrtx;
+
+            //         const double deriv = 0.5 / sqrtx; // d/dx sqrt(x) =
+            //         1/(2*sqrt(x)) for (size_t l = 0; l < L; ++l)
+            //             lanes_.dot[ybase + l] = deriv * lanes_.dot[xbase +
+            //             l];
+            //     } else {
+            //         u->value = 0.0;
+            //         std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            //     }
+            //     break;
+            // }
+
+            // case Operator::Pow: {
+            //     if (u->inputs.size() != 2) break;
+
+            //     const ADNodePtr &base = u->inputs[0];
+            //     const ADNodePtr &exponent = u->inputs[1];
+            //     const int ibase = base->id, iexp = exponent->id;
+            //     const size_t base_base = lanes_.base(ibase), exp_base =
+            //     lanes_.base(iexp);
+
+            //     const double b = base->value;
+            //     const double e = exponent->value;
+
+            //     if (b > 0.0) {
+            //         const double result = std::pow(b, e);
+            //         u->value = result;
+
+            //         // For z = b^e, dz/db = e * b^(e-1), dz/de = b^e * ln(b)
+            //         const double db_coeff = e * std::pow(b, e - 1.0);
+            //         const double de_coeff = result * std::log(b);
+
+            //         for (size_t l = 0; l < L; ++l) {
+            //             const double db = lanes_.dot[base_base + l];
+            //             const double de = lanes_.dot[exp_base + l];
+            //             lanes_.dot[ybase + l] = db_coeff * db + de_coeff *
+            //             de;
+            //         }
+            //     } else {
+            //         u->value = 0.0;
+            //         std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            //     }
+            //     break;
+            // }
+
+            // case Operator::Sigmoid: {
+            //     if (u->inputs.size() != 1) break;
+
+            //     const ADNodePtr &x = u->inputs[0];
+            //     const int ix = x->id;
+            //     const size_t xbase = lanes_.base(ix);
+
+            //     const double xval = x->value;
+            //     const double sigmoid = 1.0 / (1.0 + std::exp(-xval));
+
+            //     u->value = sigmoid;
+
+            //     const double deriv = sigmoid * (1.0 - sigmoid);
+            //     for (size_t l = 0; l < L; ++l)
+            //         lanes_.dot[ybase + l] = deriv * lanes_.dot[xbase + l];
+            //     break;
+            // }
+
+            // case Operator::LeakyRelu: {
+            //     if (u->inputs.size() != 1) break;
+
+            //     const ADNodePtr &x = u->inputs[0];
+            //     const int ix = x->id;
+            //     const size_t xbase = lanes_.base(ix);
+
+            //     const double xval = x->value;
+            //     constexpr double alpha = 0.01; // typical leaky ReLU slope
+
+            //     // FUSED: Primal and dot computation
+            //     if (xval > 0.0) {
+            //         u->value = xval;
+            //         std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
+            //     } else {
+            //         u->value = alpha * xval;
+            //         for (size_t l = 0; l < L; ++l)
+            //             lanes_.dot[ybase + l] = alpha * lanes_.dot[xbase +
+            //             l];
+            //     }
+            //     break;
+            // }
+
+        default:
+            // Fall back to separate computation for unimplemented ops
+            _dispatch_op(*u, ForwardFunctor{*this, *u});
+            // Note: This will NOT compute dot lanes for unknown ops
+            // You may want to add a warning or handle this case differently
+            std::fill_n(&lanes_.dot[ybase], L, 0.0);
+            break;
+        }
+    }
+
+    if (cache_.topo.size() != nodes.size()) [[unlikely]]
+        std::cerr << "Warning: cycle or dangling inputs in AD graph.\n";
+}
+// Call this after adoptSubgraph(...) or right before heavy evaluation.
+void ADGraph::peepholeSimplify_() {
+    // we only *read* the current topo; rebuild if stale,
+    // but we won't touch cache_.adj/radj directly here.
+    if (cache_.dirty) rebuildCache_();
+
+    auto make_cte = [&](double v) -> ADNodePtr {
+        auto c = std::make_shared<ADNode>();
+        c->type = Operator::cte;
+        c->value = v;
+        addNode(c);                   // ensure it’s in nodes & has an id later
+        return c;
+    };
+
+    // helpers that mutate u *without* touching u->id
+    auto fold_unary_into = [&](ADNode* u, auto f) {
+        if (u->inputs.size() == 1 && u->inputs[0] && u->inputs[0]->type == Operator::cte) {
+            const double x = u->inputs[0]->value;
+            u->type = Operator::cte;
+            u->value = f(x);
+            u->inputs.clear();
+            return true;
+        }
+        return false;
+    };
+
+    auto fold_binary_cte_into = [&](ADNode* u) {
+        if (u->inputs.size() != 2) return false;
+        auto &A = u->inputs[0];
+        auto &B = u->inputs[1];
+        if (!A || !B || A->type != Operator::cte || B->type != Operator::cte) return false;
+
+        const double a = A->value, b = B->value;
+        double y = 0.0;
+        switch (u->type) {
+            case Operator::Add:      y = a + b; break;
+            case Operator::Subtract: y = a - b; break;
+            case Operator::Multiply: y = a * b; break;
+            case Operator::Divide:   y = (b != 0.0) ? (a / b) : 0.0; break;
+            case Operator::Max:      y = (a >= b) ? a : b; break;
+            default: return false;
+        }
+        u->type = Operator::cte;
+        u->value = y;
+        u->inputs.clear();
+        return true;
+    };
+
+    // walk current topo; mutate nodes in place
+    for (ADNode* u : cache_.topo) {
+        if (!u) continue;
+
+        // constant folds for simple unaries
+        switch (u->type) {
+            case Operator::Sin:   if (fold_unary_into(u, +[](double x){return std::sin(x);} )) continue; break;
+            case Operator::Cos:   if (fold_unary_into(u, +[](double x){return std::cos(x);} )) continue; break;
+            case Operator::Tan:   if (fold_unary_into(u, +[](double x){return std::tan(x);} )) continue; break;
+            case Operator::Exp:   if (fold_unary_into(u, +[](double x){return std::exp(x);} )) continue; break;
+            case Operator::Log:   if (fold_unary_into(u, +[](double x){return std::log(x > 0 ? x : 1e-16);} )) continue; break;
+            case Operator::Tanh:  if (fold_unary_into(u, +[](double x){return std::tanh(x);} )) continue; break;
+            case Operator::Relu:  if (fold_unary_into(u, +[](double x){return x > 0 ? x : 0;} )) continue; break;
+            default: break;
+        }
+
+        // algebraic cleanup for Add / Multiply (flatten + remove identities)
+        if (u->type == Operator::Add) {
+            if (u->inputs.empty()) { u->type = Operator::cte; u->value = 0.0; continue; }
+
+            std::vector<ADNodePtr> flat;
+            flat.reserve(u->inputs.size());
+            double csum = 0.0;
+
+            for (auto &in : u->inputs) {
+                if (!in) continue;
+                if (in->type == Operator::cte) {
+                    csum += in->value;
+                } else if (in->type == Operator::Add) {
+                    // flatten one level
+                    for (auto &q : in->inputs) if (q) flat.push_back(q);
+                } else {
+                    flat.push_back(in);
+                }
+            }
+
+            // append the constant if needed
+            if (csum != 0.0) flat.push_back(make_cte(csum));
+
+            if (flat.empty()) {
+                u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
+            } else if (flat.size() == 1) {
+                // replace u with "passthrough" to that op (without copying id)
+                ADNodePtr a = flat[0];
+                u->type   = a->type;
+                u->value  = a->value;
+                u->inputs = a->inputs;   // share children by ptr
+                // DO NOT touch u->id
+            } else {
+                // stable order for better CSE; pointer address is fine
+                std::sort(flat.begin(), flat.end());
+                u->inputs.swap(flat);
+            }
+            continue;
+        }
+
+        if (u->type == Operator::Multiply) {
+            if (u->inputs.empty()) { u->type = Operator::cte; u->value = 1.0; continue; }
+
+            std::vector<ADNodePtr> flat;
+            flat.reserve(u->inputs.size());
+            double cprod = 1.0;
+            bool hasZero = false;
+
+            for (auto &in : u->inputs) {
+                if (!in) continue;
+                if (in->type == Operator::cte) {
+                    if (in->value == 0.0) { hasZero = true; break; }
+                    if (in->value == 1.0) continue;
+                    cprod *= in->value;
+                } else if (in->type == Operator::Multiply) {
+                    for (auto &q : in->inputs) if (q) flat.push_back(q);
+                } else {
+                    flat.push_back(in);
+                }
+            }
+
+            if (hasZero) { u->type = Operator::cte; u->value = 0.0; u->inputs.clear(); continue; }
+            if (cprod != 1.0) flat.push_back(make_cte(cprod));
+
+            if (flat.empty()) {
+                u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
+            } else if (flat.size() == 1) {
+                ADNodePtr a = flat[0];
+                u->type   = a->type;
+                u->value  = a->value;
+                u->inputs = a->inputs;
+            } else {
+                std::sort(flat.begin(), flat.end());
+                u->inputs.swap(flat);
+            }
+            continue;
+        }
+
+        // binary full-folds (cte, cte) for remaining ops
+        (void) fold_binary_cte_into(u);
+
+        // light identities:
+        if (u->type == Operator::Subtract && u->inputs.size()==2) {
+            auto &a = u->inputs[0]; auto &b = u->inputs[1];
+            if (b && b->type == Operator::cte && b->value == 0.0) {
+                // u = a - 0 -> passthrough
+                if (a) { u->type=a->type; u->value=a->value; u->inputs=a->inputs; }
+            }
+        }
+        if (u->type == Operator::Divide && u->inputs.size()==2) {
+            auto &a = u->inputs[0]; auto &b = u->inputs[1];
+            if (b && b->type == Operator::cte) {
+                if (b->value == 1.0 && a) { u->type=a->type; u->value=a->value; u->inputs=a->inputs; }
+                else if (a && a->type==Operator::cte && b->value != 0.0) {
+                    u->type=Operator::cte; u->value=a->value / b->value; u->inputs.clear();
+                }
+            }
+        }
+    }
+
+    // graph structure changed; do a **full** rebuild to recompute ids/edges
+    rebuildCacheFull_();
 }

@@ -130,325 +130,6 @@ template <class T> [[nodiscard]] constexpr T clamp01(T v) noexcept {
 // nanobind alias
 namespace nb = nanobind;
 
-// Safe: return d[k] if present, else nb::none()
-static inline nb::object nb_dict_get(const nb::dict &d, const nb::handle &k) {
-    return d.contains(k) ? d[k] : nb::none();
-}
-// ---------- Python attribute helpers ----------
-namespace pyu {
-[[nodiscard]] inline bool has_attr(const nb::object &o,
-                                   const char *name) noexcept {
-    return o.is_valid() && PyObject_HasAttrString(o.ptr(), name);
-}
-
-template <class T>
-[[nodiscard]] T getattr_or(const nb::object &o, const char *name,
-                           const T &fallback) {
-    if (!o.is_valid() || !has_attr(o, name)) [[likely]]
-        return fallback;
-    try {
-        return nb::cast<T>(o.attr(name));
-    } catch (...) {
-        return fallback;
-    }
-}
-} // namespace pyu
-
-// ---------- Optimized Python ↔ Eigen conversions ----------
-namespace pyconv {
-
-// Cache frequently used numpy module
-inline nb::object &get_numpy_module() {
-    static nb::object numpy = nb::module_::import_("numpy");
-    return numpy;
-}
-
-inline bool is_numpy_c_contig(const nb::ndarray<nb::numpy> &a) noexcept {
-    if (!a.is_valid()) [[unlikely]]
-        return false;
-    const auto ndim = a.ndim();
-    if (ndim == 1) [[likely]]
-        return a.stride(0) == sizeof(double);
-    if (ndim == 2)
-        return a.stride(1) == sizeof(double) &&
-               a.stride(0) == a.stride(1) * a.shape(1);
-    return false;
-}
-
-// Helper function to check if object is numpy array (avoid template issues)
-[[nodiscard]] inline bool is_numpy_array(const nb::object &obj) noexcept {
-    return PyObject_HasAttrString(obj.ptr(), "__array_interface__") ||
-           PyObject_HasAttrString(obj.ptr(), "__array__");
-}
-
-// Helper to get array dtype as string - optimized with string_view
-[[nodiscard]] inline std::string_view
-get_array_dtype(const nb::object &obj) noexcept {
-    try {
-        static thread_local std::string dtype_str;
-        dtype_str = nb::cast<std::string>(obj.attr("dtype").attr("name"));
-        return dtype_str;
-    } catch (...) {
-        return "unknown";
-    }
-}
-
-// Helper to get array shape - optimized with span-like interface
-[[nodiscard]] inline std::vector<size_t>
-get_array_shape(const nb::object &obj) {
-    try {
-        nb::object shape_tuple = obj.attr("shape");
-        nb::tuple shape_tup = nb::cast<nb::tuple>(shape_tuple);
-        const size_t size = shape_tup.size();
-
-        std::vector<size_t> shape;
-        shape.reserve(size); // Pre-allocate
-
-        for (size_t i = 0; i < size; ++i) {
-            shape.emplace_back(nb::cast<size_t>(shape_tup[i]));
-        }
-        return shape;
-    } catch (...) {
-        return {};
-    }
-}
-
-// Fast optimized vector conversion - prioritizes performance
-[[nodiscard]] inline dvec to_vec_safe(const nb::object &obj) {
-    if (!obj.is_valid() || obj.is_none()) [[unlikely]]
-        return dvec{};
-
-    // Fast path: Direct numpy array conversion (most common case)
-    if (is_numpy_array(obj)) [[likely]] {
-        try {
-            auto &numpy = get_numpy_module();
-            // Force contiguous double array in one call
-            nb::object arr = numpy.attr("ascontiguousarray")(
-                obj, nb::arg("dtype") = "float64");
-            auto a = nb::cast<nb::ndarray<nb::numpy>>(arr);
-
-            if (a.ndim() == 0) [[unlikely]] {
-                // Scalar case
-                return dvec::Constant(1,
-                                      *static_cast<const double *>(a.data()));
-            }
-
-            if (a.ndim() != 1) [[unlikely]]
-                throw std::runtime_error("Expected 1-D array");
-
-            const size_t n = a.shape(0);
-            if (n == 0) [[unlikely]]
-                return dvec{};
-
-            // Direct memory copy - fastest possible
-            dvec v(n);
-            std::memcpy(v.data(), a.data(), n * sizeof(double));
-            return v;
-        } catch (...) {
-            // Fall through to slower methods
-        }
-    }
-
-    // Medium speed path: Direct sequence access (lists, tuples)
-    if (PySequence_Check(obj.ptr()) && !PyUnicode_Check(obj.ptr())) [[likely]] {
-        const Py_ssize_t size =
-            PySequence_Fast_GET_SIZE(PySequence_Fast(obj.ptr(), ""));
-        if (size <= 0) [[unlikely]]
-            return dvec{};
-
-        dvec v(size);
-        PyObject *fast_seq = PySequence_Fast(obj.ptr(), "");
-        if (fast_seq) [[likely]] {
-            // Use fast sequence access
-            for (Py_ssize_t i = 0; i < size; ++i) {
-                PyObject *item = PySequence_Fast_GET_ITEM(fast_seq, i);
-                // Skip error checking for speed - assume valid doubles
-                v[i] = PyFloat_AsDouble(item);
-            }
-            Py_DECREF(fast_seq);
-            return v;
-        }
-    }
-
-    std::runtime_error("Unable to convert to vector");
-    return dvec{};
-}
-// ---------- Zero-copy sparse views (CSR for RowMajor / CSC for ColMajor)
-// ----------
-template <class SparseT>
-inline constexpr bool kRowMajor = (SparseT::Options & Eigen::RowMajor) != 0;
-
-template <class SparseT> using SparseIndexT = typename SparseT::StorageIndex;
-
-struct SciPyCompressed {
-    nb::object mat;
-    nb::ndarray<nb::numpy> indptr, indices, data;
-    int rows = 0, cols = 0;
-    long long nnz = 0;
-};
-
-template <class SparseT>
-bool extract_compressed_for(const nb::object &obj, SciPyCompressed &out) {
-    if (obj.is_none()) [[unlikely]]
-        return false;
-    nb::object m = obj;
-
-    constexpr const char *want = kRowMajor<SparseT> ? "tocsr" : "tocsc";
-    if (!PyObject_HasAttrString(m.ptr(), "indptr") ||
-        !PyObject_HasAttrString(m.ptr(), "indices") ||
-        !PyObject_HasAttrString(m.ptr(), "data")) {
-        if (PyObject_HasAttrString(m.ptr(), want)) [[likely]]
-            m = m.attr(want)();
-        else
-            return false;
-    }
-
-    try {
-        auto shape = nb::cast<std::pair<size_t, size_t>>(m.attr("shape"));
-        out.rows = static_cast<int>(shape.first);
-        out.cols = static_cast<int>(shape.second);
-
-        // Extract arrays
-        nb::object indptr_obj = m.attr("indptr");
-        nb::object indices_obj = m.attr("indices");
-        nb::object data_obj = m.attr("data");
-
-        // Check if they're array-like
-        if (!is_numpy_array(indptr_obj) || !is_numpy_array(indices_obj) ||
-            !is_numpy_array(data_obj)) [[unlikely]] {
-            return false;
-        }
-
-        // Get as generic arrays
-        out.indptr = nb::cast<nb::ndarray<nb::numpy>>(indptr_obj);
-        out.indices = nb::cast<nb::ndarray<nb::numpy>>(indices_obj);
-        out.data = nb::cast<nb::ndarray<nb::numpy>>(data_obj);
-
-        // Check data type and convert if needed
-        const auto data_dtype = get_array_dtype(data_obj);
-        if (data_dtype != "float64") [[unlikely]] {
-            auto &numpy = get_numpy_module(); // Use cached module
-            nb::object converted = numpy.attr("ascontiguousarray")(
-                data_obj, nb::arg("dtype") = "float64");
-            out.data = nb::cast<nb::ndarray<nb::numpy>>(std::move(converted));
-        }
-
-        // Check integer types for indptr and indices - use constexpr set for
-        // lookup
-        const auto indptr_dtype = get_array_dtype(indptr_obj);
-        const auto indices_dtype = get_array_dtype(indices_obj);
-
-        constexpr std::array valid_int_types{"int32", "uint32", "int64",
-                                             "uint64"};
-
-        const bool indptr_ok = std::ranges::any_of(
-            valid_int_types, [indptr_dtype](std::string_view type) {
-                return type == indptr_dtype;
-            });
-        const bool indices_ok = std::ranges::any_of(
-            valid_int_types, [indices_dtype](std::string_view type) {
-                return type == indices_dtype;
-            });
-
-        if (!indptr_ok || !indices_ok) [[unlikely]]
-            return false;
-
-        // Get data size
-        const auto data_shape = get_array_shape(data_obj);
-        if (data_shape.empty()) [[unlikely]]
-            return false;
-        out.nnz = static_cast<long long>(data_shape[0]);
-
-        out.mat = std::move(m);
-        return true;
-
-    } catch (...) {
-        return false;
-    }
-}
-
-template <class SparseT> struct PySparseView {
-    using MapT = Eigen::Map<const SparseT>;
-    nb::object owner;
-    nb::ndarray<nb::numpy> indptr, indices, data;
-    MapT map;
-
-    PySparseView(nb::object o, nb::ndarray<nb::numpy> ip,
-                 nb::ndarray<nb::numpy> idx, nb::ndarray<nb::numpy> d, int r,
-                 int c, long long nnz)
-        : owner(std::move(o)), indptr(std::move(ip)), indices(std::move(idx)),
-          data(std::move(d)),
-          map(r, c, static_cast<SparseIndexT<SparseT>>(nnz),
-              reinterpret_cast<const SparseIndexT<SparseT> *>(indptr.data()),
-              reinterpret_cast<const SparseIndexT<SparseT> *>(indices.data()),
-              reinterpret_cast<const double *>(data.data())) {}
-};
-
-template <class SparseT>
-[[nodiscard]] std::optional<PySparseView<SparseT>>
-to_sparse_view_any(const nb::object &o) {
-    SciPyCompressed s;
-    if (!extract_compressed_for<SparseT>(o, s)) [[unlikely]]
-        return std::nullopt;
-    if (s.indptr.itemsize() != sizeof(SparseIndexT<SparseT>) ||
-        s.indices.itemsize() != sizeof(SparseIndexT<SparseT>)) [[unlikely]]
-        return std::nullopt;
-    return PySparseView<SparseT>(std::move(s.mat), std::move(s.indptr),
-                                 std::move(s.indices), std::move(s.data),
-                                 s.rows, s.cols, s.nnz);
-}
-
-// Owning copy fallback (dense allowed) - optimized
-[[nodiscard]] inline spmat to_sparse(const nb::object &obj) {
-    if (obj.is_none()) [[unlikely]]
-        return spmat{};
-
-    // Try SciPy compressed
-    if (auto view = to_sparse_view_any<spmat>(obj)) [[likely]] {
-        spmat A = view->map;
-        A.makeCompressed();
-        return A;
-    }
-
-    // Dense fallback - avoid NumPy C API
-    try {
-        auto &numpy = get_numpy_module(); // Use cached module
-
-        // Convert to numpy array and ensure it's 2D float64
-        nb::object arr_obj;
-        if (is_numpy_array(obj)) [[likely]] {
-            arr_obj = numpy.attr("ascontiguousarray")(obj, nb::arg("dtype") =
-                                                               "float64");
-        } else {
-            arr_obj = numpy.attr("array")(obj, nb::arg("dtype") = "float64");
-            arr_obj = numpy.attr("ascontiguousarray")(arr_obj);
-        }
-
-        // Check dimensions using Python interface
-        const auto shape = get_array_shape(arr_obj);
-        if (shape.size() != 2) [[unlikely]]
-            throw std::runtime_error("to_sparse: expected 2-D array");
-
-        const int rows = static_cast<int>(shape[0]);
-        const int cols = static_cast<int>(shape[1]);
-
-        // Get raw data pointer through nanobind
-        auto a = nb::cast<nb::ndarray<nb::numpy>>(arr_obj);
-
-        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
-                                       Eigen::RowMajor>>
-            M(static_cast<const double *>(a.data()), rows, cols);
-        spmat S = M.sparseView(0.0, 1.0);
-        S.makeCompressed();
-        return S;
-
-    } catch (const std::exception &e) {
-        throw std::runtime_error("to_sparse conversion failed: " +
-                                 std::string(e.what()));
-    }
-}
-
-} // namespace pyconv
 // ---------- Core data structures ----------
 struct IPState {
     int mI = 0, mE = 0;
@@ -506,43 +187,55 @@ namespace detail {
 }
 
 [[nodiscard]] inline Sigmas
-build_sigmas(const dvec &zL, const dvec &zU, const Bounds &B, const dvec &lmb,
-             const dvec &s, const dvec &cI, double tau_shift,
-             double bound_shift, bool use_shifted, double eps_abs, double cap) {
+build_sigmas(const dvec& zL, const dvec& zU, const Bounds& B, 
+                      const dvec& lmb, const dvec& s, const dvec& cI, 
+                      double tau_shift, double bound_shift, bool use_shifted, 
+                      double eps_abs, double cap) {
     const int n = static_cast<int>(zL.size());
     const int mI = static_cast<int>(s.size());
-
     Sigmas S;
+    
+    // Ultra-vectorized Sigma_x computation
     S.Sigma_x = dvec::Zero(n);
-    S.Sigma_s = dvec::Zero(mI);
-
-    for (int i = 0; i < n; ++i) {
-        double v = 0.0;
-        if (B.hasL[i]) {
-            const double d = B.sL[i] + (use_shifted ? bound_shift : 0.0);
-            v += zL[i] / clamp_min(d, eps_abs);
+    
+    if (n > 0) {
+        const double shift = use_shifted ? bound_shift : 0.0;
+        
+        // Convert bounds to Eigen arrays for vectorization
+        dvec hasL_float(n), hasU_float(n), sL_vec(n), sU_vec(n);
+        
+        // Single loop to extract all bound data
+        for (int i = 0; i < n; ++i) {
+            hasL_float[i] = B.hasL[i] ? 1.0 : 0.0;
+            hasU_float[i] = B.hasU[i] ? 1.0 : 0.0; 
+            sL_vec[i] = B.sL[i];
+            sU_vec[i] = B.sU[i];
         }
-        if (B.hasU[i]) {
-            const double d = B.sU[i] + (use_shifted ? bound_shift : 0.0);
-            v += zU[i] / clamp_min(d, eps_abs);
-        }
-        S.Sigma_x[i] = clamp(v, 0.0, cap);
+        
+        // Fully vectorized computation
+        dvec dL = (sL_vec.array() + shift).max(eps_abs);
+        dvec dU = (sU_vec.array() + shift).max(eps_abs);
+        
+        dvec zL_contrib = hasL_float.cwiseProduct(zL.cwiseQuotient(dL));
+        dvec zU_contrib = hasU_float.cwiseProduct(zU.cwiseQuotient(dU));
+        
+        S.Sigma_x = (zL_contrib + zU_contrib).array().max(0.0).min(cap);
     }
-
+    
+    // Same vectorized Sigma_s as above
+    S.Sigma_s = dvec::Zero(mI);
+    
     if (mI > 0) {
         if (use_shifted) {
-            for (int i = 0; i < mI; ++i) {
-                const double d = s[i] + tau_shift;
-                S.Sigma_s[i] = clamp(lmb[i] / clamp_min(d, eps_abs), 0.0, cap);
-            }
+            dvec d = (s.array() + tau_shift).max(eps_abs);
+            S.Sigma_s = (lmb.cwiseQuotient(d)).array().max(0.0).min(cap);
         } else {
-            for (int i = 0; i < mI; ++i) {
-                const double sf = clamp(std::abs(cI[i]), 1e-8, 1.0);
-                const double sv = clamp_min(s[i], sf);
-                S.Sigma_s[i] = clamp(lmb[i] / clamp_min(sv, eps_abs), 0.0, cap);
-            }
+            dvec sf = cI.cwiseAbs().array().max(1e-8).min(1.0);
+            dvec sv = s.cwiseMax(sf).array().max(eps_abs);
+            S.Sigma_s = (lmb.cwiseQuotient(sv)).array().max(0.0).min(cap);
         }
     }
+    
     return S;
 }
 
@@ -808,12 +501,14 @@ public:
             tau_shift = adaptive_shift_slack_(s, cI, it);
             st.tau_shift = tau_shift;
         }
+        IP_LAP("bounds & shifts (A)");
+
         double bound_shift =
             use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0)
                         : 0.0;
         if (use_shifted && shift_adapt)
             bound_shift = adaptive_shift_bounds_(x, B, it);
-        IP_LAP("bounds & shifts");
+        IP_LAP("bounds & shifts (B)");
 
         // -------------------- Quick convergence check --------------------
         const double tol = pyu::getattr_or<double>(cfg_, "tol", 1e-8);
@@ -1141,7 +836,8 @@ public:
         //         nb::dict kw;
         //         kw["accepted"] = nb::bool_(false);
         //         // nanobind allows kwargs via the call operator with **kw:
-        //         model.attr("hessian_update")(nb::cast(sx), nb::cast(yL), **kw);
+        //         model.attr("hessian_update")(nb::cast(sx), nb::cast(yL),
+        //         **kw);
         //     }
         // } catch (const nb::python_error &e) {
         //     // Optional: log and continue without killing the IP iteration

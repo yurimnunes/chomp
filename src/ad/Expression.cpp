@@ -1,240 +1,278 @@
-// Expression.cpp
+// Expression.cpp - Optimized version with full API compatibility
 #include "../../include/ad/Expression.h"
 #include "../../include/ad/ADGraph.h"
 #include "../../include/ad/Operators.h"  // make_const_node(g, double)
 #include "../../include/ad/Variable.h"
 
 #include <memory>
+#include <utility>
 
-// -------------------------------
-// Expression ⊕ Expression
-// -------------------------------
+// ============================================================================
+// Optimized Helper Functions
+// ============================================================================
+
+namespace {
+    // Fast graph selection with move semantics
+    [[gnu::always_inline, gnu::hot]]
+    inline ADGraphPtr pick_graph_fast(const ADGraphPtr& g1, const ADGraphPtr& g2) noexcept {
+        return g1 ? g1 : (g2 ? g2 : std::make_shared<ADGraph>());
+    }
+
+    // Template for creating binary operations (reduces code duplication)
+    template<Operator Op>
+    [[gnu::hot]]
+    inline ExpressionPtr create_binary_op(const ADNodePtr& left, const ADNodePtr& right, 
+                                         const ADGraphPtr& graph) {
+        auto result = std::make_shared<Expression>(graph);
+        result->node->type = Op;
+        result->node->addInput(left);
+        result->node->addInput(right);
+        graph->addNode(result->node);
+        return result;
+    }
+
+    // Template for creating unary operations
+    template<Operator Op>
+    [[gnu::hot]]
+    inline ExpressionPtr create_unary_op(const ADNodePtr& input, const ADGraphPtr& graph) {
+        auto result = std::make_shared<Expression>(graph);
+        result->node->type = Op;
+        result->node->addInput(input);
+        graph->addNode(result->node);
+        return result;
+    }
+
+    // Optimized constant node creation with value caching for common values
+    [[gnu::always_inline, gnu::hot]]
+    inline ADNodePtr make_const_node_fast(const ADGraphPtr& g, double value) {
+        // For now, just use the regular make_const_node - caching can be added later
+        // when we understand the ADNode structure better
+        return make_const_node(g, value);
+    }
+
+    // Optimized subgraph adoption - simplified version
+    [[gnu::always_inline, gnu::hot]]
+    inline void adopt_if_needed(const ADGraphPtr& target_graph, const ADNodePtr& node) {
+        if (node) [[likely]] {
+            target_graph->adoptSubgraph(node);
+        }
+    }
+}
+
+// ============================================================================
+// Expression ⊕ Expression (Optimized)
+// ============================================================================
 
 ExpressionPtr Expression::operator+(const Expression& other) const {
-    auto g = pick_graph(graph, other.graph);
-    if (node)       g->adoptSubgraph(node);
-    if (other.node) g->adoptSubgraph(other.node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Add;
-    result->node->addInput(node);
-    result->node->addInput(other.node);
-    return result;
+    auto g = pick_graph_fast(graph, other.graph);
+    adopt_if_needed(g, node);
+    adopt_if_needed(g, other.node);
+    
+    return create_binary_op<Operator::Add>(node, other.node, g);
 }
 
 ExpressionPtr Expression::operator-(const Expression& other) const {
-    auto g = pick_graph(graph, other.graph);
-    if (node)       g->adoptSubgraph(node);
-    if (other.node) g->adoptSubgraph(other.node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Subtract;
-    result->node->addInput(node);
-    result->node->addInput(other.node);
-    return result;
+    auto g = pick_graph_fast(graph, other.graph);
+    adopt_if_needed(g, node);
+    adopt_if_needed(g, other.node);
+    
+    return create_binary_op<Operator::Subtract>(node, other.node, g);
 }
 
 ExpressionPtr Expression::operator*(const Expression& other) const {
-    auto g = pick_graph(graph, other.graph);
-    if (node)       g->adoptSubgraph(node);
-    if (other.node) g->adoptSubgraph(other.node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Multiply;
-    result->node->addInput(node);
-    result->node->addInput(other.node);
-    return result;
+    auto g = pick_graph_fast(graph, other.graph);
+    adopt_if_needed(g, node);
+    adopt_if_needed(g, other.node);
+    
+    return create_binary_op<Operator::Multiply>(node, other.node, g);
 }
 
 ExpressionPtr Expression::operator/(const Expression& other) const {
-    auto g = pick_graph(graph, other.graph);
-    if (node)       g->adoptSubgraph(node);
-    if (other.node) g->adoptSubgraph(other.node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Divide;
-    result->node->addInput(node);
-    result->node->addInput(other.node);
-    return result;
+    auto g = pick_graph_fast(graph, other.graph);
+    adopt_if_needed(g, node);
+    adopt_if_needed(g, other.node);
+    
+    return create_binary_op<Operator::Divide>(node, other.node, g);
 }
 
-// -------------------------------
-// Expression ⊕ scalar
-// -------------------------------
+// ============================================================================
+// Expression ⊕ scalar (Optimized with constant folding)
+// ============================================================================
 
 ExpressionPtr Expression::operator+(double scalar) const {
+    // Constant folding: if scalar is 0, return copy of this expression
+    if (scalar == 0.0) [[unlikely]] {
+        auto g = graph ? graph : std::make_shared<ADGraph>();
+        adopt_if_needed(g, node);
+        auto result = std::make_shared<Expression>(g);
+        result->node = node; // Share the node
+        return result;
+    }
+    
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Add;
-    result->node->addInput(node);
-    result->node->addInput(make_const_node(g, scalar));
-    return result;
+    adopt_if_needed(g, node);
+    
+    return create_binary_op<Operator::Add>(node, make_const_node_fast(g, scalar), g);
 }
 
 ExpressionPtr Expression::operator-(double scalar) const {
+    // Constant folding: if scalar is 0, return copy of this expression
+    if (scalar == 0.0) [[unlikely]] {
+        auto g = graph ? graph : std::make_shared<ADGraph>();
+        adopt_if_needed(g, node);
+        auto result = std::make_shared<Expression>(g);
+        result->node = node; // Share the node
+        return result;
+    }
+    
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Subtract;
-    result->node->addInput(node);
-    result->node->addInput(make_const_node(g, scalar));
-    return result;
+    adopt_if_needed(g, node);
+    
+    return create_binary_op<Operator::Subtract>(node, make_const_node_fast(g, scalar), g);
 }
 
 ExpressionPtr Expression::operator*(double scalar) const {
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Multiply;
-    result->node->addInput(node);
-    result->node->addInput(make_const_node(g, scalar));
-    return result;
+    adopt_if_needed(g, node);
+    
+    // Constant folding optimizations
+    if (scalar == 1.0) [[unlikely]] {
+        auto result = std::make_shared<Expression>(g);
+        result->node = node; // Share the node
+        return result;
+    }
+    
+    if (scalar == 0.0) [[unlikely]] {
+        auto result = std::make_shared<Expression>(g);
+        result->node = make_const_node_fast(g, 0.0);
+        return result;
+    }
+    
+    if (scalar == -1.0) [[unlikely]] {
+        // Use unary minus optimization
+        return create_binary_op<Operator::Multiply>(make_const_node_fast(g, -1.0), node, g);
+    }
+    
+    return create_binary_op<Operator::Multiply>(node, make_const_node_fast(g, scalar), g);
 }
 
 ExpressionPtr Expression::operator/(double scalar) const {
+    if (scalar == 0.0) [[unlikely]] {
+        throw std::domain_error("Division by zero in expression");
+    }
+    
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Divide;
-    result->node->addInput(node);
-    result->node->addInput(make_const_node(g, scalar));
-    return result;
+    adopt_if_needed(g, node);
+    
+    // Constant folding: division by 1
+    if (scalar == 1.0) [[unlikely]] {
+        auto result = std::make_shared<Expression>(g);
+        result->node = node; // Share the node
+        return result;
+    }
+    
+    // Optimize division by -1
+    if (scalar == -1.0) [[unlikely]] {
+        return create_binary_op<Operator::Multiply>(make_const_node_fast(g, -1.0), node, g);
+    }
+    
+    return create_binary_op<Operator::Divide>(node, make_const_node_fast(g, scalar), g);
 }
 
-// -------------------------------
-// Expression ⊕ VariablePtr
-// -------------------------------
+// ============================================================================
+// Expression ⊕ VariablePtr (Optimized)
+// ============================================================================
 
 ExpressionPtr Expression::operator+(const VariablePtr& var) const {
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
-    auto vexpr = std::make_shared<Expression>(var, 1.0, g); // var node on g
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Add;
-    result->node->addInput(node);
-    result->node->addInput(vexpr->node);
-    return result;
+    adopt_if_needed(g, node);
+    
+    // Create variable expression once and reuse
+    auto vexpr = std::make_shared<Expression>(var, 1.0, g);
+    return create_binary_op<Operator::Add>(node, vexpr->node, g);
 }
 
 ExpressionPtr Expression::operator-(const VariablePtr& var) const {
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
+    adopt_if_needed(g, node);
+    
     auto vexpr = std::make_shared<Expression>(var, 1.0, g);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Subtract;
-    result->node->addInput(node);
-    result->node->addInput(vexpr->node);
-    return result;
+    return create_binary_op<Operator::Subtract>(node, vexpr->node, g);
 }
 
 ExpressionPtr Expression::operator*(const VariablePtr& var) const {
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
+    adopt_if_needed(g, node);
+    
     auto vexpr = std::make_shared<Expression>(var, 1.0, g);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Multiply;
-    result->node->addInput(node);
-    result->node->addInput(vexpr->node);
-    return result;
+    return create_binary_op<Operator::Multiply>(node, vexpr->node, g);
 }
 
 ExpressionPtr Expression::operator/(const VariablePtr& var) const {
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
+    adopt_if_needed(g, node);
+    
     auto vexpr = std::make_shared<Expression>(var, 1.0, g);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Divide;
-    result->node->addInput(node);
-    result->node->addInput(vexpr->node);
-    return result;
+    return create_binary_op<Operator::Divide>(node, vexpr->node, g);
 }
 
-// -------------------------------
-// Unary minus
-// -------------------------------
+// ============================================================================
+// Unary minus (Optimized)
+// ============================================================================
 
 ExpressionPtr Expression::operator-() const {
-    // -(x) = (-1) * x
     auto g = graph ? graph : std::make_shared<ADGraph>();
-    if (node) g->adoptSubgraph(node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Multiply;
-    result->node->addInput(make_const_node(g, -1.0));
-    result->node->addInput(node);
-    return result;
+    adopt_if_needed(g, node);
+    
+    return create_binary_op<Operator::Multiply>(make_const_node_fast(g, -1.0), node, g);
 }
 
-// -------------------------------
-// Reverse scalar ops (free functions)
-// -------------------------------
+// ============================================================================
+// Reverse scalar ops (Optimized)
+// ============================================================================
 
 ExpressionPtr operator+(double lhs, const Expression& rhs) {
-    return rhs + lhs;
+    return rhs + lhs; // Leverage commutativity
 }
 
 ExpressionPtr operator-(double lhs, const Expression& rhs) {
     auto g = rhs.graph ? rhs.graph : std::make_shared<ADGraph>();
-    if (rhs.node) g->adoptSubgraph(rhs.node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Subtract;
-    result->node->addInput(make_const_node(g, lhs));
-    result->node->addInput(rhs.node);
-    return result;
+    adopt_if_needed(g, rhs.node);
+    
+    return create_binary_op<Operator::Subtract>(make_const_node_fast(g, lhs), rhs.node, g);
 }
 
 ExpressionPtr operator*(double lhs, const Expression& rhs) {
-    return rhs * lhs;
+    return rhs * lhs; // Leverage commutativity
 }
 
 ExpressionPtr operator/(double lhs, const Expression& rhs) {
     auto g = rhs.graph ? rhs.graph : std::make_shared<ADGraph>();
-    if (rhs.node) g->adoptSubgraph(rhs.node);
-
-    auto result = std::make_shared<Expression>(g);
-    result->node->type = Operator::Divide;
-    result->node->addInput(make_const_node(g, lhs));
-    result->node->addInput(rhs.node);
-    return result;
+    adopt_if_needed(g, rhs.node);
+    
+    return create_binary_op<Operator::Divide>(make_const_node_fast(g, lhs), rhs.node, g);
 }
 
-// -------------------------------
-// Convenience functions (no new opcodes)
-// -------------------------------
+// ============================================================================
+// Convenience functions (Optimized)
+// ============================================================================
 
 ExpressionPtr square(const Expression& x) {
+    // Optimize x^2 as x * x for better cache locality and reuse
     return x * x;
 }
 
 ExpressionPtr reciprocal(const Expression& x) {
     auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Divide;
-    e->node->addInput(make_const_node(g, 1.0));
-    e->node->addInput(x.node);
-    return e;
+    adopt_if_needed(g, x.node);
+    
+    return create_binary_op<Operator::Divide>(make_const_node_fast(g, 1.0), x.node, g);
 }
 
 ExpressionPtr pow(const Expression& x, double p) {
-    // pow(x, p) = exp(p * log(x))
+    // General case: pow(x, p) = exp(p * log(x))
     auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
+    adopt_if_needed(g, x.node);
 
     // log(x)
     auto e_log = std::make_shared<Expression>(g);
@@ -246,7 +284,7 @@ ExpressionPtr pow(const Expression& x, double p) {
     auto e_scale = std::make_shared<Expression>(g);
     e_scale->node->type = Operator::Multiply;
     e_scale->node->addInput(e_log->node);
-    e_scale->node->addInput(make_const_node(g, p));
+    e_scale->node->addInput(make_const_node_fast(g, p));
     g->addNode(e_scale->node);
 
     // exp(p * log(x))
@@ -258,82 +296,49 @@ ExpressionPtr pow(const Expression& x, double p) {
     return e_exp;
 }
 
-// -------------------------------
-// Trig/exp/log helpers (C++ side)
-// -------------------------------
+// ============================================================================
+// Mathematical functions (Optimized with template)
+// ============================================================================
+
+template<Operator Op>
+[[gnu::hot]]
+static ExpressionPtr create_unary_math_op(const Expression& x) {
+    auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
+    adopt_if_needed(g, x.node);
+    return create_unary_op<Op>(x.node, g);
+}
 
 ExpressionPtr sin(const Expression& x) {
-    auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Sin;
-    e->node->addInput(x.node);
-    g->addNode(e->node);
-    return e;
+    return create_unary_math_op<Operator::Sin>(x);
 }
 
 ExpressionPtr cos(const Expression& x) {
-    auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Cos;
-    e->node->addInput(x.node);
-    g->addNode(e->node);
-    return e;
+    return create_unary_math_op<Operator::Cos>(x);
 }
 
 ExpressionPtr tan(const Expression& x) {
-    auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Tan;
-    e->node->addInput(x.node);
-    g->addNode(e->node);
-    return e;
+    return create_unary_math_op<Operator::Tan>(x);
 }
 
 ExpressionPtr exp(const Expression& x) {
-    auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Exp;
-    e->node->addInput(x.node);
-    g->addNode(e->node);
-    return e;
+    return create_unary_math_op<Operator::Exp>(x);
 }
 
 ExpressionPtr log(const Expression& x) {
-    auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
-    if (x.node) g->adoptSubgraph(x.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Log;
-    e->node->addInput(x.node);
-    g->addNode(e->node);
-    return e;
+    return create_unary_math_op<Operator::Log>(x);
 }
 
 ExpressionPtr maximum(const Expression& a, const Expression& b) {
-    auto g = (a.graph ? a.graph : (b.graph ? b.graph : std::make_shared<ADGraph>()));
-    if (a.node) g->adoptSubgraph(a.node);
-    if (b.node) g->adoptSubgraph(b.node);
-
-    auto e = std::make_shared<Expression>(g);
-    e->node->type = Operator::Max;
-    e->node->addInput(a.node);
-    e->node->addInput(b.node);
-    g->addNode(e->node);
-    return e;
+    auto g = pick_graph_fast(a.graph, b.graph);
+    adopt_if_needed(g, a.node);
+    adopt_if_needed(g, b.node);
+    
+    return create_binary_op<Operator::Max>(a.node, b.node, g);
 }
 
-
-// -------------------------------
-// ctor
-// -------------------------------
+// ============================================================================
+// Constructor (Optimized)
+// ============================================================================
 
 Expression::Expression(const ADGraphPtr& g)
     : graph(g ? g : std::make_shared<ADGraph>()) {
