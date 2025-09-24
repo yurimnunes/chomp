@@ -15,6 +15,8 @@
 #include "../include/ad/Variable.h"
 
 #include <Eigen/Dense>
+#include <Eigen/Core>
+#include <Eigen/SparseCore>
 
 #include <atomic>
 #include <bit>
@@ -1023,6 +1025,75 @@ public:
         return H;
     }
 
+    Eigen::SparseMatrix<double>
+    hess_sparse(const Eigen::Ref<const Eigen::VectorXd> &x_in,
+                const Eigen::Ref<const Eigen::VectorXd> &lam_in,
+                const Eigen::Ref<const Eigen::VectorXd> &nu_in,
+                double tol = 1e-12) {
+        set_state_eigen(x_in, lam_in, nu_in);
+
+        const size_t n = x_nodes.size();
+        build_permutations_once_();
+
+        constexpr size_t L = 16; // block width
+        // Row-major scratch to match (gi*L + j) addressing
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+            V(n, L);
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+            Y(n, L);
+
+        std::vector<Eigen::Triplet<double>> trips;
+        trips.reserve(
+            std::min<size_t>(n * 16, n * n)); // rough guess; grows if needed
+
+        for (size_t base = 0; base < n; base += L) {
+            const size_t k = std::min(L, n - base);
+
+            // Build k basis columns in graph index space
+            V.setZero();
+            for (size_t j = 0; j < k; ++j) {
+                const size_t xj = base + j;
+                const int gij = x2g_[xj];
+                V(static_cast<Eigen::Index>(gij),
+                  static_cast<Eigen::Index>(j)) = 1.0;
+            }
+
+            {
+                nb::gil_scoped_release nogil;
+                g->hessianMultiVectorProduct(L_root, V.data(), L, Y.data(), L,
+                                             k);
+            }
+
+            // Scatter: we only take i <= col_x (upper triangle)
+            for (size_t j = 0; j < k; ++j) {
+                const size_t col_x = base + j;
+                for (size_t gi = 0; gi < n; ++gi) {
+                    const size_t xi = static_cast<size_t>(g2x_[gi]);
+                    if (xi > col_x)
+                        continue; // keep to upper triangle
+
+                    const double val = Y(static_cast<Eigen::Index>(gi),
+                                         static_cast<Eigen::Index>(j));
+                    if (std::abs(val) >= tol) {
+                        trips.emplace_back(static_cast<int>(xi),
+                                           static_cast<int>(col_x), val);
+                    }
+                }
+            }
+        }
+
+        // Build upper-triangular sparse
+        Eigen::SparseMatrix<double> H_upper(static_cast<int>(n),
+                                            static_cast<int>(n));
+        H_upper.setFromTriplets(trips.begin(), trips.end());
+        H_upper.makeCompressed();
+
+        // Symmetrize: H = H_upper + H_upper.transpose() - diag(H_upper)
+        // (avoid double-counting diagonal)
+        Eigen::SparseMatrix<double> H = H_upper.selfadjointView<Eigen::Upper>();
+        return H; // CSC by default
+    }
+
     Arr2D hvp_multi_numpy(Arr1D x_in, Arr1D lam_in, Arr1D nu_in, Arr2D V_in) {
         set_state_numpy(x_in, lam_in, nu_in);
         auto [n, k] = shape_2d(V_in);
@@ -1295,7 +1366,6 @@ batch_value_grad_from_gradfns(const std::vector<std::shared_ptr<GradFn>> &gfs,
 }
 using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
-
 
 static inline std::pair<dvec, dmat> batch_value_grad_from_gradfns_eigen(
     const std::vector<std::shared_ptr<GradFn>> &gfs, const dvec &x) {

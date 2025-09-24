@@ -572,7 +572,7 @@ public:
         auto H_obj = m_->hess(x, lmb, nuv);
 
         // spmat H0 = pyconv::to_sparse(H_obj);
-        spmat H0 = H_obj.sparseView();
+        spmat H0 = H_obj;
         IP_LAP("get Hessian");
 
         auto [H, reg_info] = regularizer_->regularize(H0, it);

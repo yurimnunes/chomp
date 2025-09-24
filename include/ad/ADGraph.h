@@ -2,6 +2,7 @@
 #include "Definitions.h"
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -347,6 +348,14 @@ private:
     bool buildTopoOrderDFS_();
     void compactNodeIds_();
 
+    // Constant pooling and fast replace helpers
+    std::unordered_map<double, ADNodePtr> constant_pool_;
+    std::unordered_map<const ADNode *, std::vector<ADNode *>> uses_;
+    bool uses_valid_ = false;
+    void buildUseListsOnce_();
+    void markGraphMutated_();
+    void canonicalizeOperands_(ADNode &node);
+
     // Convenience exec helpers (scalar/AoS — unchanged)
     void executeUnaryOp(ADNode *node, std::function<double(double)> forward_fn,
                         std::function<double(double)> backward_fn = nullptr) {
@@ -389,6 +398,142 @@ private:
     // Simplification cache/flags
     mutable bool simplification_needed_ = false;
     size_t last_simplification_size_ = 0;
+
+    enum class Fam { Other, Add, Mul };
+
+    static inline Fam familyOf(Operator t) {
+        if (t == Operator::Add || t == Operator::Subtract)
+            return Fam::Add;
+        if (t == Operator::Multiply || t == Operator::Divide)
+            return Fam::Mul;
+        return Fam::Other;
+    }
+
+    // Quantize doubles for constant key stability (same helper you had)
+    static inline double qfp(double x, double s = 1e12) {
+        return std::nearbyint(x * s) / s;
+    }
+
+    inline bool is_commutative_node_(Operator op) const {
+        return op == Operator::Add || op == Operator::Multiply;
+    }
+
+    struct CSEKey {
+        Operator op = Operator::NA;
+        uint32_t lanes = 1;
+        bool is_cte = false;
+        double cval = 0.0; // only if is_cte == true
+
+        // Children identities (by pointer). For commutative ops, this is
+        // sorted.
+        std::vector<const ADNode *> kids;
+
+        bool operator==(const CSEKey &o) const {
+            if (op != o.op || lanes != o.lanes || is_cte != o.is_cte)
+                return false;
+            if (is_cte)
+                return qfp(cval) == qfp(o.cval);
+            if (kids.size() != o.kids.size())
+                return false;
+            for (size_t i = 0; i < kids.size(); ++i)
+                if (kids[i] != o.kids[i])
+                    return false;
+            return true;
+        }
+    };
+
+    struct CSEKeyHash {
+        size_t operator()(const CSEKey &k) const noexcept {
+            auto mix = [](size_t a, size_t b) {
+                return a ^ (b + 0x9e3779b97f4a7c15ULL + (a << 6) + (a >> 2));
+            };
+            size_t h = std::hash<int>{}(int(k.op));
+            h = mix(h, std::hash<uint32_t>{}(k.lanes));
+            h = mix(h, std::hash<bool>{}(k.is_cte));
+            if (k.is_cte) {
+                uint64_t bits;
+                std::memcpy(&bits, &k.cval, sizeof(bits));
+                h = mix(h, std::hash<uint64_t>{}(bits));
+            } else {
+                for (auto *p : k.kids)
+                    h = mix(h, std::hash<const void *>{}(p));
+            }
+            return h;
+        }
+    };
+
+    // Collect additive terms: Add = sum(+inputs), Sub = first - rest
+    void collectAddTerms_(const ADNode *n, int sgn,
+                          std::unordered_map<const ADNode *, int> &mult,
+                          double &csum) const {
+        if (!n)
+            return;
+        if (n->type == Operator::Add) {
+            for (auto &in : n->inputs)
+                collectAddTerms_(in.get(), sgn, mult, csum);
+            return;
+        }
+        if (n->type == Operator::Subtract) {
+            if (!n->inputs.empty())
+                collectAddTerms_(n->inputs[0].get(), sgn, mult, csum);
+            for (size_t i = 1; i < n->inputs.size(); ++i)
+                collectAddTerms_(n->inputs[i].get(), -sgn, mult, csum);
+            return;
+        }
+        if (n->type == Operator::cte) {
+            csum += sgn * n->value;
+            return;
+        }
+        mult[n] += sgn; // record signed multiplicity
+    }
+
+    // Collect multiplicative factors: Mul = product, Div = first / rest
+    void
+    collectMulFactors_(const ADNode *n, int exp,
+                       std::unordered_map<const ADNode *, int> &powmap) const {
+        if (!n)
+            return;
+        if (n->type == Operator::Multiply) {
+            for (auto &in : n->inputs)
+                collectMulFactors_(in.get(), exp, powmap);
+            return;
+        }
+        if (n->type == Operator::Divide) {
+            if (!n->inputs.empty())
+                collectMulFactors_(n->inputs[0].get(), exp, powmap);
+            for (size_t i = 1; i < n->inputs.size(); ++i)
+                collectMulFactors_(n->inputs[i].get(), -exp, powmap);
+            return;
+        }
+        // Treat constants as normal factors—safe & simple (no 1/0 surprises)
+        powmap[n] += exp;
+    }
+
+    CSEKey makeCSEKey_(const ADNode &n) const {
+        CSEKey k;
+        k.op = n.type;
+        k.lanes = static_cast<uint32_t>(this->lanes());
+
+        if (n.type == Operator::cte) {
+            k.is_cte = true;
+            k.cval = qfp(n.value);
+            return k;
+        }
+
+        // Exact structure: preserve arity and (for non-commutative) order.
+        // For commutative ops (Add/Multiply), sort children by pointer ONLY.
+        k.kids.reserve(n.inputs.size());
+        for (auto &in : n.inputs)
+            k.kids.push_back(in.get());
+
+        if (is_commutative_node_(n.type)) {
+            std::sort(k.kids.begin(), k.kids.end(),
+                      [](const ADNode *a, const ADNode *b) { return a < b; });
+        }
+        return k;
+    }
+
+    bool cseByKey_();
 };
 
 // ============================ pick_graph helper ==============================

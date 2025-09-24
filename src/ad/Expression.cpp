@@ -328,6 +328,21 @@ ExpressionPtr log(const Expression& x) {
     return create_unary_math_op<Operator::Log>(x);
 }
 
+ExpressionPtr tanh(const Expression& x) {
+    return create_unary_math_op<Operator::Tanh>(x);
+}
+ExpressionPtr silu(const Expression& x) {
+    return create_unary_math_op<Operator::Silu>(x);
+}
+ExpressionPtr gelu(const Expression& x) {
+    return create_unary_math_op<Operator::Gelu>(x);
+}
+ExpressionPtr relu(const Expression& x) {
+    return create_unary_math_op<Operator::Relu>(x);
+}
+
+
+
 ExpressionPtr maximum(const Expression& a, const Expression& b) {
     auto g = pick_graph_fast(a.graph, b.graph);
     adopt_if_needed(g, a.node);

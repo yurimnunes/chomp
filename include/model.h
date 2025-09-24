@@ -29,7 +29,7 @@
 struct ADCompiled {
     std::function<double(const dvec &)> val;
     std::function<dvec(const dvec &)> grad;
-    std::function<dmat(const dvec &)> hess;
+    std::function<dmat(const spmat &)> hess;
 };
 
 
@@ -43,7 +43,8 @@ struct EvalEntry {
 
     std::optional<double> f;
     std::optional<dvec> g, cI, cE;
-    std::optional<dmat> JI, JE, H;
+    std::optional<dmat> JI, JE;
+    std::optional<spmat> H; // Hessian
     
     // Add access tracking for LRU
     mutable int access_order{0};
@@ -221,14 +222,14 @@ public:
     }
 
     // -------------------------------------------------------------------------
-    dmat hess(const Eigen::Ref<const dvec> &x,
+    spmat hess(const Eigen::Ref<const dvec> &x,
               const Eigen::Ref<const dvec> &lam,
               const Eigen::Ref<const dvec> &nu) const {
         EvalEntry *e = cache_.find(x);
         if (!e)
             e = &cache_.insert(x);
         if (!e->H)
-            e->H = f_hess_->hess_eigen(x, lam, nu);
+            e->H = f_hess_->hess_sparse(x, lam, nu);
         return *e->H;
     }
 

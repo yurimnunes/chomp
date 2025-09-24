@@ -978,35 +978,77 @@ ADGraph::rebuildGraphWithUniqueVariables(const ADNodePtr &rootNode) {
     return {newG, newG->nodeVariables};
 }
 
-void ADGraph::simplifyGraph() {
-    if (!simplification_needed_ && nodes.size() == last_simplification_size_) {
-        return; // No changes since last simplification
+////////////////////////////////////////////////////
+
+ADNodePtr ADGraph::createConstantNode(double value) {
+    // Quantize a bit for stable hashing (tweak if you like)
+    double q = std::nearbyint(value * 1e12) * 1e-12;
+
+    auto it = constant_pool_.find(q);
+    if (it != constant_pool_.end())
+        return it->second;
+
+    auto node = std::make_shared<ADNode>();
+    node->type = Operator::cte;
+    node->value = q;
+    node->val_epoch = cur_val_epoch_;
+    addNode(node);
+
+    constant_pool_[q] = node;
+    uses_valid_ = false; // graph changed
+    return node;
+}
+
+void ADGraph::buildUseListsOnce_() {
+    if (uses_valid_)
+        return;
+    uses_.clear();
+    uses_.reserve(nodes.size() * 2);
+    for (const auto &n : nodes) {
+        if (!n)
+            continue;
+        for (const auto &in : n->inputs) {
+            if (in)
+                uses_[in.get()].push_back(n.get());
+        }
     }
+    uses_valid_ = true;
+}
+
+void ADGraph::markGraphMutated_() {
+    uses_valid_ = false;
+    simplification_needed_ = true;
+    markDirty_();
+}
+void ADGraph::simplifyGraph() {
+    if (!simplification_needed_ && nodes.size() == last_simplification_size_)
+        return;
 
     size_t initial_size = nodes.size();
     bool changed = true;
     int iterations = 0;
-    const int max_iterations = 10; // Prevent infinite loops
+    const int max_iterations = 10;
+
+    buildUseListsOnce_(); // NEW: enables fast rewrites
 
     while (changed && iterations < max_iterations) {
         changed = false;
 
-        // Phase 1: Constant folding
         constantFolding();
-
-        // Phase 2: Algebraic simplification
         algebraicSimplification();
 
-        // Phase 3: Peephole optimizations
-        if (peepholeSimplify()) {
+        if (peepholeSimplify())
             changed = true;
-        }
 
-        // Phase 4: Dead code elimination
+        // NEW: non-destructive, AC-aware CSE
+        if (cseByKey_())
+            changed = true;
+
         size_t before_dce = nodes.size();
         eliminateDeadCode();
         if (nodes.size() < before_dce) {
             changed = true;
+            uses_valid_ = false;
         }
 
         iterations++;
@@ -1014,14 +1056,12 @@ void ADGraph::simplifyGraph() {
 
     if (nodes.size() != initial_size) {
         markDirty_();
-        makeNodesUnique(); // Ensure consistency
+        makeNodesUnique();
     }
-
     last_simplification_size_ = nodes.size();
     simplification_needed_ = false;
-
-    std::cout << "Simplification: " << initial_size << " -> " << nodes.size()
-              << " nodes (" << iterations << " iterations)\n";
+    // std::cout << "Simplification: " << initial_size << " -> " << nodes.size()
+    //           << " nodes (" << iterations << " iterations)\n";
 }
 
 void ADGraph::constantFolding() {
@@ -1356,6 +1396,7 @@ bool ADGraph::peepholeSimplify() {
     for (const auto &node : nodes) {
         if (!node)
             continue;
+        // canonicalizeOperands_(*node); // NEW
 
         // Pattern: (x + y) - y = x
         if (node->type == Operator::Subtract && node->inputs.size() >= 2) {
@@ -1398,15 +1439,39 @@ bool ADGraph::peepholeSimplify() {
     return changed;
 }
 
-// Helper methods
-ADNodePtr ADGraph::createConstantNode(double value) {
-    auto node = std::make_shared<ADNode>();
-    node->type = Operator::cte;
-    node->value = value;
-    node->val_epoch = cur_val_epoch_;
-    addNode(node);
-    return node;
+inline static bool is_commutative_(Operator t) {
+    return t == Operator::Add || t == Operator::Multiply || t == Operator::Max;
 }
+inline static bool is_associative_(Operator t) {
+    return t == Operator::Add || t == Operator::Multiply;
+}
+
+void ADGraph::canonicalizeOperands_(ADNode &n) {
+    if (is_associative_(n.type)) {
+        std::vector<ADNodePtr> flat;
+        flat.reserve(n.inputs.size());
+        for (auto &in : n.inputs) {
+            if (in && in->type == n.type) {
+                flat.insert(flat.end(), in->inputs.begin(), in->inputs.end());
+            } else {
+                flat.push_back(in);
+            }
+        }
+        n.inputs.swap(flat);
+    }
+    if (is_commutative_(n.type)) {
+        std::stable_sort(n.inputs.begin(), n.inputs.end(),
+                         [&](const ADNodePtr &a, const ADNodePtr &b) {
+                             const bool ca = a && a->type == Operator::cte;
+                             const bool cb = b && b->type == Operator::cte;
+                             if (ca != cb)
+                                 return !ca && cb; // non-consts first
+                             return a.get() < b.get();
+                         });
+    }
+}
+
+// Helper methods
 
 bool ADGraph::isConstant(const ADNodePtr &node) const {
     return node && node->type == Operator::cte;
@@ -1419,46 +1484,56 @@ bool ADGraph::isZero(const ADNodePtr &node) const {
 bool ADGraph::isOne(const ADNodePtr &node) const {
     return isConstant(node) && std::abs(node->value - 1.0) < 1e-12;
 }
-
 void ADGraph::replaceNodeReferences(const ADNodePtr &oldNode,
                                     const ADNodePtr &newNode) {
     if (!oldNode || !newNode || oldNode == newNode)
         return;
 
-    // Update all nodes that reference oldNode in their inputs
-    for (const auto &node : nodes) {
-        if (!node)
-            continue;
+    // Try the fast path with use-lists
+    buildUseListsOnce_();
+    auto it = uses_.find(oldNode.get());
+    if (it != uses_.end()) {
+        auto &users = it->second; // vector<ADNode*>
 
-        for (auto &input : node->inputs) {
-            if (input == oldNode) {
-                input = newNode;
-                markDirty_(node.get());
+        for (ADNode *u : users) {
+            for (auto &inp : u->inputs) {
+                if (inp.get() == oldNode.get()) {
+                    inp = newNode;
+                    markDirty_(u);
+                }
+            }
+            uses_[newNode.get()].push_back(u);
+        }
+        users.clear();
+    } else {
+        // Fallback: full scan if not found (keeps compatibility)
+        for (const auto &node : nodes) {
+            if (!node)
+                continue;
+            for (auto &input : node->inputs) {
+                if (input == oldNode) {
+                    input = newNode;
+                    markDirty_(node.get());
+                }
             }
         }
+        // Also update uses_ map lazily (we’ll rebuild later anyway)
+        uses_valid_ = false;
     }
 
-    // Update node index if oldNode had a name
+    // Keep your name/index and variable bookkeeping exactly as before
     if (!oldNode->name.empty()) {
         nodeIndex_[oldNode->name] = newNode;
         newNode->name = oldNode->name;
     }
-
-    // Update nodeVariables if it was a variable
     std::vector<std::string> keys_to_update;
-    for (const auto &kv : nodeVariables) {
-        if (kv.second == oldNode) {
+    for (const auto &kv : nodeVariables)
+        if (kv.second == oldNode)
             keys_to_update.push_back(kv.first);
-        }
-    }
-    for (const auto &key : keys_to_update) {
+    for (const auto &key : keys_to_update)
         nodeVariables[key] = newNode;
-    }
 
-    // Mark the old node for removal but don't delete it immediately
-    // Let eliminateDeadCode handle the actual removal
-    simplification_needed_ = true;
-    markDirty_();
+    markGraphMutated_(); // maintains your existing flags
 }
 
 std::vector<ADNodePtr> ADGraph::findNodesWithoutForwardReferences() const {
@@ -1484,4 +1559,38 @@ std::vector<ADNodePtr> ADGraph::findNodesWithoutForwardReferences() const {
     }
 
     return roots;
+}
+
+bool ADGraph::cseByKey_() {
+    // Build use-lists if you have them; it speeds replacement a lot.
+    buildUseListsOnce_();
+
+    std::unordered_map<CSEKey, ADNodePtr, CSEKeyHash> seen;
+    seen.reserve(nodes.size() * 2);
+
+    bool changed = false;
+    for (auto &sp : nodes) {
+        if (!sp)
+            continue;
+
+        // Skip pure variables and raw constants: you likely already pool
+        // constants.
+        if (sp->type == Operator::Var)
+            continue;
+
+        CSEKey key = makeCSEKey_(*sp);
+
+        // Be conservative: avoid families with tricky NaN semantics
+        // (Min/Max). We didn't include them in a family.
+        auto it = seen.find(key);
+        if (it == seen.end()) {
+            seen.emplace(std::move(key), sp);
+        } else {
+            // Redirect users of this node to the first representative
+            replaceNodeReferences(sp, it->second);
+            changed = true;
+        }
+    }
+
+    return changed;
 }

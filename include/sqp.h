@@ -97,7 +97,7 @@ public:
 
         // ---- 2) Lagrangian Hessian + regularization ----
         auto H_obj = model_->hess(x, lam_in, nu_in);
-        spmat H0 = H_obj.sparseView();
+        spmat H0 = H_obj;
 
         auto [H, reg_info] = regularizer_->regularize(H0, it);
         H.makeCompressed();
