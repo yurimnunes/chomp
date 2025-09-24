@@ -28,153 +28,40 @@
   <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
 
   <style>
-    html {
-      scroll-behavior: smooth
-    }
-
-    .card {
-      backdrop-filter: blur(4px)
-    }
-
-    .theorem {
-      background: #eff6ff;
-      border-left: 4px solid #3b82f6;
-      padding: .75rem 1rem;
-      border-radius: .5rem
-    }
-
-    .def {
-      background: #f0fdf4;
-      border-left: 4px solid #22c55e;
-      padding: .75rem 1rem;
-      border-radius: .5rem
-    }
-
-    .warn {
-      background: #fef2f2;
-      border-left: 4px solid #ef4444;
-      padding: .75rem 1rem;
-      border-radius: .5rem
-    }
-
-    .insight {
-      background: #fefce8;
-      border-left: 4px solid #eab308;
-      padding: .75rem 1rem;
-      border-radius: .5rem
-    }
-
-    .step {
-      background: #f8fafc;
-      border: 2px solid #e2e8f0;
-      padding: 1rem;
-      border-radius: .75rem;
-      margin: 1rem 0
-    }
-
-    code {
-      background: #f1f5f9;
-      padding: .15rem .35rem;
-      border-radius: .35rem;
-      font-size: .85em !important;
-    }
-
-    pre code {
-      background: transparent;
-      padding: 0
-    }
-
-    .step-number {
-      background: #3b82f6;
-      color: #fff;
-      border-radius: 50%;
-      width: 28px;
-      height: 28px;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-      font-size: 14px
-    }
-
-    .math-nowrap {
-      overflow-x: auto;
-      white-space: nowrap
-    }
-
-    .kbd {
-      border: 1px solid #cbd5e1;
-      background: #000000;
-      border-radius: .375rem;
-      padding: .125rem .375rem;
-      font-size: .75rem
-    }
-
-    /* Landing grid backdrop */
-    .bg-grid {
+    html { scroll-behavior: smooth }
+    .card { backdrop-filter: blur(4px) }
+    .theorem{ background:#eff6ff; border-left:4px solid #3b82f6; padding:.75rem 1rem; border-radius:.5rem}
+    .def{ background:#f0fdf4; border-left:4px solid #22c55e; padding:.75rem 1rem; border-radius:.5rem}
+    .warn{ background:#fef2f2; border-left:4px solid #ef4444; padding:.75rem 1rem; border-radius:.5rem}
+    .insight{ background:#fefce8; border-left:4px solid #eab308; padding:.75rem 1rem; border-radius:.5rem}
+    .step{ background:#f8fafc; border:2px solid #e2e8f0; padding:1rem; border-radius:.75rem; margin:1rem 0}
+    code{ background:#f1f5f9; padding:.15rem .35rem; border-radius:.35rem; font-size:.85em !important;}
+    pre code{ background:transparent; padding:0 }
+    .step-number{ background:#3b82f6; color:#fff; border-radius:50%; width:28px; height:28px; display:inline-flex; align-items:center; justify-content:center; font-weight:700; font-size:14px}
+    .math-nowrap{ overflow-x:auto; white-space:nowrap }
+    .kbd{ border:1px solid #cbd5e1; background:#000000; border-radius:.375rem; padding:.125rem .375rem; font-size:.75rem}
+    .bg-grid{
       background-image:
-        linear-gradient(to right, rgba(15, 23, 42, .06) 1px, transparent 1px),
-        linear-gradient(to bottom, rgba(15, 23, 42, .06) 1px, transparent 1px);
-      background-size: 24px 24px;
-      mask-image: radial-gradient(ellipse at 50% 20%, rgba(0, 0, 0, .9), rgba(0, 0, 0, .15) 60%, transparent 75%);
+        linear-gradient(to right, rgba(15,23,42,.06) 1px, transparent 1px),
+        linear-gradient(to bottom, rgba(15,23,42,.06) 1px, transparent 1px);
+      background-size:24px 24px;
+      mask-image: radial-gradient(ellipse at 50% 20%, rgba(0,0,0,.9), rgba(0,0,0,.15) 60%, transparent 75%);
     }
-
-    /* Soft gradient glow */
-    .glow {
-      position: absolute;
-      inset: -20% -10% auto -10%;
-      height: 55vh;
-      background: radial-gradient(60% 60% at 50% 40%, rgba(79, 70, 229, .25), rgba(34, 197, 94, .18) 40%, rgba(14, 165, 233, .12) 70%, transparent 75%);
-      filter: blur(40px);
-      pointer-events: none;
-    }
-
-    /* Fade-in and up */
-    .fade-up {
-      opacity: 0;
-      transform: translateY(12px);
-      animation: fadeUp .7s ease forwards .1s;
-    }
-
-    @keyframes fadeUp {
-      to {
-        opacity: 1;
-        transform: none;
-      }
-    }
-
-    /* Nav active state */
-    .nav-link {
-      position: relative;
-    }
-
-    .nav-link.active {
-      color: rgb(15 23 42);
-      font-weight: 700;
-    }
-
-    .nav-link.active::after {
-      content: "";
-      position: absolute;
-      left: 0;
-      right: 0;
-      bottom: -8px;
-      height: 2px;
-      background: rgb(15 23 42);
-      border-radius: 9999px;
+    .glow{ position:absolute; inset:-20% -10% auto -10%; height:55vh;
+      background: radial-gradient(60% 60% at 50% 40%, rgba(79,70,229,.25), rgba(34,197,94,.18) 40%, rgba(14,165,233,.12) 70%, transparent 75%);
+      filter:blur(40px); pointer-events:none;}
+    .fade-up{ opacity:0; transform: translateY(12px); animation: fadeUp .7s ease forwards .1s;}
+    @keyframes fadeUp{ to{ opacity:1; transform:none; } }
+    .nav-link{ position:relative; }
+    .nav-link.active{ color:rgb(15 23 42); font-weight:700; }
+    .nav-link.active::after{
+      content:""; position:absolute; left:0; right:0; bottom:-8px; height:2px; background:rgb(15 23 42); border-radius:9999px;
     }
   </style>
   <style>
-    :root {
-      --nav-h: 72px;
-    }
-
-    /* tweak if your nav is taller/shorter */
-    .alt-section {
-      scroll-margin-top: calc(var(--nav-h) + 12px);
-    }
+    :root{ --nav-h:72px; }
+    .alt-section{ scroll-margin-top: calc(var(--nav-h) + 12px); }
   </style>
-
 </head>
 
 <body class="min-h-screen text-slate-800 bg-gradient-to-br from-slate-50 to-indigo-50">
@@ -189,6 +76,7 @@
       <div class="hidden md:flex items-center gap-5 text-sm">
         <a class="nav-link hover:text-slate-900 text-slate-600" href="#get">Get</a>
         <a class="nav-link hover:text-slate-900 text-slate-600" href="#algorithms">Algorithms</a>
+        <a class="nav-link hover:text-slate-900 text-slate-600" href="#ad">AutoDiff</a>
         <a class="nav-link hover:text-slate-900 text-slate-600" href="#l1">DFO-L1</a>
         <a class="nav-link hover:text-slate-900 text-slate-600" href="#usage">Usage</a>
         <a class="nav-link hover:text-slate-900 text-slate-600" href="#api">API</a>
@@ -220,9 +108,6 @@
       <div class="grid lg:grid-cols-[1.2fr_.8fr] gap-10 items-center">
         <!-- Hero copy -->
         <div class="fade-up">
-
-
-
           <p class="mt-5 text-lg md:text-xl text-slate-700 max-w-2xl">
             A modular nonlinear programming solver that chomps through tough constrained problems using
             <b>SQP</b>, <b>Interior-Point</b>, and <b>DFO-L1 Exact Penalty</b>, plus an <b>Auto</b> strategy selector —
@@ -275,7 +160,7 @@
     </a>
   </header>
 
-  <!-- ======= Sections (no fixed bg here; alternator will handle) ======= -->
+  <!-- ======= Get ======= -->
   <section id="get" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Get CHOMP</h2>
@@ -285,25 +170,20 @@
           <h3 class="text-xl font-semibold mb-3">Quick Install (Python)</h3>
           <p class="text-slate-700 mb-3">Editable install for development:</p>
           <div class="relative">
-            <button
-              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre
-              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-bash">git clone https://github.com/lseman/chomp
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-bash">git clone https://github.com/lseman/chomp
 cd chomp
 pip install -e .</code></pre>
           </div>
-          <p class="text-sm text-slate-600 mt-3"><b>Requires:</b> Python ≥ 3.9, NumPy, SciPy. Native extensions build
-            automatically if your toolchain is available.</p>
+          <p class="text-sm text-slate-600 mt-3"><b>Requires:</b> Python ≥ 3.9, NumPy, SciPy. Native extensions build automatically if your toolchain is available.</p>
         </article>
 
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card" id="build">
-          <h3 class="text-xl font-semibold mb-3">Build from Source (CMake + pybind11)</h3>
+          <h3 class="text-xl font-semibold mb-3">Build from Source (CMake + nanobind)</h3>
           <p class="text-slate-700 mb-3">Compile C++ kernels and Python bindings:</p>
           <div class="relative">
-            <button
-              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre
-              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-bash">git clone https://github.com/lseman/chomp
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-bash">git clone https://github.com/lseman/chomp
 cd chomp
 mkdir build &amp;&amp; cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release \
@@ -325,7 +205,7 @@ cmake --build . -j</code></pre>
             <div class="bg-slate-50 border border-slate-200 rounded-lg p-3">
               <div class="font-semibold">Build Deps</div>
               <ul class="list-disc ml-5 mt-1 space-y-1">
-                <li>pybind11 ≥ 2.13, Eigen ≥ 3.3, fmt ≥ 11</li>
+                <li>nanobind ≥ 2.9, Eigen ≥ 3.4, fmt ≥ 11</li>
                 <li>Python dev headers (3.9+)</li>
                 <li>Optional: OpenMP</li>
                 <li>CPM.cmake auto-fetches if not found</li>
@@ -334,13 +214,14 @@ cmake --build . -j</code></pre>
           </div>
 
           <p class="text-xs text-slate-500 mt-3">
-            Platform: GCC ≥ 11 / Clang ≥ 14 (Linux/macOS), MSVC 2022 (Windows). Use <code>Release</code> builds for
-            speed.
+            Platform: GCC ≥ 11 / Clang ≥ 14 (Linux/macOS), MSVC 2022 (Windows). Use <code>Release</code> builds for speed.
           </p>
         </article>
       </div>
     </div>
   </section>
+
+  <!-- ======= Algorithms ======= -->
   <section id="algorithms" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Core Algorithms</h2>
@@ -369,63 +250,52 @@ cmake --build . -j</code></pre>
           <p class="text-slate-700 mt-3">
             We use a Byrd–Omojokun composite step \(p = p_n + p_t\): a <em>normal</em> step reduces
             feasibility in the equality space, then a <em>tangential</em> step optimizes the Lagrangian in the
-            nullspace, both
-            within the trust region (Euclidean or ellipsoidal).
+            nullspace, both within the trust region (Euclidean or ellipsoidal).
           </p>
 
           <h4 class="font-semibold mt-4">Trust-Region Geometry</h4>
           <ul class="list-disc pl-5 text-slate-700 space-y-1">
             <li><span class="font-medium">Ellipsoidal norm (optional):</span> \(\|p\|_{\mathrm{TR}}=\|L^\top p\|_2\)
-              with \(M=L L^\top \approx \operatorname{sym}(H_k)+\tau I\); adapts the ball to curvature.</li>
-            <li><span class="font-medium">PCG (Steihaug–Toint):</span> preconditioned CG on the TR subproblem; fast
-              Numba path for dense/CSR with Jacobi.</li>
-            <li><span class="font-medium">Active-set inequalities:</span> iterative augmentation of equalities when
+              with \(M=L L^\top \approx \operatorname{sym}(H_k)+\tau I\).</li>
+            <li><span class="font-medium">PCG (Steihaug–Toint):</span> preconditioned CG on the TR subproblem; dense/CSR path with Jacobi.</li>
+            <li><span class="font-medium">Active-set inequalities:</span> augment equalities when
               \(J_I p + c_I(x_k)\) violates feasibility.</li>
             <li><span class="font-medium">Box-safe scaling:</span> fraction-to-boundary cap \(\alpha_{\max}\) keeps
               \(x_k+\alpha p \in [\ell,u]\).</li>
           </ul>
 
-          <h4 class="font-semibold mt-4">Stabilization & Feasibility</hight4>
-            <ul class="list-disc pl-5 text-slate-700 space-y-1">
-              <li><span class="font-medium">dOPT stabilization:</span> small residual shifts on \(c_E,c_I\)
-                (Gill–Saunders style) near active sets to tame ill-conditioning.</li>
-              <li><span class="font-medium">Criticality safeguard:</span> when \(\|P_T\nabla f\|\) is small, shrink
+          <h4 class="font-semibold mt-4">Stabilization &amp; Feasibility</h4>
+          <ul class="list-disc pl-5 text-slate-700 space-y-1">
+            <li><span class="font-medium">dOPT stabilization:</span> small residual shifts on \(c_E,c_I\) near active sets.</li>
+            <li><span class="font-medium">Criticality safeguard:</span> when \(\|P_T\nabla f\|\) is small, shrink
                 \(\Delta_k\) to regain model accuracy.</li>
-              <li><span class="font-medium">Adaptive split:</span> normal radius \(\Delta_n=\zeta\Delta_k\) with
+            <li><span class="font-medium">Adaptive split:</span> \(\Delta_n=\zeta\Delta_k\) with
                 \(\zeta\) adapted from feasibility history.</li>
-              <li><span class="font-medium">SOC correction (optional):</span> a short second-order correction \(q\)
-                after line search; clipped so \(\|p+q\|_{\mathrm{TR}}\le\Delta_k\).</li>
-              <li><span class="font-medium">Restoration:</span> targeted feasibility step if line search/TR acceptance
-                fails.</li>
-            </ul>
+            <li><span class="font-medium">SOC (least-squares) correction:</span> solve
+              \(\min_{\Delta x}\|J_E\Delta x + c_E\|^2 + \|J_I\Delta x + (c_I+s)\|^2\),
+              set \(\Delta s = -(c_I + s + J_I\Delta x)\); fraction-to-boundary on \(\Delta s\).</li>
+            <li><span class="font-medium">Restoration:</span> feasibility-first step if acceptance fails.</li>
+          </ul>
 
-            <h4 class="font-semibold mt-4">Acceptance & Updates</h4>
-            <ul class="list-disc pl-5 text-slate-700 space-y-1">
-              <li><span class="font-medium">Predicted vs. actual reduction:</span> \(m(0)-m(p)\) vs.
-                \(f(x_k)-f(x_k+p)\); ratio \(\rho_k=\dfrac{\text{ared}}{\text{pred}}\).</li>
-              <li><span class="font-medium">Feasibility-aware \(\rho\):</span> down-weights \(\rho_k\) when constraint
-                violation is large; integrates with filter/funnel.</li>
-              <li><span class="font-medium">Curvature-aware radius:</span> expand \(\Delta_k\) when curvature along
-                \(p\) is healthy and the step nearly hits the boundary; shrink on poor \(\rho_k\).</li>
-              <li><span class="font-medium">Line search bridge:</span> optional merit/filter line search on \(p\) before
-                SOC; always clipped by \(\alpha_{\max}\).</li>
-              <li><span class="font-medium">Multipliers:</span> recover \((\lambda,\nu)\) from a safeguarded
-                least-squares system using an estimated TR multiplier \(\sigma\).</li>
-            </ul>
+          <h4 class="font-semibold mt-4">Acceptance &amp; Updates</h4>
+          <ul class="list-disc pl-5 text-slate-700 space-y-1">
+            <li><span class="font-medium">ared/pred ratio:</span> feasibility-aware \(\rho_k\) integrates with filter/funnel.</li>
+            <li><span class="font-medium">Curvature-aware radius:</span> expand/shrink \(\Delta_k\) based on model agreement.</li>
+            <li><span class="font-medium">Line search bridge:</span> merit/filter line search before SOC, clipped by \(\alpha_{\max}\).</li>
+            <li><span class="font-medium">Multipliers:</span> recover \((\lambda,\nu)\) from a safeguarded LS system.</li>
+          </ul>
 
-            <details class="mt-4">
-              <summary class="cursor-pointer text-slate-800 font-semibold">What’s inside the subproblem solve?</summary>
-              <div class="mt-2 text-slate-700 space-y-2">
-                <p><span class="font-medium">Normal step:</span> solve \(J_E p_n \approx -c_E(x_k)\), clipped to
-                  \(\Delta_n\) (and box). </p>
-                <p><span class="font-medium">Tangential step:</span> minimize the reduced quadratic in the nullspace \(
-                  \mathcal N(J_E)\) with Steihaug–Toint PCG; ellipsoidal metric handled by change of variables.</p>
-                <p><span class="font-medium">Active-set loop:</span> add the most violated \(J_I\) rows as temporary
-                  equalities until feasible within tolerance.</p>
-              </div>
-            </details>
+          <details class="mt-4">
+            <summary class="cursor-pointer text-slate-800 font-semibold">What’s inside the subproblem solve?</summary>
+            <div class="mt-2 text-slate-700 space-y-2">
+              <p><span class="font-medium">Normal step:</span> solve \(J_E p_n \approx -c_E(x_k)\), clipped to
+                \(\Delta_n\) (and box). </p>
+              <p><span class="font-medium">Tangential step:</span> minimize the reduced quadratic in the nullspace \(
+                \mathcal N(J_E)\) with Steihaug–Toint PCG; ellipsoidal metric handled by change of variables.</p>
+              <p><span class="font-medium">Active-set loop:</span> add violated \(J_I\) rows as temporary equalities until feasible.</p>
+            </div>
+          </details>
         </article>
-
 
         <article class="step h-full">
           <div class="flex items-center gap-3 mb-3">
@@ -447,8 +317,7 @@ cmake --build . -j</code></pre>
 
           <p class="text-slate-700 mt-3">
             Bounds use shifted slacks \(s_L=x-\ell,\; s_U=u-x\) with duals \(z_L,z_U\) (and optional bound shift
-            \(\beta\)).
-            The perturbed complementarity conditions are:
+            \(\beta\)). The perturbed complementarity conditions are:
           </p>
 
           <div class="math-nowrap mt-2">$$
@@ -458,63 +327,37 @@ cmake --build . -j</code></pre>
             $$</div>
 
           <p class="text-slate-700 mt-3">
-            We form a regularized augmented system (HYKKT by default; LDLᵀ fallback) with diagonal
-            barriers \(\Sigma_x,\Sigma_s\) and solve predictor/corrector steps efficiently.
+            We form a regularized augmented system (HYKKT by default; LDLᵀ fallback) with diagonal barriers and solve predictor/corrector steps efficiently.
           </p>
 
           <div class="math-nowrap mt-2">$$
-            W \;\;=\;\; \nabla_{xx}^2 \mathcal{L}(x,\lambda,\nu)\;+\;\underbrace{\Sigma_x}_{z_L,z_U}\;+\;
-            J_I^\top \underbrace{\Sigma_s}_{\lambda,s}\, J_I,
-            $$</div>
-
-          <div class="math-nowrap">$$
-            \text{solve } \begin{bmatrix} W & J_E^\top \\ J_E & 0 \end{bmatrix}
+            W \;=\; \nabla_{xx}^2 \mathcal{L}(x,\lambda,\nu)\;+\;\Sigma_x\;+\;J_I^\top \Sigma_s J_I,
+            \quad
+            \begin{bmatrix} W & J_E^\top \\ J_E & 0 \end{bmatrix}
             \begin{bmatrix} \Delta x \\ \Delta \nu \end{bmatrix}
-            \;=\;
-            \begin{bmatrix} -r_d \\ -r_{p,E} \end{bmatrix},
-            \quad
-            \Delta s = -\big(c_I + J_I\,\Delta x\big),
-            \quad
-            \Delta\lambda,\Delta z_L,\Delta z_U \text{ from complementarity}.
-            $$</div>
+            = \begin{bmatrix} -r_d \\ -r_{p,E} \end{bmatrix},
+            \ \ \Delta s = -\big(c_I + J_I\,\Delta x\big).
+          $$</div>
 
           <h4 class="font-semibold mt-4">Algorithmic Highlights</h4>
           <ul class="list-disc pl-5 text-slate-700 space-y-1">
-            <li><span class="font-medium">Mehrotra Predictor–Corrector:</span> affine-scaling predictor, adaptive
-              centering \(\sigma = ((1-\alpha_{\mathrm{aff}})^2) ( \mu_{\mathrm{aff}}/\mu )^{p}\) with \(p\approx3\),
-              corrector with centrality & bounds terms.</li>
-            <li><span class="font-medium">Fraction-to-Boundary:</span> separate \(\tau_{\text{pri}},
-              \tau_{\text{dual}}\) caps for \(\alpha\) to keep \(s,\lambda,z_L,z_U>0\) and stay inside the shifted cone.
-            </li>
-            <li><span class="font-medium">Shifted Barrier (robustness):</span> automatic \(\tau\) (inequalities) and
-              \(\beta\) (bounds) adaptation to avoid tiny slacks and help with large residuals.</li>
-            <li><span class="font-medium">Gondzio Multi-Corrector (optional):</span> extra right-hand-side sweeps when
-              the affine step is short or complementarity is dispersed.</li>
-            <li><span class="font-medium">Higher-Order Correction (optional):</span> a capped second correction
-              \(\Delta^2 x\) based on the quadratic term \(J_I^\top(\Sigma_s J_I \Delta x)\) to reduce nonlinearity
-              error.</li>
-            <li><span class="font-medium">Tiny Trust Region on \(\Delta x\):</span> norm cap to prevent overly
-              aggressive steps when Hessian conditioning is marginal.</li>
-            <li><span class="font-medium">Filter/Armijo Line Search:</span> feasibility-aware merit bridge; if needed, a
-              <em>restoration</em> phase seeks a cheaper feasible point to resume progress.
-            </li>
-            <li><span class="font-medium">KKT Solves:</span> HYKKT with reuse & CG refinement; LDLᵀ fallback. Hessian is
-              regularized to be numerically PSD.</li>
+            <li><span class="font-medium">Mehrotra Predictor–Corrector:</span> affine predictor, adaptive centering, corrector.</li>
+            <li><span class="font-medium">Fraction-to-Boundary:</span> separate caps for \(s,\lambda,z_L,z_U\) to keep positivity.</li>
+            <li><span class="font-medium">Shifted Barrier:</span> automatic \(\tau,\beta\) adaptation to avoid tiny slacks.</li>
+            <li><span class="font-medium">Gondzio Multi-Corrector (opt):</span> extra RHS sweeps when affine step is short.</li>
+            <li><span class="font-medium">Higher-Order Correction (opt):</span> capped quadratic correction on \(J_I\).</li>
+            <li><span class="font-medium">Tiny TR on \(\Delta x\):</span> prevent aggressive steps with marginal conditioning.</li>
+            <li><span class="font-medium">KKT Solves:</span> HYKKT with reuse & CG refinement; LDLᵀ fallback; Ruiz equilibration.</li>
           </ul>
 
           <details class="mt-4">
             <summary class="cursor-pointer text-slate-800 font-semibold">Stopping &amp; μ-update</summary>
             <div class="mt-2 text-slate-700 space-y-2">
-              <p>We stop when
-                \(\|r_d\|_\infty,\;\|c_E\|_\infty,\;\|c_I\|_\infty,\;\max\{\|(s+\tau)\odot\lambda-\mu\|_\infty,\|(s_L+\beta)\odot
-                z_L-\mu\|_\infty,\|(s_U+\beta)\odot z_U-\mu\|_\infty\}\)
-                are below tolerance and \(\mu\) is small.</p>
-              <p>\(\mu\) is decreased using a safeguarded schedule based on predictor quality, feasibility,
-                complementarity, and Hessian conditioning.</p>
+              <p>Stop when \(\|r_d\|_\infty,\|c_E\|_\infty,\|c_I\|_\infty\) and complementarity residuals are below tolerance and \(\mu\) is small.</p>
+              <p>\(\mu\) decreases via a safeguarded schedule based on predictor quality, feasibility, complementarity, and Hessian conditioning.</p>
             </div>
           </details>
         </article>
-
       </div>
 
       <!-- Single-column: AUTO -->
@@ -525,12 +368,94 @@ cmake --build . -j</code></pre>
         </div>
         <p class="text-slate-700">
           Chooses SQP vs IP vs DFO based on structure (active inequalities, conditioning, progress).
-          Warm-starts duals/slacks.
+          Warm-starts duals/slacks, reuses KKT factors when possible, and flips modes if a funnel/filter rejects steps repeatedly.
         </p>
+        <ul class="list-disc pl-5 text-slate-700 space-y-1 mt-2">
+          <li>Switch-to-IP when infeasibility dominates or bound activity explodes.</li>
+          <li>Switch-to-SQP when curvature is well-behaved and feasibility is near.</li>
+          <li>Switch-to-DFO when derivatives are unreliable or noisy (small-n, black-box regimes).</li>
+        </ul>
       </article>
     </div>
   </section>
 
+  <!-- ======= AutoDiff ======= -->
+  <section id="ad" class="alt-section py-14">
+    <div class="max-w-7xl mx-auto px-6">
+      <h2 class="text-3xl font-bold text-center mb-8">Automatic Differentiation & Graph Engine</h2>
+
+      <div class="grid lg:grid-cols-2 gap-6">
+        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
+          <h3 class="text-xl font-semibold mb-3">High-Performance Vectorization (HPV) with Lanes</h3>
+          <p class="text-slate-700">
+            CHOMP’s AD core is a C++23 engine (nanobind bindings) with lane-parallel evaluation (“HPV with lanes”).
+            Nodes carry compact tapes; kernels are fused and vectorized (e.g., AVX2) to evaluate multiple seeds at once.
+          </p>
+          <ul class="list-disc ml-5 mt-2 text-slate-700 space-y-1">
+            <li><span class="font-medium">Lanes:</span> evaluate <code>L</code> seeds in parallel (typical L=8–16) for fast JVPs/HVPs and batched gradients.</li>
+            <li><span class="font-medium">Fused kernels:</span> contiguous memory walks, thread-local scratch, minimal allocs.</li>
+            <li><span class="font-medium">OpTraits:</span> optimized derivatives for <code>pow</code>, <code>sqrt</code>, <code>abs</code> (and friends), with safe branches.</li>
+            <li><span class="font-medium">Dead-code elimination &amp; simplification:</span> graph compaction, constant-folding, and lane-aware pruning.</li>
+          </ul>
+
+          <h4 class="font-semibold mt-4">Objects you can get</h4>
+          <ul class="list-disc ml-5 text-slate-700 space-y-1">
+            <li>\(f(x)\), \(\nabla f(x)\), \(J_E(x),J_I(x)\)</li>
+            <li>Hessian-vector products \(H(x)v\) (via lanes) and exact Hessians</li>
+            <li>Batched <code>val, grad</code> for lists of constraints (one pass)</li>
+          </ul>
+        </article>
+
+        <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
+          <h3 class="text-xl font-semibold mb-3">Sparse-Aware & Numerically Robust</h3>
+          <ul class="list-disc ml-5 text-slate-700 space-y-1">
+            <li><span class="font-medium">Sparse Jacobians/Hessians:</span> structured assembly for KKT/HYKKT; reuse-friendly permutations.</li>
+            <li><span class="font-medium">Memory pool:</span> arena allocators + thread-local scratch for zero-overhead temporaries.</li>
+            <li><span class="font-medium">Safe math:</span> guards like <code>_safe_div</code>, tiny Tikhonov on normal equations, barrier-aware logs.</li>
+            <li><span class="font-medium">API parity:</span> used everywhere via <code>ModelC::eval_all(...)</code> and getters (<code>get_f/get_g/get_JE/get_JI</code>).</li>
+          </ul>
+
+          <h4 class="font-semibold mt-4">Tiny Example (HVP)</h4>
+          <div class="relative">
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
+from chomp import ModelC
+
+# assume f, c_ineq, c_eq compiled; model exposes eval_all + getters
+model: ModelC = make_model()
+
+x = np.random.randn(model.n())
+v = np.random.randn(model.n())
+
+# One lane-block computes H(x) @ v efficiently
+model.eval_all(x, ["g", "hessvec"])   # engine fills internal buffers
+Hv = model.get_hessvec(v).value()
+print("vᵀHv =", float(v @ Hv))</code></pre>
+          </div>
+        </article>
+      </div>
+
+      <div class="mt-6 grid lg:grid-cols-3 gap-4 text-sm">
+        <div class="border border-slate-200 rounded-xl p-4 bg-white">
+          <div class="text-slate-500 text-xs font-semibold">ENGINE</div>
+          <h4 class="font-semibold">C++23 + nanobind</h4>
+          <p class="text-slate-700">SIMD-friendly tapes, lane-parallel JVP/HVP, optional OpenMP.</p>
+        </div>
+        <div class="border border-slate-200 rounded-xl p-4 bg-white">
+          <div class="text-slate-500 text-xs font-semibold">OPERATORS</div>
+          <h4 class="font-semibold">OpTraits</h4>
+          <p class="text-slate-700">Specialized rules for <code>abs</code>, <code>sqrt</code>, <code>pow</code>, trigs, reductions.</p>
+        </div>
+        <div class="border border-slate-200 rounded-xl p-4 bg-white">
+          <div class="text-slate-500 text-xs font-semibold">INTEGRATION</div>
+          <h4 class="font-semibold">KKT-Ready</h4>
+          <p class="text-slate-700">Directly feeds HYKKT/LDLᵀ with sparse \(J_E,J_I\), exact or quasi-Newton \(H\).</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======= DFO-L1 ======= -->
   <section id="l1" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Derivative-Free L1 Exact Penalty (Trust-Region)</h2>
@@ -556,25 +481,19 @@ cmake --build . -j</code></pre>
 
           <div class="def text-sm mt-4">
             <b>Nearly-active vs. clearly violated constraints.</b> Constraints with $|c_i(x)|\le \varepsilon$ are
-            treated specially to avoid
-            zig-zagging near the boundary; others contribute smoothly via model $p_1$.
+            treated specially to avoid zig-zagging near the boundary; others contribute smoothly via model $p_1$.
           </div>
 
           <h3 class="text-lg font-semibold mt-6">Step Strategy (Sketch)</h3>
           <ol class="list-decimal ml-6 text-slate-700 space-y-1">
-            <li><b>Direction:</b> Solve a small LP to get a “steepest” descent direction for the model of $p$ that
-              respects nearly-active gradients.</li>
-            <li><b>1-D Search with Breakpoints:</b> Line search along the direction across piecewise-quadratic segments
-              (breakpoints where constraints switch).</li>
-            <li><b>Project Nearly-Active to Zero:</b> Compute a small correction that drives nearly-active constraints
-              closer to $0$ (least-squares).</li>
-            <li><b>Trust-Region &amp; Acceptance:</b> Compare predicted vs. actual reduction; adjust radius, and improve
-              models if agreement is poor.</li>
+            <li><b>Direction:</b> Solve a small LP to get a “steepest” descent direction for the model of $p$ that respects nearly-active gradients.</li>
+            <li><b>1-D Search with Breakpoints:</b> Line search along the direction across piecewise-quadratic segments.</li>
+            <li><b>Project Nearly-Active to Zero:</b> Small LS correction that drives nearly-active constraints closer to $0$.</li>
+            <li><b>Trust-Region &amp; Acceptance:</b> Compare predicted vs. actual reduction; adjust radius and refine models.</li>
           </ol>
 
           <div class="insight text-sm mt-4">
-            <b>When to use:</b> Black-box objectives/constraints, limited $n$ (e.g., $n\le 50$), noisy derivatives, or
-            expensive simulations.
+            <b>When to use:</b> Black-box objectives/constraints, limited $n$ (e.g., $n\le 50$), noisy derivatives, or expensive simulations.
           </div>
         </article>
 
@@ -598,6 +517,7 @@ cmake --build . -j</code></pre>
     </div>
   </section>
 
+  <!-- ======= Usage ======= -->
   <section id="usage" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Quick Start</h2>
@@ -606,10 +526,8 @@ cmake --build . -j</code></pre>
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-xl font-semibold mb-3">Classic API</h3>
           <div class="relative">
-            <button
-              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre
-              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
 from chomp import NLPSolver, SQPConfig
 
 # Rosenbrock + circle inequality
@@ -625,13 +543,10 @@ print(x_opt, info.status)</code></pre>
 
         <article class="bg-white border border-slate-200 rounded-2xl p-6 shadow card">
           <h3 class="text-xl font-semibold mb-3">Wrapper API (Symbolic)</h3>
-          <p class="text-sm text-slate-600 -mt-1 mb-2">Build with operator-overloaded expressions; AD-aware trigs and
-            reductions.</p>
+          <p class="text-sm text-slate-600 -mt-1 mb-2">Build with operator-overloaded expressions; AD-aware trigs and reductions.</p>
           <div class="relative">
-            <button
-              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre
-              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import math
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import math
 import numpy as np
 from nlp.wrapper import Model, cos   # AD-aware functions
 from chomp import NLPSolver, SQPConfig
@@ -660,9 +575,7 @@ print("x* =", x_star, info.status)</code></pre>
         <div class="border border-slate-200 rounded-xl p-4 bg-white">
           <div class="text-slate-500 text-xs font-semibold">STEP 1</div>
           <h4 class="font-semibold">Choose mode</h4>
-          <p class="text-sm text-slate-700"><code>mode="sqp"</code>, <code>"ip"</code>, <code>"dfo"</code>, or
-            <code>"auto"</code>.
-          </p>
+          <p class="text-sm text-slate-700"><code>mode="sqp"</code>, <code>"ip"</code>, <code>"dfo"</code>, or <code>"auto"</code>.</p>
         </div>
         <div class="border border-slate-200 rounded-xl p-4 bg-white">
           <div class="text-slate-500 text-xs font-semibold">STEP 2</div>
@@ -672,13 +585,13 @@ print("x* =", x_star, info.status)</code></pre>
         <div class="border border-slate-200 rounded-xl p-4 bg-white">
           <div class="text-slate-500 text-xs font-semibold">STEP 3</div>
           <h4 class="font-semibold">Inspect</h4>
-          <p class="text-sm text-slate-700">Use <code>info</code>/<code>history</code> for residuals, step types, and
-            timings.</p>
+          <p class="text-sm text-slate-700">Use <code>info</code>/<code>history</code> for residuals, step types, and timings.</p>
         </div>
       </div>
     </div>
   </section>
 
+  <!-- ======= API ======= -->
   <section id="api" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">API Cheatsheet</h2>
@@ -711,6 +624,7 @@ print("x* =", x_star, info.status)</code></pre>
     </div>
   </section>
 
+  <!-- ======= Examples ======= -->
   <section id="examples" class="alt-section py-14">
     <div class="max-w-7xl mx-auto px-6">
       <h2 class="text-3xl font-bold text-center mb-8">Worked Examples</h2>
@@ -719,10 +633,8 @@ print("x* =", x_star, info.status)</code></pre>
           <h3 class="text-lg font-semibold mb-2">Quadratic with Linear Constraints (SQP)</h3>
           <p class="text-slate-700">Filter globalization + trust region with active-set changes.</p>
           <div class="relative">
-            <button
-              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre
-              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
 from chomp import NLPSolver, SQPConfig
 
 Q = np.diag([1.0, 10.0]); q = np.array([-1.0, -2.0])
@@ -741,10 +653,8 @@ print(x, info.status)</code></pre>
           <h3 class="text-lg font-semibold mb-2">Inequalities via Slacks (IP)</h3>
           <p class="text-slate-700">Log-barrier with Mehrotra predictor–corrector and fraction-to-boundary.</p>
           <div class="relative">
-            <button
-              class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
-            <pre
-              class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">from chomp import NLPSolver, IPConfig
+            <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
+            <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">from chomp import NLPSolver, IPConfig
 
 f = lambda x: (x[0]-1)**2 + (x[1]+2)**2
 c_ineq = [lambda x: x[0] + x[1] - 1]  # <= 0
@@ -771,13 +681,12 @@ print(x, info.status)</code></pre>
         <p class="text-sm">© <span id="year"></span> CHOMP — Nonlinear Optimization Solver</p>
         <div class="text-xs text-slate-400">SQP • Interior-Point • DFO-L1 • Auto • Sparse KKT • AD</div>
       </div>
-      <div class="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-400">
-        Trust-region &amp; filter globalization • Slack/barrier IPM • Schur/LDL<sup>T</sup> • Ruiz equilibration
-      </div>
-      <div class="mt-6 text-center text-xs text-slate-400">
-        References: Giuliani, Camponogara &amp; Conn (2022); Nocedal &amp; Wright; Wächter &amp; Biegler; Gill, Murray
-        &amp; Wright.
-      </div>
+    </div>
+    <div class="mt-4 pt-4 border-t border-slate-700 text-center text-xs text-slate-400">
+      Trust-region &amp; filter globalization • Slack/barrier IPM • HYKKT/LDL<sup>T</sup> • Ruiz equilibration • HPV lanes AD
+    </div>
+    <div class="mt-6 text-center text-xs text-slate-400">
+      References: Nocedal &amp; Wright; Wächter &amp; Biegler; Gill, Murray &amp; Wright; Giuliani, Camponogara &amp; Conn (2022).
     </div>
   </footer>
 
@@ -805,7 +714,7 @@ print(x, info.status)</code></pre>
       const y = document.getElementById('year');
       if (y) y.textContent = new Date().getFullYear();
 
-      // Smooth anchor scroll (ensure block start)
+      // Smooth anchor scroll
       document.querySelectorAll('a[href^="#"]').forEach(a => {
         a.addEventListener('click', (e) => {
           const href = a.getAttribute('href');
@@ -824,16 +733,13 @@ print(x, info.status)</code></pre>
       const solid = () => nav && nav.classList.add('backdrop-blur', 'bg-white/80', 'border-b', 'border-slate-200');
       const clear = () => nav && nav.classList.remove('backdrop-blur', 'bg-white/80', 'border-b', 'border-slate-200');
 
-      // Start solid to avoid flash; observer will clear if hero is fully visible
       solid();
 
       let navH = nav ? nav.getBoundingClientRect().height : 72;
 
-      // --- Active nav highlight based on section visibility ---
+      // Active nav highlight
       const links = Array.from(document.querySelectorAll('.nav-link'));
-      const linkById = new Map(
-        links.filter(a => a.hash).map(a => [a.hash.slice(1), a])
-      );
+      const linkById = new Map(links.filter(a => a.hash).map(a => [a.hash.slice(1), a]));
       const sections = Array.from(document.querySelectorAll('.alt-section'));
 
       const setActive = (id) => {
@@ -842,19 +748,13 @@ print(x, info.status)</code></pre>
         if (el) el.classList.add('active');
       };
 
-      // Mark immediately on click to avoid IO lag
-      links.forEach(a => {
-        a.addEventListener('click', () => {
-          const id = a.hash && a.hash.slice(1);
-          if (id) setActive(id);
-        });
-      });
+      links.forEach(a => a.addEventListener('click', () => {
+        const id = a.hash && a.hash.slice(1);
+        if (id) setActive(id);
+      }));
 
-      // Track visibility ratios
-      const vis = new Map(); // id -> ratio
-
+      const vis = new Map();
       const chooseAndSetActive = () => {
-        // Pick the section with the highest ratio; break ties with nearest to header
         let bestId = null, bestRatio = 0, bestDist = Infinity;
         const headerY = navH + 8;
         sections.forEach(sec => {
@@ -869,7 +769,6 @@ print(x, info.status)</code></pre>
           }
         });
         if (!bestId) {
-          // Fallback: nearest section to header line
           let nearestId = null, nearestDist = Infinity;
           sections.forEach(sec => {
             const rect = sec.getBoundingClientRect();
@@ -884,40 +783,28 @@ print(x, info.status)</code></pre>
       const thresholds = Array.from({ length: 11 }, (_, i) => i / 10);
 
       let sectionObserver = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-          const id = entry.target.id;
-          vis.set(id, entry.intersectionRatio);
-        });
+        entries.forEach(entry => vis.set(entry.target.id, entry.intersectionRatio));
         chooseAndSetActive();
-      }, {
-        // Make the top boundary just below the sticky nav; bottom boundary a bit above footer
-        rootMargin: `-${navH + 8}px 0px -55% 0px`,
-        threshold: thresholds
-      });
+      }, { rootMargin: `-${navH + 8}px 0px -55% 0px`, threshold: thresholds });
 
       sections.forEach(s => sectionObserver.observe(s));
 
-      // --- Navbar transparency only when hero is fully visible at top ---
+      // Navbar transparency when hero fully visible
       let heroObserver = null;
       const makeHeroObserver = () => {
         if (!hero) return;
         if (heroObserver) heroObserver.disconnect();
         heroObserver = new IntersectionObserver((entries) => {
           entries.forEach(entry => {
-            if (entry.isIntersecting && entry.intersectionRatio === 1) {
-              // Hero fully visible -> transparent
-              clear();
-            } else {
-              // Otherwise -> solid
-              solid();
-            }
+            if (entry.isIntersecting && entry.intersectionRatio === 1) clear();
+            else solid();
           });
-        }, { threshold: [0, 1], rootMargin: "0px 0px 0px 0px" });
+        }, { threshold: [0, 1] });
         heroObserver.observe(hero);
       };
       makeHeroObserver();
 
-      // Handle initial hash (deep link) or initial state with no hash
+      // Initialize active state
       const init = () => {
         if (location.hash) {
           const id = location.hash.slice(1);
@@ -930,7 +817,7 @@ print(x, info.status)</code></pre>
       };
       requestAnimationFrame(init);
 
-      // --- Alternating section backgrounds (white / slate-50) ---
+      // Alternating section backgrounds
       const applyAlternating = () => {
         const secs = Array.from(document.querySelectorAll('.alt-section'));
         secs.forEach((sec, idx) => {
@@ -938,25 +825,19 @@ print(x, info.status)</code></pre>
           sec.classList.add(idx % 2 === 0 ? 'bg-white' : 'bg-slate-50');
         });
       };
-
-      // initial apply after layout settles
       requestAnimationFrame(applyAlternating);
-
-      // keep it fresh on resize (in case layout reorders or sections show/hide)
       window.addEventListener('resize', applyAlternating);
 
-      // if sections are dynamically inserted/removed, re-apply
+      // Observe DOM changes
       const mo = new MutationObserver(() => applyAlternating());
       mo.observe(document.body, { childList: true, subtree: true });
 
-
-      // Recompute on resize: update nav height, re-create observers with new margins
+      // Recompute on resize (nav height)
       window.addEventListener('resize', () => {
         const newNavH = nav ? nav.getBoundingClientRect().height : 72;
         if (newNavH !== navH) {
           navH = newNavH;
 
-          // Recreate section observer with updated rootMargin
           sectionObserver.disconnect();
           sections.forEach(s => vis.set(s.id, 0));
           sectionObserver = new IntersectionObserver((entries) => {
@@ -965,15 +846,11 @@ print(x, info.status)</code></pre>
           }, { rootMargin: `-${navH + 8}px 0px -55% 0px`, threshold: thresholds });
           sections.forEach(s => sectionObserver.observe(s));
 
-          // Recreate hero observer (rootMargin doesn't depend on navH, but keep consistent)
           makeHeroObserver();
         }
         chooseAndSetActive();
       });
     });
   </script>
-
-
 </body>
-
 </html>

@@ -68,6 +68,16 @@ struct ChompConfig {
     bool adaptive_gamma = false;
     bool assemble_schur_if_m_small = true;
     bool use_prec = true;
+        double delta_min        = 1e-12;   // gentle starting floor for δ₁ when 0 is passed in
+    double delta_max        = 1e+6;    // hard cap to avoid runaway δ₁
+
+    // δ₂ shift for Schur system (used when LLT/CG struggles on S = G K^{-1} Gᵀ)
+    double schur_delta2_min = 1e-12;   // initial δ₂ for S + δ₂ I
+    double schur_delta2_max = 1e-2;    // cap for δ₂ growth (×10 per retry)
+
+    // Second CG budget for the δ₂-shifted solve (first try uses cg_maxit)
+    int    cg_maxit2        = 2 * 200; // e.g., if cg_maxit==200, set cg_maxit2==400
+
 };
 
 struct KKTReusable {

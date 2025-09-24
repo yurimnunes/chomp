@@ -34,7 +34,7 @@
 #include "linesearch.h"
 #include "regularizer.h"
 
-#include "model.h"                // Model
+#include "model.h" // Model
 #include <chrono>
 #include <iomanip> // std::setprecision
 
@@ -464,11 +464,9 @@ public:
         // For Jacobians, do NOT assign to nb::object. Extract as (dense|sparse)
         // and normalize. If the producer may return either dense or sparse,
         // accept both:
-        spmat JI = (mI > 0) ? m_->get_JI().value()
-                            : spmat(mI, n); // empty OK
+        spmat JI = (mI > 0) ? m_->get_JI().value() : spmat(mI, n); // empty OK
 
-        spmat JE = (mE > 0) ? m_->get_JE().value()
-                            : spmat(mE, n); // FIX 5
+        spmat JE = (mE > 0) ? m_->get_JE().value() : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE");
 
         double theta = m_->constraint_violation(x);
@@ -505,8 +503,7 @@ public:
             r_d -= zL_in;
             r_d += zU_in;
 
-            const double s_max =
-                get_attr_or<double>(cfg_, "ip_s_max", 100.0);
+            const double s_max = get_attr_or<double>(cfg_, "ip_s_max", 100.0);
             const int denom_ct = static_cast<int>(s_in.size()) + mE + n;
             const double sum_mults = lam_in.lpNorm<1>() + nu_in.lpNorm<1>() +
                                      zL_in.lpNorm<1>() + zU_in.lpNorm<1>();
@@ -556,8 +553,7 @@ public:
         }
 
         // -------------------- Sigmas & Hessian --------------------
-        const double eps_abs =
-            get_attr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
+        const double eps_abs = get_attr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
         const double cap = get_attr_or<double>(cfg_, "sigma_cap", 1e8);
 
         Sigmas Sg =
@@ -663,8 +659,7 @@ public:
         const double tau_pri = get_attr_or<double>(
             cfg_, "ip_tau_pri", get_attr_or<double>(cfg_, "ip_tau", 0.995));
         const double tau_dual = get_attr_or<double>(
-            cfg_, "ip_tau_dual",
-            get_attr_or<double>(cfg_, "ip_tau", 0.995));
+            cfg_, "ip_tau_dual", get_attr_or<double>(cfg_, "ip_tau", 0.995));
         const double a_ftb = detail::alpha_ftb_vec(
             x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), lmb,
             (mI ? dlam : dvec()), B, tau_pri, tau_dual);
@@ -745,10 +740,9 @@ public:
         dvec cE_new = (mE > 0) ? m_->get_cE().value() : dvec::Zero(mE); // FIX 4
         IP_LAP("extract f,g,cI,cE new");
 
-        spmat JI_new = (mI > 0) ? m_->get_JI().value()
-                                : spmat(mI, n); // empty OK
-        spmat JE_new = (mE > 0) ? m_->get_JE().value()
-                                : spmat(mE, n); // FIX 5
+        spmat JI_new =
+            (mI > 0) ? m_->get_JI().value() : spmat(mI, n); // empty OK
+        spmat JE_new = (mE > 0) ? m_->get_JE().value() : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE new");
 
         double theta_new = m_->constraint_violation(x_new);
@@ -919,8 +913,7 @@ private:
         const bool use_shifted =
             get_attr_or<bool>(cfg_, "ip_use_shifted_barrier", true);
         const double tau_shift =
-            use_shifted ? get_attr_or<double>(cfg_, "ip_shift_tau", 0.1)
-                        : 0.0;
+            use_shifted ? get_attr_or<double>(cfg_, "ip_shift_tau", 0.1) : 0.0;
         const double bound_shift =
             use_shifted ? get_attr_or<double>(cfg_, "ip_shift_bounds", 0.1)
                         : 0.0;
@@ -1014,7 +1007,8 @@ private:
         if (mE == 0 && (method_cpp == "hykkt" || method_cpp == "hykkt_cholmod"))
             method_cpp = "ldl";
 
-        // // ---------- New: fast path using HYKKTFlow (handles reuse internally)
+        // // ---------- New: fast path using HYKKTFlow (handles reuse
+        // internally)
         // // ----------
         // if ((method_cpp == "hykkt" || method_cpp == "hykkt_cholmod") &&
         //     mE > 0) {
@@ -1024,15 +1018,18 @@ private:
         //     //     // You can map fields from your ChompConfig to hykkt_cfg_
         //     //     here if needed hykkt_cfg_.sym_ordering       = "amd";
         //     //     hykkt_cfg_.schur_dense_cutoff = 0.05;  // m <= 5% of n →
-        //     //     dense Schur hykkt_cfg_.use_prec           = true;  // Jacobi
+        //     //     dense Schur hykkt_cfg_.use_prec           = true;  //
+        //     Jacobi
         //     //     by default hykkt_cfg_.cg_tol             = 1e-8;
         //     //     hykkt_cfg_.cg_maxit           = 200;
         //     //     hykkt_cfg_.use_simd           = true;
 
-        //     //     hykkt_flow_ = std::make_unique<kkt::HYKKTFlow>(hykkt_cfg_);
+        //     //     hykkt_flow_ =
+        //     std::make_unique<kkt::HYKKTFlow>(hykkt_cfg_);
         //     // }
 
-        //     // delta: your IP regularization for W; if you have a value, pass it
+        //     // delta: your IP regularization for W; if you have a value, pass
+        //     it
         //     // here
         //     const double delta = 0.0;
 
@@ -1047,7 +1044,8 @@ private:
         //     );
 
         //     // If your KKTResult third field must be non-null, you can keep
-        //     // nullptr; the flow already handles reuse internally on subsequent
+        //     // nullptr; the flow already handles reuse internally on
+        //     subsequent
         //     // calls.
         //     return {std::move(dx), std::move(dy), /*reusable*/ nullptr};
         // }
@@ -1124,8 +1122,7 @@ private:
         const double tau_pri = get_attr_or<double>(
             cfg_, "ip_tau_pri", get_attr_or<double>(cfg_, "ip_tau", 0.995));
         const double tau_dual = get_attr_or<double>(
-            cfg_, "ip_tau_dual",
-            get_attr_or<double>(cfg_, "ip_tau", 0.995));
+            cfg_, "ip_tau_dual", get_attr_or<double>(cfg_, "ip_tau", 0.995));
         double alpha_aff = 1.0;
 
         if (mI > 0) {
@@ -1217,38 +1214,42 @@ private:
 
         return {alpha_aff, mu_aff, sigma};
     }
-
     [[nodiscard]] double update_mu_(double mu, const dvec &s, const dvec &lam,
                                     double theta, KKT &kkt, bool accepted,
                                     double cond_H, double sigma, double mu_aff,
                                     bool use_shifted, double tau_shift) {
+        IP_TIMER("update_mu_");
         const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
         const double kappa = get_attr_or<double>(cfg_, "kappa_mu", 1.5);
-        const double theta_tol =
-            get_attr_or<double>(cfg_, "tol_feas", 1e-6);
+        const double theta_tol = get_attr_or<double>(cfg_, "tol_feas", 1e-6);
         const double comp_tol = get_attr_or<double>(cfg_, "tol_comp", 1e-6);
         const double cond_max =
             get_attr_or<double>(cfg_, "cond_threshold", 1e6);
-
         const double comp =
             detail::complementarity(s, lam, mu, tau_shift, use_shifted);
         const bool good =
             (accepted && theta <= theta_tol && comp <= comp_tol &&
              kkt.stat <= get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
              (std::isnan(cond_H) || cond_H <= cond_max));
-
         const double comp_ratio = comp / clamp_min(mu, 1e-12);
         const double mu_base = clamp_min(sigma * mu_aff, mu_min);
 
+        // Cosine annealing schedule
+        static int iteration = 0;
+        const double T_max =
+            get_attr_or<double>(cfg_, "ip_max_iterations", 100.0);
+        const double eta = 0.5 * (1.0 + std::cos(M_PI * iteration / T_max));
         double mu_new;
         if (good && comp_ratio < 0.1) {
             mu_new = mu_base *
-                     std::min(0.1, std::pow(mu_aff / clamp_min(mu, 1e-12), 2));
+                     std::min(0.1, std::pow(mu_aff / clamp_min(mu, 1e-12), 2)) *
+                     eta;
         } else if (comp_ratio > 10.0 || theta > 10 * theta_tol) {
-            mu_new = std::min(10.0 * mu, mu_base * 1.2);
+            mu_new = std::min(10.0 * mu, mu_base * 1.2) * eta;
         } else {
-            mu_new = std::min(mu_base, std::pow(mu, kappa));
+            mu_new = std::min(mu_base, std::pow(mu, kappa)) * eta;
         }
+        iteration++;
         return clamp_min(mu_new, mu_min);
     }
 
@@ -1457,7 +1458,6 @@ private:
         }
         return {rhs_x, rhs_s};
     }
-
     [[nodiscard]] GondzioStepData gondzio_multiple_corrections(
         const spmat &W, const dvec &r_d, const std::optional<spmat> &JE,
         const std::optional<dvec> &r_pE, const std::optional<spmat> &JI,
@@ -1465,14 +1465,12 @@ private:
         const dvec &zL, const dvec &zU, const Bounds &B, double mu_target,
         bool use_shifted, double tau_shift, double bound_shift,
         const Sigmas &Sg, const dvec &base_dx, const dvec &base_dnu) {
-
+        IP_TIMER("gondzio_multiple_corrections");
         GondzioStepData R;
         R.dx = base_dx;
         R.dnu = base_dnu;
         R.mu_target = mu_target;
-
         const int mI = static_cast<int>(s.size());
-
         if (mI > 0 && JI) {
             R.ds = -(r_pI.value() + (*JI) * base_dx);
             R.dlam = dvec(mI);
@@ -1484,44 +1482,44 @@ private:
             R.ds.resize(0);
             R.dlam.resize(0);
         }
-
         auto [dzL_base, dzU_base] = detail::dz_bounds_from_dx_vec(
             base_dx, zL, zU, B, bound_shift, use_shifted, mu_target, true);
         R.dzL = dzL_base;
         R.dzU = dzU_base;
-
-        const double tau_pri =
-            get_attr_or<double>(cfg_, "ip_tau_pri", 0.995);
-        const double tau_dual =
-            get_attr_or<double>(cfg_, "ip_tau_dual", 0.995);
+        const double tau_pri = get_attr_or<double>(cfg_, "ip_tau_pri", 0.995);
+        const double tau_dual = get_attr_or<double>(cfg_, "ip_tau_dual", 0.995);
         std::tie(R.alpha_pri, R.alpha_dual) =
             compute_gondzio_step_lengths(s, R.ds, lam, R.dlam, zL, R.dzL, zU,
                                          R.dzU, R.dx, B, tau_pri, tau_dual);
 
-        for (int k = 0; k < gondzio_config_.max_corrections; ++k) {
-            const double centrality = compute_centrality_measure(
-                s, lam, R.ds, R.dlam, zL, zU, R.dzL, R.dzU, R.dx, B,
-                R.alpha_pri, R.alpha_dual, mu_target, use_shifted, tau_shift,
-                bound_shift);
+        // Adaptive correction count based on centrality
+        int max_corrections = gondzio_config_.max_corrections;
+        static double prev_centrality = std::numeric_limits<double>::infinity();
+        const double centrality = compute_centrality_measure(
+            s, lam, R.ds, R.dlam, zL, zU, R.dzL, R.dzU, R.dx, B, R.alpha_pri,
+            R.alpha_dual, mu_target, use_shifted, tau_shift, bound_shift);
+        if (centrality > prev_centrality * 0.9 && R.correction_count > 0) {
+            max_corrections = std::max(
+                1, max_corrections -
+                       1); // Reduce corrections if centrality isn't improving
+        }
+        prev_centrality = centrality;
 
+        for (int k = 0; k < max_corrections; ++k) {
             const double alpha_max = std::min(R.alpha_pri, R.alpha_dual);
             if (!should_apply_gondzio_correction(centrality, alpha_max,
                                                  gondzio_config_))
                 break;
-
             auto [rhs_corr_x, rhs_corr_s] = compute_gondzio_corrector_rhs(
                 s, lam, R.ds, R.dlam, zL, zU, R.dzL, R.dzU, R.dx, B,
                 JI ? *JI : spmat(), R.alpha_pri, R.alpha_dual, mu_target,
                 centrality, use_shifted, tau_shift, bound_shift, Sg);
-
             auto corr_res = solve_KKT_(
                 W, rhs_corr_x, JE, std::nullopt,
                 get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
-
             R.dx += corr_res.dx;
             if (JE && corr_res.dy.size() > 0)
                 R.dnu += corr_res.dy;
-
             if (mI > 0 && JI) {
                 R.ds = -(r_pI.value() + (*JI) * R.dx);
                 for (int i = 0; i < mI; ++i) {
@@ -1532,11 +1530,9 @@ private:
             }
             std::tie(R.dzL, R.dzU) = detail::dz_bounds_from_dx_vec(
                 R.dx, zL, zU, B, bound_shift, use_shifted, mu_target, true);
-
             std::tie(R.alpha_pri, R.alpha_dual) = compute_gondzio_step_lengths(
                 s, R.ds, lam, R.dlam, zL, R.dzL, zU, R.dzU, R.dx, B, tau_pri,
                 tau_dual);
-
             R.correction_count++;
             R.use_correction = true;
         }
