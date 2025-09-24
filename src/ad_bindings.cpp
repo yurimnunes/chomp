@@ -35,8 +35,8 @@
 #include <vector>
 
 // if you use tsl::robin_* elsewhere, keep includes in your project build.
-#include "../../third_party/robin_map.h"
-#include "../../third_party/robin_set.h"
+#include "../third_party/robin_map.h"
+#include "../third_party/robin_set.h"
 #include "../include/ad/ADBindings.h" // pyu, pyconv
 
 // ---------- Module ----------
