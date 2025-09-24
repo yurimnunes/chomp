@@ -87,9 +87,9 @@ public:
         const dvec g0 = model_->get_g().value();
 
         spmat JI =
-            (mI > 0) ? model_->get_JI().value().sparseView() : spmat(mI, n);
+            (mI > 0) ? model_->get_JI().value() : spmat(mI, n);
         spmat JE =
-            (mE > 0) ? model_->get_JE().value().sparseView() : spmat(mE, n);
+            (mE > 0) ? model_->get_JE().value() : spmat(mE, n);
         dvec cI = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
         dvec cE = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
 
@@ -147,9 +147,9 @@ public:
         const double f1 = model_->get_f().value();
         const dvec g1 = model_->get_g().value();
         spmat JI1 =
-            (mI > 0) ? model_->get_JI().value().sparseView() : spmat(mI, n);
+            (mI > 0) ? model_->get_JI().value() : spmat(mI, n);
         spmat JE1 =
-            (mE > 0) ? model_->get_JE().value().sparseView() : spmat(mE, n);
+            (mE > 0) ? model_->get_JE().value() : spmat(mE, n);
         dvec cI1 = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
         dvec cE1 = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
 

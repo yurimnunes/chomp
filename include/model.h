@@ -29,7 +29,7 @@
 struct ADCompiled {
     std::function<double(const dvec &)> val;
     std::function<dvec(const dvec &)> grad;
-    std::function<dmat(const spmat &)> hess;
+    std::function<spmat(const spmat &)> hess;
 };
 
 
@@ -43,7 +43,7 @@ struct EvalEntry {
 
     std::optional<double> f;
     std::optional<dvec> g, cI, cE;
-    std::optional<dmat> JI, JE;
+    std::optional<spmat> JI, JE;
     std::optional<spmat> H; // Hessian
     
     // Add access tracking for LRU
@@ -159,8 +159,6 @@ private:
 // ============================================================================
 class ModelC {
 public:
-    using Ret = std::unordered_map<std::string,
-                                   std::variant<double, dvec, dmat, spmat>>;
 
     EvalEntry current_vals = EvalEntry();
 
@@ -168,8 +166,8 @@ public:
     std::optional<dvec> get_g() const { return current_vals.g; }
     std::optional<dvec> get_cI() const { return current_vals.cI; }
     std::optional<dvec> get_cE() const { return current_vals.cE; }
-    std::optional<dmat> get_JI() const { return current_vals.JI; }
-    std::optional<dmat> get_JE() const { return current_vals.JE; }
+    std::optional<spmat> get_JI() const { return current_vals.JI; }
+    std::optional<spmat> get_JE() const { return current_vals.JE; }
     std::optional<dvec> get_lb() const { return lb_; }
     std::optional<dvec> get_ub() const { return ub_; }
 
@@ -263,7 +261,7 @@ public:
         // inequalities
         if ((wants("cI") || wants("JI")) && (!e->cI || !e->JI) && mI_ > 0) {
             auto [vals, J] =
-                batch_value_grad_from_gradfns_eigen(cI_compiled_, x);
+                batch_value_grad_from_gradfns_sparse(cI_compiled_, x);
             e->cI = vals;
             e->JI = J;
             current_vals.cI = e->cI;
@@ -273,7 +271,7 @@ public:
         // equalities
         if ((wants("cE") || wants("JE")) && (!e->cE || !e->JE) && mE_ > 0) {
             auto [vals, J] =
-                batch_value_grad_from_gradfns_eigen(cE_compiled_, x);
+                batch_value_grad_from_gradfns_sparse(cE_compiled_, x);
             e->cE = vals;
             e->JE = J;
             current_vals.cE = e->cE;

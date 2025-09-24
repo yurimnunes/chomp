@@ -464,10 +464,10 @@ public:
         // For Jacobians, do NOT assign to nb::object. Extract as (dense|sparse)
         // and normalize. If the producer may return either dense or sparse,
         // accept both:
-        spmat JI = (mI > 0) ? m_->get_JI().value().sparseView()
+        spmat JI = (mI > 0) ? m_->get_JI().value()
                             : spmat(mI, n); // empty OK
 
-        spmat JE = (mE > 0) ? m_->get_JE().value().sparseView()
+        spmat JE = (mE > 0) ? m_->get_JE().value()
                             : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE");
 
@@ -745,9 +745,9 @@ public:
         dvec cE_new = (mE > 0) ? m_->get_cE().value() : dvec::Zero(mE); // FIX 4
         IP_LAP("extract f,g,cI,cE new");
 
-        spmat JI_new = (mI > 0) ? m_->get_JI().value().sparseView()
+        spmat JI_new = (mI > 0) ? m_->get_JI().value()
                                 : spmat(mI, n); // empty OK
-        spmat JE_new = (mE > 0) ? m_->get_JE().value().sparseView()
+        spmat JE_new = (mE > 0) ? m_->get_JE().value()
                                 : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE new");
 

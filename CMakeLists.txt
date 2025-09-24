@@ -104,14 +104,20 @@ find_package(Python3 3.13
   REQUIRED
 )
 
+# define include dir python globally
+include_directories(${Python3_INCLUDE_DIRS})
+
+# nanobind (always via CPM is fine; it uses Python3 variables)
 # nanobind (always via CPM is fine; it uses Python3 variables)
 set(NANOBIND_TAG v2.9.2 CACHE STRING "nanobind version/tag to fetch via CPM")
 CPMAddPackage(
   NAME nanobind
   GITHUB_REPOSITORY wjakob/nanobind
   GIT_TAG ${NANOBIND_TAG}
+  OPTIONS "NB_STATIC=ON"
 )
-# nanobind provides nanobind_add_module()
+
+
 
 # Spectra (header-only; CPM + INTERFACE target alias)
 if(AD_ENABLE_SPECTRA)
@@ -304,6 +310,10 @@ ad_add_nanobind_module(chomp
   src/ad/Variable.cpp
 )
 ad_use_cholmod(chomp)
+# add python dir to ad module search path
+target_include_directories(chomp PRIVATE ${Python3_INCLUDE_DIRS})
+target_include_directories(ad PRIVATE ${Python3_INCLUDE_DIRS})
+
 # _ad_link_gurobi(chomp)
 # link openmp to chomp if available
 

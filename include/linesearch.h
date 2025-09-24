@@ -144,8 +144,8 @@ public:
         const dvec g0 = model->get_g().value();
         const std::optional<dvec> cE0 = model->get_cE();
         const std::optional<dvec> cI0 = model->get_cI();
-        const std::optional<dmat> JE0 = model->get_JE();
-        const std::optional<dmat> JI0 = model->get_JI();
+        const std::optional<spmat> JE0 = model->get_JE();
+        const std::optional<spmat> JI0 = model->get_JI();
 
         std::cout << "Line search eval done.\n";
 

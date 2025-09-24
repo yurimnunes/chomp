@@ -39,6 +39,10 @@
 
 namespace nb = nanobind;
 using namespace nb::literals;
+using dvec = Eigen::VectorXd;
+using dmat = Eigen::MatrixXd;
+using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
+
 
 // ---------- Memory pool for hot allocations ----------
 static std::pmr::unsynchronized_pool_resource g_pool{
@@ -1364,8 +1368,6 @@ batch_value_grad_from_gradfns(const std::vector<std::shared_ptr<GradFn>> &gfs,
 
     return {std::move(vals), std::move(J)};
 }
-using dvec = Eigen::VectorXd;
-using dmat = Eigen::MatrixXd;
 
 static inline std::pair<dvec, dmat> batch_value_grad_from_gradfns_eigen(
     const std::vector<std::shared_ptr<GradFn>> &gfs, const dvec &x) {
@@ -1413,6 +1415,86 @@ static inline std::pair<dvec, dmat> batch_value_grad_from_gradfns_eigen(
         }
     }
 
+    return {std::move(vals), std::move(J)};
+}
+
+// Returns values (m) and sparse Jacobian J (m x n) assembled directly.
+// tol: keep entries with |grad| > tol (use 0.0 to keep exact nonzeros)
+// reserve_nnz_per_row: optional hint to pre-reserve triplets
+
+static inline std::pair<dvec, spmat>
+batch_value_grad_from_gradfns_sparse(const std::vector<std::shared_ptr<GradFn>> &gfs,
+                                     const dvec &x,
+                                     double tol = 0.0,
+                                     int reserve_nnz_per_row = 0) {
+    const Eigen::Index m = static_cast<Eigen::Index>(gfs.size());
+    const Eigen::Index n = x.size();
+
+    if (m == 0) {
+        return {dvec(0), spmat(0, n)};
+    }
+
+    // sanity: all arities must match x.size()
+    for (const auto &gf : gfs) {
+        if (!gf)
+            throw std::invalid_argument("batch_valgrad: null GradFn");
+        if (static_cast<Eigen::Index>(gf->var_nodes.size()) != n)
+            throw std::invalid_argument("batch_valgrad: inconsistent arity");
+    }
+
+    dvec vals(m);
+    spmat J(m, n);
+
+    using SIndex = typename spmat::StorageIndex;
+    std::vector<Eigen::Triplet<double, SIndex>> triplets;
+    {
+        // reserve a sensible amount of space to avoid re-allocations
+        const Eigen::Index hint_per_row =
+            (reserve_nnz_per_row > 0)
+                ? static_cast<Eigen::Index>(reserve_nnz_per_row)
+                : std::min<Eigen::Index>(n, 64);
+        triplets.reserve(static_cast<size_t>(m * hint_per_row));
+
+        nb::gil_scoped_release nogil;
+
+        for (Eigen::Index j = 0; j < m; ++j) {
+            auto &gf = gfs[static_cast<size_t>(j)];
+
+            // set inputs
+            for (Eigen::Index i = 0; i < n; ++i)
+                gf->var_nodes[static_cast<size_t>(i)]->value = x[i];
+
+            // fused value + grad
+            gf->g->resetGradients();
+            gf->g->resetForwardPass();
+            gf->g->computeForwardPass();
+            vals[j] = gf->expr_root->value;
+
+            set_epoch_value(gf->expr_root->gradient, gf->expr_root->grad_epoch,
+                            gf->g->cur_grad_epoch_, 1.0);
+            gf->g->initiateBackwardPass(gf->expr_root);
+
+            // append sparse row j
+            if (tol <= 0.0) {
+                for (Eigen::Index i = 0; i < n; ++i) {
+                    const double g = gf->var_nodes[static_cast<size_t>(i)]->gradient;
+                    if (g != 0.0)
+                        triplets.emplace_back(static_cast<SIndex>(j),
+                                              static_cast<SIndex>(i), g);
+                }
+            } else {
+                for (Eigen::Index i = 0; i < n; ++i) {
+                    const double g = gf->var_nodes[static_cast<size_t>(i)]->gradient;
+                    if (std::abs(g) > tol)
+                        triplets.emplace_back(static_cast<SIndex>(j),
+                                              static_cast<SIndex>(i), g);
+                }
+            }
+        }
+    }
+
+    J.setFromTriplets(triplets.begin(), triplets.end());
+    J.makeCompressed();
     return {std::move(vals), std::move(J)};
 }
 
