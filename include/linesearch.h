@@ -2,7 +2,8 @@
 // nanobind + Eigen port of line_searcher_pybind.cc
 //
 // Requires:
-//   - nanobind (with Eigen bridge): <nanobind/nanobind.h>, <nanobind/eigen/dense.h>
+//   - nanobind (with Eigen bridge): <nanobind/nanobind.h>,
+//   <nanobind/eigen/dense.h>
 //   - Eigen
 //   - Your Funnel classes in "funnel.h"
 
@@ -16,8 +17,8 @@
 #include <tuple>
 #include <utility>
 
-#include <nanobind/nanobind.h>
 #include <nanobind/eigen/dense.h>
+#include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
 
 #include "model.h"
@@ -29,15 +30,15 @@ using dvec = Eigen::VectorXd;
 struct LSConfig {
     double ls_backtrack{0.5};
     double ls_armijo_f{1e-4};
-    int    ls_max_iter{20};
+    int ls_max_iter{20};
     double ls_min_alpha{1e-12};
     double ls_wolfe_c{0.9}; // not used here, kept for parity
     double ip_fraction_to_boundary_tau{0.995};
     double ls_theta_restoration{1e3};
-    int    max_soc{4};
-    double kappa_soc_min{0.1};   // Minimum kappa_soc for adaptive strategy
-    double kappa_soc_max{0.99};  // Maximum kappa_soc for adaptive strategy
-    double kappa_soc_base{0.5};  // Base kappa_soc when theta_t/theta0 is large
+    int max_soc{4};
+    double kappa_soc_min{0.1};  // Minimum kappa_soc for adaptive strategy
+    double kappa_soc_max{0.99}; // Maximum kappa_soc for adaptive strategy
+    double kappa_soc_base{0.5}; // Base kappa_soc when theta_t/theta0 is large
 };
 
 // ---------------- small helpers ----------------
@@ -92,13 +93,13 @@ static inline dvec matvec(const nb::object &M, const dvec &v) {
     return nb::cast<dvec>(mv);
 }
 
-// ---------------- line searcher (holds Python filter, C++ funnel) ----------------
+// ---------------- line searcher (holds Python filter, C++ funnel)
+// ----------------
 class LineSearcher {
 public:
     LineSearcher(nb::object cfg, nb::object filter = nb::none(),
                  std::shared_ptr<Funnel> funnel = nullptr)
-        : cfg_obj_(std::move(cfg)),
-          filter_(std::move(filter)),
+        : cfg_obj_(std::move(cfg)), filter_(std::move(filter)),
           funnel_(std::move(funnel)) {
         // sanitize/load cfg once (mirror python guards)
         cfg_.ls_backtrack = std::clamp(
@@ -136,8 +137,7 @@ public:
            std::optional<double> theta0_opt = std::nullopt,
            double alpha_max = 1.0) const {
         // --- base eval (single call; request only needed pieces)
-        std::vector<std::string> comp_names{
-            "f", "g", "cE", "cI", "JE", "JI"};
+        std::vector<std::string> comp_names{"f", "g", "cE", "cI", "JE", "JI"};
 
         model->eval_all(x, comp_names);
         const double f0 = model->get_f().value();
@@ -264,9 +264,8 @@ public:
                 if (phi_t <= phi0 + cfg_.ls_armijo_f * alpha * d_phi) {
                     auto cE_t = model->get_cE();
                     auto cI_t = model->get_cI();
-                    const double thE_t =
-                        cE_t
-                            ? cE_t.value().array().abs().sum() : 0.0; // cE_t.is_none() ? 0.0
+                    const double thE_t = cE_t ? cE_t.value().array().abs().sum()
+                                              : 0.0; // cE_t.is_none() ? 0.0
                     double thI_t = 0.0;
                     if (cI_t) {
                         dvec vI_t = cI_t.value();
@@ -298,146 +297,216 @@ public:
                 ++it;
                 continue;
             }
-            // // Try second-order corrections if conditions met
-            // if (it == 0 && theta_t >= theta0) {
-            //     double theta_last = theta_t;
-            //     auto cE_t_current = model->get_cE() ? model->get_cE().value() : dvec();
-            //     auto cI_t_current = model->get_cI() ? model->get_cI().value() : dvec();
-            //     dvec s_t_current = s_t;
-            //     int soc_count = 0;
-            //     while (soc_count < cfg_.max_soc) {
-            //         ++soc_count;
-            //         // Compute adaptive kappa_soc
-            //         double kappa_soc = cfg_.kappa_soc_base;
-            //         if (theta0 > 1e-8) { // Avoid division by near-zero
-            //             const double theta_ratio = theta_t / theta0;
-            //             if (theta_ratio > 10.0) {
-            //                 kappa_soc = cfg_.kappa_soc_min; // strict reduction
-            //             } else if (theta_ratio > 1.0) {
-            //                 // Linear interpolation between min and max
-            //                 kappa_soc =
-            //                     cfg_.kappa_soc_min +
-            //                     (cfg_.kappa_soc_max - cfg_.kappa_soc_min) *
-            //                         (1.0 - (theta_ratio - 1.0) / 9.0);
-            //             } else {
-            //                 kappa_soc = cfg_.kappa_soc_max; // loose reduction
-            //             }
-            //         }
-            //         // Relax kappa_soc for later SOC iterations
-            //         kappa_soc = std::min(kappa_soc + 0.1 * (soc_count - 1),
-            //                              cfg_.kappa_soc_max);
-            //         // Compute c_soc
-            //         dvec c_soc_E = dvec();
-            //         if (cE0) {
-            //             c_soc_E = alpha * cE0.value() +
-            //                       cE_t_current;
-            //         }
-            //         dvec c_soc_I = dvec();
-            //         if (cI0) {
-            //             dvec ci0_plus_s = cI0.value() + s;
-            //             dvec ci_t_plus_s_t =
-            //                 cI_t_current + s_t_current;
-            //             c_soc_I = alpha * ci0_plus_s + ci_t_plus_s_t;
-            //         }
-            //         // Call model->compute_soc_step(c_soc_E, c_soc_I, mu)
-            //         nb::tuple soc_res;
-            //         try {
-            //             soc_res = nb::cast<nb::tuple>(
-            //                 model->attr("compute_soc_step")(c_soc_E, c_soc_I, mu));
-            //         } catch (const std::exception &) {
-            //             break;
-            //         }
-            //         dvec dx_cor = to_vec_opt(soc_res[0]);
-            //         dvec ds_cor = to_vec_opt(soc_res[1]);
-            //         if (dx_cor.size() == 0 || ds_cor.size() == 0)
-            //             break;
-            //         // Fraction-to-boundary for corrected direction
-            //         double alpha_soc = 1.0;
-            //         for (Eigen::Index i = 0; i < ds_cor.size(); ++i) {
-            //             if (ds_cor[i] < 0.0) {
-            //                 const double am =
-            //                     (1.0 - cfg_.ip_fraction_to_boundary_tau) *
-            //                     s[i] / (-ds_cor[i]);
-            //                 if (am < alpha_soc)
-            //                     alpha_soc = am;
-            //             }
-            //         }
-            //         alpha_soc = std::max(alpha_soc, cfg_.ls_min_alpha);
-            //         // Trial point for SOC
-            //         dvec x_t_soc = x + alpha_soc * dx_cor;
-            //         dvec s_t_soc = s + alpha_soc * ds_cor;
-            //         if ((s_t_soc.array() <= 0.0).any())
-            //             break;
-            //         // Eval at SOC trial
-            //         nb::dict d_t_soc;
-            //         try {
-            //             nb::list comps_t;
-            //             std::vector<std::string> base_comps{
-            //                 "f", "cE", "cI"};
-            //             model->eval_all(x_t_soc, base_comps);
-            //         } catch (const std::exception &) {
-            //             continue;
-            //         }
-            //         const double f_t_soc = nb::cast<double>(d_t_soc["f"]);
-            //         if (!std::isfinite(f_t_soc))
-            //             continue;
-            //         const double phi_t_soc =
-            //             f_t_soc -
-            //             mu * (s_t_soc.array()
-            //                       .unaryExpr([&](double v) {
-            //                           return std::log(std::max(v, barrier_eps));
-            //                       })
-            //                       .sum());
-            //         if (!std::isfinite(phi_t_soc))
-            //             continue;
-            //         auto cE_t_soc = model->get_cE() ? model->get_cE().value() : dvec();
-            //         auto cI_t_soc = model->get_cI() ? model->get_cI().value
-            //         const double thE_t_soc =
-            //             cE_t_soc.is_none()
-            //                 ? 0.0
-            //                 : nb::cast<dvec>(cE_t_soc).array().abs().sum();
-            //         double thI_t_soc = 0.0;
-            //         if (!cI_t_soc.is_none()) {
-            //             dvec vI_t_soc = nb::cast<dvec>(cI_t_soc);
-            //             thI_t_soc =
-            //                 (vI_t_soc.array() + s_t_soc.array()).abs().sum();
-            //         }
-            //         const double theta_t_soc = thE_t_soc + thI_t_soc;
-            //         // Check sufficient reduction in theta for continuing SOC
-            //         if (theta_t_soc >= kappa_soc * theta_last)
-            //             break;
-            //         // Update for next iteration
-            //         theta_last = theta_t_soc;
-            //         cE_t_current = cE_t_soc;
-            //         cI_t_current = cI_t_soc;
-            //         s_t_current = s_t_soc;
-            //         // Armijo on φ using original alpha
-            //         if (phi_t_soc > phi0 + cfg_.ls_armijo_f * alpha * d_phi)
-            //             continue;
-            //         // Check acceptability
-            //         bool acceptable_ok_soc = true;
-            //         if (funnel_) {
-            //             acceptable_ok_soc = funnel_->is_acceptable(
-            //                 theta0, f0, theta_t_soc, f_t_soc, pred_df,
-            //                 pred_dtheta);
-            //         } else if (filter_ && !filter_.is_none()) {
-            //             acceptable_ok_soc = nb::cast<bool>(
-            //                 filter_.attr("is_acceptable")(theta_t_soc, f_t_soc));
-            //         }
-            //         if (acceptable_ok_soc) {
-            //             if (funnel_) {
-            //                 (void)funnel_->add_if_acceptable(
-            //                     theta0, f0, theta_t_soc, f_t_soc, pred_df,
-            //                     pred_dtheta);
-            //             } else if (filter_ && !filter_.is_none()) {
-            //                 (void)filter_.attr("add_if_acceptable")(theta_t_soc,
-            //                                                         f_t_soc);
-            //             }
-            //             return {alpha_soc, it + soc_count, false, dx_cor,
-            //                     ds_cor};
-            //         }
-            //     }
-            // }
+            // Try second-order corrections if conditions met (use ModelC API)
+            if (it == 0 && theta_t >= theta0 && cfg_.max_soc > 0) {
+                // Current residuals at (x_t, s_t)
+                dvec cE_t = cE0 ? model->get_cE().value() : dvec();
+                dvec cI_t = cI0 ? model->get_cI().value() : dvec();
+                dvec s_t_cur = s + alpha * ds;
+
+                // Guard sizes
+                auto nnzE = (cE_t.size() ? cE_t.size() : 0);
+                auto nnzI = (cI_t.size() ? cI_t.size() : 0);
+
+                double theta_last = theta_t;
+                int soc_count = 0;
+
+                while (soc_count < cfg_.max_soc) {
+                    ++soc_count;
+
+                    // --- Adaptive kappa_soc (like before, but entirely local)
+                    double kappa_soc = cfg_.kappa_soc_base;
+                    if (theta0 > 1e-8) {
+                        const double ratio = theta_last / theta0;
+                        if (ratio > 10.0) {
+                            kappa_soc = cfg_.kappa_soc_min; // strict
+                        } else if (ratio > 1.0) {
+                            // Linear interp in (1,10] from min→max
+                            kappa_soc =
+                                cfg_.kappa_soc_min +
+                                (cfg_.kappa_soc_max - cfg_.kappa_soc_min) *
+                                    (1.0 - (ratio - 1.0) / 9.0);
+                        } else {
+                            kappa_soc = cfg_.kappa_soc_max; // loose
+                        }
+                    }
+                    // Relax for later SOC iterations
+                    kappa_soc = std::min(kappa_soc + 0.1 * (soc_count - 1),
+                                         cfg_.kappa_soc_max);
+
+                    // --- Build/refresh Jacobians at x_t
+                    // We use a fresh eval so J* correspond to x_t (not x).
+                    {
+                        std::vector<std::string> compsJ{"JE", "JI"};
+                        model->eval_all(x + alpha * dx, compsJ);
+                    }
+                    dmat JE_t = (JE0 && nnzE) ? model->get_JE().value()
+                                              : dmat((Eigen::Index)0,
+                                                     (Eigen::Index)x.size());
+                    dmat JI_t = (JI0 && nnzI) ? model->get_JI().value()
+                                              : dmat((Eigen::Index)0,
+                                                     (Eigen::Index)x.size());
+
+                    // Right-hand side residuals for LS:
+                    // rE = cE(x_t), rI = cI(x_t) + s_t
+                    dvec rE = cE_t;
+                    dvec rI = (nnzI ? (cI_t + s_t_cur) : dvec());
+
+                    // If both empty, nothing to correct
+                    if ((rE.size() == 0) && (rI.size() == 0))
+                        break;
+
+                    // --- Form normal equations: (A^T A) dx_cor = -A^T r
+                    // where A = [JE_t; JI_t], r = [rE; rI]
+                    const Eigen::Index n = static_cast<Eigen::Index>(x.size());
+                    dmat AtA = dmat::Zero(n, n);
+                    dvec At_r = dvec::Zero(n);
+
+                    if (rE.size() && JE_t.rows() == rE.size()) {
+                        AtA.noalias() += JE_t.transpose() * JE_t;
+                        At_r.noalias() += JE_t.transpose() * rE;
+                    }
+                    if (rI.size() && JI_t.rows() == rI.size()) {
+                        AtA.noalias() += JI_t.transpose() * JI_t;
+                        At_r.noalias() += JI_t.transpose() * rI;
+                    }
+
+                    // Small Tikhonov if needed for numerical safety
+                    const double eps_reg = 1e-12;
+                    AtA.diagonal().array() += eps_reg;
+
+                    // Solve normal equations
+                    dvec dx_cor;
+                    {
+                        Eigen::LDLT<dmat> ldlt(AtA);
+                        if (ldlt.info() != Eigen::Success) {
+                            // Fallback to QR if LDLT fails
+                            dx_cor = (-AtA).colPivHouseholderQr().solve(At_r);
+                        } else {
+                            dx_cor = ldlt.solve(-At_r);
+                        }
+                    }
+
+                    // Slack correction: ds_cor = -(cI_t + s_t + JI_t dx_cor)
+                    dvec ds_cor;
+                    if (rI.size()) {
+                        dvec JI_dx = (JI_t.rows() ? (JI_t * dx_cor) : dvec());
+                        ds_cor = -(rI + JI_dx);
+                    } else {
+                        ds_cor = dvec(); // no inequality side
+                    }
+
+                    // Fraction-to-boundary for corrected direction (from
+                    // current s)
+                    double alpha_soc = 1.0;
+                    if (ds_cor.size()) {
+                        for (Eigen::Index i = 0; i < ds_cor.size(); ++i) {
+                            if (ds_cor[i] < 0.0) {
+                                const double am =
+                                    (1.0 - cfg_.ip_fraction_to_boundary_tau) *
+                                    s[i] / (-ds_cor[i]);
+                                if (am < alpha_soc)
+                                    alpha_soc = am;
+                            }
+                        }
+                        alpha_soc = std::max(alpha_soc, cfg_.ls_min_alpha);
+                    }
+
+                    // Trial with SOC step
+                    const dvec x_t_soc = x + alpha_soc * dx_cor;
+                    const dvec s_t_soc = s + alpha_soc * ds_cor;
+                    if (s_t_soc.size() && (s_t_soc.array() <= 0.0).any())
+                        break;
+
+                    // Evaluate f, cE, cI at (x_t_soc)
+                    double f_t_soc = 0.0;
+                    double theta_t_soc = 0.0;
+                    try {
+                        std::vector<std::string> comps_soc{"f", "cE", "cI"};
+                        model->eval_all(x_t_soc, comps_soc);
+
+                        f_t_soc = model->get_f().value();
+                        if (!std::isfinite(f_t_soc))
+                            continue;
+
+                        dvec cE_soc =
+                            model->get_cE() ? model->get_cE().value() : dvec();
+                        dvec cI_soc =
+                            model->get_cI() ? model->get_cI().value() : dvec();
+
+                        const double thE_soc =
+                            cE_soc.size() ? cE_soc.array().abs().sum() : 0.0;
+                        double thI_soc = 0.0;
+                        if (cI_soc.size()) {
+                            thI_soc =
+                                (cI_soc.array() + s_t_soc.array()).abs().sum();
+                        }
+                        theta_t_soc = thE_soc + thI_soc;
+                    } catch (const std::exception &) {
+                        continue;
+                    }
+
+                    // Sufficient infeasibility reduction?
+                    if (theta_t_soc >= kappa_soc * theta_last)
+                        break;
+
+                    // Armijo on φ with corrected step (use same d_phi slope)
+                    const double phi_t_soc =
+                        f_t_soc -
+                        mu * (s_t_soc.array()
+                                  .unaryExpr([&](double v) {
+                                      return std::log(std::max(v, barrier_eps));
+                                  })
+                                  .sum());
+                    if (!std::isfinite(phi_t_soc) ||
+                        phi_t_soc > phi0 + cfg_.ls_armijo_f * alpha * d_phi) {
+                        // Not acceptable by merit decrease → try next SOC or
+                        // quit
+                        continue;
+                    }
+
+                    // Acceptability (filter/funnel)
+                    bool acceptable_ok_soc = true;
+                    if (funnel_) {
+                        acceptable_ok_soc = funnel_->is_acceptable(
+                            theta0, f0, theta_t_soc, f_t_soc, pred_df,
+                            pred_dtheta);
+                    } else if (filter_ && !filter_.is_none()) {
+                        acceptable_ok_soc = nb::cast<bool>(filter_.attr(
+                            "is_acceptable")(theta_t_soc, f_t_soc));
+                    }
+
+                    if (acceptable_ok_soc) {
+                        if (funnel_) {
+                            (void)funnel_->add_if_acceptable(
+                                theta0, f0, theta_t_soc, f_t_soc, pred_df,
+                                pred_dtheta);
+                        } else if (filter_ && !filter_.is_none()) {
+                            (void)filter_.attr("add_if_acceptable")(theta_t_soc,
+                                                                    f_t_soc);
+                        }
+                        // Return corrected step
+                        return {alpha_soc, it + soc_count, false, dx_cor,
+                                ds_cor};
+                    }
+
+                    // Prepare for a possible next SOC round:
+                    theta_last = theta_t_soc;
+                    // Refresh residuals at (x_t_soc) for next iteration
+                    try {
+                        std::vector<std::string> comps_next{"cE", "cI"};
+                        model->eval_all(x_t_soc, comps_next);
+                        cE_t =
+                            model->get_cE() ? model->get_cE().value() : dvec();
+                        cI_t =
+                            model->get_cI() ? model->get_cI().value() : dvec();
+                        s_t_cur = s_t_soc;
+                    } catch (const std::exception &) {
+                        break;
+                    }
+                }
+            }
+
             alpha *= cfg_.ls_backtrack;
             ++it;
         }
