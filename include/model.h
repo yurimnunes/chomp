@@ -21,7 +21,7 @@
 #include <variant>
 #include <vector>
 
-#include "../src/ad_bindings.cpp" // GradFn, LagHessFn, compile_*
+#include "ad/ADBindings.h" // GradFn, LagHessFn, compile_*
 #include "definitions.h"
 
 // ============================================================================
@@ -32,8 +32,11 @@ struct ADCompiled {
     std::function<dmat(const dvec &)> hess;
 };
 
+
 // ============================================================================
-// Cached results for a given x
+// Simple LRU cache for evaluation results
+// ============================================================================
+// Cached results for a given x (keep original structure)
 struct EvalEntry {
     dvec x;
     std::size_t hash{0};
@@ -41,76 +44,114 @@ struct EvalEntry {
     std::optional<double> f;
     std::optional<dvec> g, cI, cE;
     std::optional<dmat> JI, JE, H;
+    
+    // Add access tracking for LRU
+    mutable int access_order{0};
+    
+    // Move operations for efficiency
+    EvalEntry() = default;
+    EvalEntry(EvalEntry&& other) noexcept = default;
+    EvalEntry& operator=(EvalEntry&& other) noexcept = default;
 };
 
 // ============================================================================
-// Simple LRU cache for evaluation results
-// ============================================================================
+// Improved LRU cache with better performance
 class EvalCache {
 public:
-    explicit EvalCache(std::size_t capacity = 8) : capacity_(capacity) {}
+    explicit EvalCache(std::size_t capacity = 16) 
+        : capacity_(capacity), current_access_(0) {
+        entries_.reserve(capacity);
+    }
 
-    // get existing entry or nullptr
-    EvalEntry *find(const Eigen::Ref<const dvec> &x) {
+    // Find existing entry or nullptr
+    EvalEntry* find(const Eigen::Ref<const dvec>& x) {
         std::size_t h = hash_vec(x);
-        auto it = map_.find(h);
-        if (it == map_.end())
-            return nullptr;
-
-        // verify exact match (hash collision safe)
-        for (auto &entry : entries_) {
-            if (entry.hash == h && entry.x.size() == x.size() &&
+        
+        // Linear search is faster for small caches due to cache locality
+        for (auto& entry : entries_) {
+            if (entry.hash == h && entry.x.size() == x.size() && 
                 entry.x.isApprox(x, 1e-14)) {
-                // move to front (LRU)
-                promote(h);
+                entry.access_order = ++current_access_;
                 return &entry;
             }
         }
         return nullptr;
     }
 
-    // insert new entry
-    EvalEntry &insert(const Eigen::Ref<const dvec> &x) {
+    // Insert new entry
+    EvalEntry& insert(const Eigen::Ref<const dvec>& x) {
         std::size_t h = hash_vec(x);
-        if (entries_.size() >= capacity_) {
-            // evict oldest
-            auto old_h = order_.back();
-            order_.pop_back();
-            map_.erase(old_h);
-            entries_.pop_back();
+        
+        if (entries_.size() < capacity_) {
+            entries_.emplace_back();
+            EvalEntry& entry = entries_.back();
+            entry.x = x;
+            entry.hash = h;
+            entry.access_order = ++current_access_;
+            return entry;
         }
-        entries_.push_front(EvalEntry{x, h});
-        order_.push_front(h);
-        map_[h] = order_.begin();
-        return entries_.front();
+        
+        // Find LRU entry to replace
+        auto lru_it = std::min_element(entries_.begin(), entries_.end(),
+            [](const EvalEntry& a, const EvalEntry& b) { 
+                return a.access_order < b.access_order; 
+            });
+            
+        // Reset the entry
+        lru_it->x = x;
+        lru_it->hash = h;
+        lru_it->access_order = ++current_access_;
+        
+        // Clear cached values
+        lru_it->f.reset();
+        lru_it->g.reset();
+        lru_it->cI.reset();
+        lru_it->cE.reset();
+        lru_it->JI.reset();
+        lru_it->JE.reset();
+        lru_it->H.reset();
+        
+        return *lru_it;
     }
 
-    static std::size_t hash_vec(const Eigen::Ref<const dvec> &v) {
-        const double *data = v.data();
-        std::size_t h = 1469598103934665603ull;
-        for (int i = 0; i < v.size(); ++i) {
-            auto bits = std::bit_cast<std::uint64_t>(data[i]);
-            h ^= bits;
-            h *= 1099511628211ull;
+    // Improved hash function with better distribution
+    static std::size_t hash_vec(const Eigen::Ref<const dvec>& v) {
+        constexpr std::size_t FNV_OFFSET_BASIS = 14695981039346656037ULL;
+        constexpr std::size_t FNV_PRIME = 1099511628211ULL;
+        
+        std::size_t hash = FNV_OFFSET_BASIS;
+        const double* data = v.data();
+        const std::size_t size = v.size() * sizeof(double);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+        
+        for (std::size_t i = 0; i < size; ++i) {
+            hash ^= bytes[i];
+            hash *= FNV_PRIME;
         }
-        return h;
+        return hash;
+    }
+
+    // Make capacity accessible for adaptive sizing
+    std::size_t capacity() const { return capacity_; }
+    void set_capacity(std::size_t new_capacity) {
+        capacity_ = new_capacity;
+        if (entries_.size() > capacity_) {
+            // Remove oldest entries
+            std::sort(entries_.begin(), entries_.end(),
+                [](const EvalEntry& a, const EvalEntry& b) {
+                    return a.access_order > b.access_order;
+                });
+            entries_.resize(capacity_);
+        }
+        entries_.reserve(capacity_);
     }
 
 private:
-    void promote(std::size_t h) {
-        auto it = map_.find(h);
-        if (it == map_.end())
-            return;
-        order_.erase(it->second);
-        order_.push_front(h);
-        map_[h] = order_.begin();
-    }
-
     std::size_t capacity_;
-    std::list<EvalEntry> entries_; // actual storage
-    std::list<std::size_t> order_; // LRU order
-    std::unordered_map<std::size_t, std::list<std::size_t>::iterator> map_;
+    std::vector<EvalEntry> entries_;
+    int current_access_;
 };
+
 
 // ============================================================================
 // ModelC with LRU multi-point cache

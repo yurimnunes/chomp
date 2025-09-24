@@ -29,10 +29,10 @@ using VariablePtr = std::shared_ptr<Variable>;
 namespace {
 
 thread_local std::vector<size_t> g_scratch_bases; // new
-inline void ensure_base_size(size_t n) {
-    if (g_scratch_bases.size() < n)
-        g_scratch_bases.resize(n * 2);
-}
+// inline void ensure_base_size(size_t n) {
+//     if (g_scratch_bases.size() < n)
+//         g_scratch_bases.resize(n * 2);
+// }
 
 inline bool validate_nary_inputs(const std::vector<ADNodePtr> &inputs,
                                  std::string_view op_name,
@@ -68,13 +68,13 @@ thread_local std::vector<double> g_scratch_values;
 thread_local std::vector<double> g_scratch_dots;
 thread_local std::vector<double> g_scratch_softmax;
 
-inline void ensure_scratch_size(size_t n) {
-    if (g_scratch_values.size() < n) {
-        g_scratch_values.resize(n * 2);
-        // g_scratch_dots.resize(n * 2);
-        // g_scratch_softmax.resize(n * 2);
-    }
-}
+// inline void ensure_scratch_size(size_t n) {
+//     if (g_scratch_values.size() < n) {
+//         g_scratch_values.resize(n * 2);
+//         // g_scratch_dots.resize(n * 2);
+//         // g_scratch_softmax.resize(n * 2);
+//     }
+// }
 
 #if defined(__AVX2__)
 inline double hsum256_pd(__m256d v) {
@@ -141,10 +141,17 @@ void ADGraph::release_id_(int id) {
     cache_.by_id[id] = nullptr;
     cache_.free_ids.push_back(id);
 }
-
 void ADGraph::link_edge_(int pid, int cid) {
     if (pid == cid)
         return;
+    const int need = std::max(pid, cid) + 1;
+    if ((int)cache_.adj.size() < need)
+        cache_.adj.resize(need);
+    if ((int)cache_.radj.size() < need)
+        cache_.radj.resize(need);
+    if ((int)cache_.indeg.size() < need)
+        cache_.indeg.resize(need, 0);
+
     auto [it, inserted] = cache_.adj[pid].insert(cid);
     if (inserted) {
         cache_.radj[cid].insert(pid);
@@ -555,7 +562,7 @@ void ADGraph::computeForwardPass() {
     for (ADNode *u : cache_.topo) {
         if (!u)
             continue;
-        _dispatch_op(*u, ForwardFunctor{*this, *u});
+        dispatch_op(*u, ForwardFunctor{*this, *u});
     }
     if (cache_.topo.size() != nodes.size()) [[unlikely]]
         std::cerr << "Warning: cycle or dangling inputs in AD graph.\n";
@@ -568,12 +575,13 @@ void ADGraph::initiateBackwardPassFused() {
         ADNode *u = *it;
         if (!u)
             continue;
-        _dispatch_op(*u, BackwardFunctor{*this, *u});
+        dispatch_op(*u, BackwardFunctor{*this, *u});
     }
 }
 
 // ======================== Lane-aware forward/backward ========================
-// Forward lanes: propagate per-lane dot using node AoS primals.
+// ADGraph.cpp - Updated methods using dispatcher
+
 void ADGraph::computeForwardPassWithDotLanes() {
     if (cache_.dirty)
         rebuildCache_();
@@ -586,297 +594,11 @@ void ADGraph::computeForwardPassWithDotLanes() {
         const int uid = u->id;
         const size_t ybase = lanes_.base(uid);
 
-        switch (u->type) {
-        case Operator::Var:
-        case Operator::cte:
-            // variables already have per-lane dots loaded; constants keep 0
-            break;
-
-        case Operator::Add: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
-            std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            for (const auto &inp : u->inputs) {
-                const size_t ibase = lanes_.base(inp->id);
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.dot[ybase + l] += lanes_.dot[ibase + l];
-            }
-            break;
-        }
-
-        case Operator::Subtract: {
-            if (u->inputs.size() != 2)
-                break;
-            const int ia = u->inputs[0]->id, ib = u->inputs[1]->id;
-            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] =
-                    lanes_.dot[abase + l] - lanes_.dot[bbase + l];
-            break;
-        }
-        // drop-in for n-ary Multiply forward lanes
-        case Operator::Multiply: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
-            if (m == 2) { /* keep your fast path */
-            } else {
-                ensure_scratch_size(m);
-                ensure_base_size(m);
-
-                // Preload scalars and bases (lane-independent)
-                size_t zc = 0, zidx = 0;
-                for (size_t j = 0; j < m; ++j) {
-                    const double vj = u->inputs[j]->value;
-                    g_scratch_values[j] = vj;
-                    g_scratch_bases[j] = lanes_.base(u->inputs[j]->id);
-                    if (vj == 0.0 && (++zc == 1))
-                        zidx = j;
-                }
-
-                if (zc >= 2) {
-                    // All zero
-                    std::fill_n(&lanes_.dot[ybase], L, 0.0);
-                    break;
-                }
-
-                if (zc == 1) {
-                    // Only the zero term contributes
-                    double prod_nz = 1.0;
-                    for (size_t j = 0; j < m; ++j)
-                        if (j != zidx)
-                            prod_nz *= g_scratch_values[j];
-                    const size_t zb = g_scratch_bases[zidx];
-                    for (size_t l = 0; l < L; ++l)
-                        lanes_.dot[ybase + l] = lanes_.dot[zb + l] * prod_nz;
-                    break;
-                }
-
-                // zc == 0: use prefix/suffix products (no division in the inner
-                // loop) prefix[i] = v0*...*v_{i-1}, suffix[i] =
-                // v_{i+1}*...*v_{m-1}
-                ensure_scratch_size(3 * m);
-                double *prefix = g_scratch_values.data(); // reuse block 0..m-1
-                double *suffix =
-                    g_scratch_values.data() + m; // reuse block m..2m-1
-                double *contrib = g_scratch_values.data() +
-                                  2 * m; // temp per i (lane-indep coeff)
-
-                prefix[0] = 1.0;
-                for (size_t i = 1; i < m; ++i)
-                    prefix[i] = prefix[i - 1] * u->inputs[i - 1]->value;
-                suffix[m - 1] = 1.0;
-                for (size_t i = m - 1; i-- > 0;)
-                    suffix[i] = suffix[i + 1] * u->inputs[i + 1]->value;
-
-                for (size_t i = 0; i < m; ++i)
-                    contrib[i] = prefix[i] * suffix[i];
-
-                // lanes
-                for (size_t l = 0; l < L; ++l) {
-                    double yd = 0.0;
-                    for (size_t i = 0; i < m; ++i)
-                        yd += contrib[i] * lanes_.dot[g_scratch_bases[i] + l];
-                    lanes_.dot[ybase + l] = yd;
-                }
-            }
-            break;
-        }
-
-        case Operator::Divide: {
-            if (u->inputs.size() != 2)
-                break;
-            const int ia = u->inputs[0]->id, ib = u->inputs[1]->id;
-            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-            const double aval = u->inputs[0]->value, bval = u->inputs[1]->value;
-            if (bval == 0.0) {
-                std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            } else {
-                const double invb2 = 1.0 / (bval * bval);
-                for (size_t l = 0; l < L; ++l) {
-                    const double ad = lanes_.dot[abase + l];
-                    const double bd = lanes_.dot[bbase + l];
-                    lanes_.dot[ybase + l] = (ad * bval - aval * bd) * invb2;
-                }
-            }
-            break;
-        }
-
-        case Operator::Sin: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double cosx = std::cos(u->inputs[0]->value);
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = cosx * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Cos: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double sinx = std::sin(u->inputs[0]->value);
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = -sinx * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Tan: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double tx = std::tan(u->inputs[0]->value);
-            const double sec2 = 1.0 + tx * tx;
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = sec2 * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Exp: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double ex = std::exp(u->inputs[0]->value);
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = ex * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Log: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double x = u->inputs[0]->value;
-            if (x > 0.0) {
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.dot[ybase + l] = lanes_.dot[xbase + l] / x;
-            } else {
-                std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            }
-            break;
-        }
-
-        case Operator::Tanh: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double th = std::tanh(u->inputs[0]->value);
-            const double sech2 = 1.0 - th * th;
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = sech2 * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Relu: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double xv = u->inputs[0]->value;
-            if (xv > 0.0) {
-                std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
-            } else {
-                std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            }
-            break;
-        }
-
-        case Operator::Max: {
-            if (u->inputs.size() != 2)
-                break;
-            const int ia = u->inputs[0]->id, ib = u->inputs[1]->id;
-            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-            const double a = u->inputs[0]->value, b = u->inputs[1]->value;
-            if (a >= b) {
-                std::copy_n(&lanes_.dot[abase], L, &lanes_.dot[ybase]);
-            } else {
-                std::copy_n(&lanes_.dot[bbase], L, &lanes_.dot[ybase]);
-            }
-            break;
-        }
-
-            // ---- New lane kernels ----
-
-        case Operator::Gelu: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            constexpr double inv_sqrt2 = 0.70710678118654752440;
-            constexpr double inv_sqrt2pi = 0.39894228040143267794;
-            const double x = u->inputs[0]->value;
-            const double Phi = 0.5 * (1.0 + std::erf(x * inv_sqrt2));
-            const double phi = inv_sqrt2pi * std::exp(-0.5 * x * x);
-            const double f1 = Phi + x * phi; // f'(x)
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = f1 * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Silu: {
-            if (u->inputs.size() != 1)
-                break;
-            const int ix = u->inputs[0]->id;
-            const size_t xbase = lanes_.base(ix);
-            const double x = u->inputs[0]->value;
-            const double s = 1.0 / (1.0 + std::exp(-x));
-            const double sp = s * (1.0 - s);
-            const double f1 = s + x * sp;
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = f1 * lanes_.dot[xbase + l];
-            break;
-        }
-
-        case Operator::Softmax: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
-
-            ensure_scratch_size(m);
-            // stable softmax over AoS primals
-            double mmax = -std::numeric_limits<double>::infinity();
-            for (size_t j = 0; j < m; ++j)
-                mmax = std::max(mmax, u->inputs[j]->value);
-            double Z = 0.0;
-            for (size_t j = 0; j < m; ++j) {
-                g_scratch_values[j] = std::exp(u->inputs[j]->value - mmax);
-                Z += g_scratch_values[j];
-            }
-            for (size_t j = 0; j < m; ++j)
-                g_scratch_values[j] /= Z; // s_j
-
-            const size_t i = 0; // component index (first input)
-            const double si = g_scratch_values[i];
-
-            for (size_t l = 0; l < L; ++l) {
-                double avg = 0.0;
-                for (size_t j = 0; j < m; ++j)
-                    avg += g_scratch_values[j] *
-                           lanes_.dot[lanes_.base(u->inputs[j]->id) + l];
-                const size_t ibase = lanes_.base(u->inputs[i]->id);
-                const double di = lanes_.dot[ibase + l];
-                lanes_.dot[ybase + l] = si * (di - avg);
-            }
-            break;
-        }
-
-        default:
-            // no-op or add more kernels here
-            break;
-        }
+        // Replace the entire giant switch statement with:
+        dispatch_op(*u, ForwardDotLanesFunctor{*this, *u, L, ybase});
     }
 }
 
-// Reverse lanes: uses precomputed AoS gradients (one scalar reverse
-// pass done).
 void ADGraph::initiateBackwardPassFusedLanes() {
     if (cache_.dirty)
         rebuildCache_();
@@ -892,340 +614,31 @@ void ADGraph::initiateBackwardPassFusedLanes() {
 
         const int uid = u->id;
         const size_t ybase = lanes_.base(uid);
-        const double w = u->gradient; // AoS gradient already computed
 
-        switch (u->type) {
-        case Operator::Var:
-        case Operator::cte:
-            break;
-
-        case Operator::Add: {
-            for (const auto &inp : u->inputs) {
-                const size_t ibase = lanes_.base(inp->id);
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.gdot[ibase + l] += lanes_.gdot[ybase + l];
-            }
-            break;
-        }
-
-        case Operator::Subtract: {
-            if (u->inputs.size() != 2)
-                break;
-            const size_t abase = lanes_.base(u->inputs[0]->id);
-            const size_t bbase = lanes_.base(u->inputs[1]->id);
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                lanes_.gdot[abase + l] += gu;
-                lanes_.gdot[bbase + l] -= gu;
-            }
-            break;
-        }
-        case Operator::Multiply: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
-
-            if (m == 2) [[likely]] {
-                const size_t abase = lanes_.base(u->inputs[0]->id);
-                const size_t bbase = lanes_.base(u->inputs[1]->id);
-                const double aval = u->inputs[0]->value,
-                             bval = u->inputs[1]->value;
-                for (size_t l = 0; l < L; ++l) {
-                    const double gu = lanes_.gdot[ybase + l];
-                    const double ad = lanes_.dot[abase + l];
-                    const double bd = lanes_.dot[bbase + l];
-                    lanes_.gdot[abase + l] += gu * bval + w * bd;
-                    lanes_.gdot[bbase + l] += gu * aval + w * ad;
-                }
-            } else {
-                ensure_scratch_size(m);
-                ensure_base_size(m);
-
-                size_t zero_count = 0, zero_idx = 0;
-                double prod_nz = 1.0;
-                for (size_t j = 0; j < m; ++j) {
-                    const double vj = u->inputs[j]->value;
-                    g_scratch_values[j] = vj;
-                    g_scratch_bases[j] = lanes_.base(u->inputs[j]->id);
-                    if (vj == 0.0) {
-                        if (++zero_count == 1)
-                            zero_idx = j;
-                    } else {
-                        prod_nz *= vj;
-                    }
-                }
-
-                for (size_t l = 0; l < L; ++l) {
-                    const double gu = lanes_.gdot[ybase + l];
-
-                    if (zero_count == 0) {
-                        // sum over dj / vj
-                        double sum_d_over_v = 0.0;
-                        for (size_t j = 0; j < m; ++j)
-                            sum_d_over_v += lanes_.dot[g_scratch_bases[j] + l] /
-                                            g_scratch_values[j];
-
-                        for (size_t i = 0; i < m; ++i) {
-                            const double vi = g_scratch_values[i];
-                            const double di =
-                                lanes_.dot[g_scratch_bases[i] + l];
-                            lanes_.gdot[g_scratch_bases[i] + l] +=
-                                gu * (prod_nz / vi) +
-                                w * ((prod_nz / vi) * (sum_d_over_v - di / vi));
-                        }
-                    } else if (zero_count == 1) {
-                        const double dz =
-                            lanes_.dot[g_scratch_bases[zero_idx] + l];
-                        lanes_.gdot[g_scratch_bases[zero_idx] + l] +=
-                            gu * prod_nz;
-
-                        for (size_t i = 0; i < m; ++i)
-                            if (i != zero_idx) {
-                                const double vi = g_scratch_values[i];
-                                lanes_.gdot[g_scratch_bases[i] + l] +=
-                                    w * (dz * (prod_nz / vi));
-                            }
-                    }
-                    // if >=2 zeros: nothing to do
-                }
-            }
-            break;
-        }
-
-        case Operator::Divide: {
-            if (u->inputs.size() != 2)
-                break;
-            const size_t abase = lanes_.base(u->inputs[0]->id);
-            const size_t bbase = lanes_.base(u->inputs[1]->id);
-            const double aval = u->inputs[0]->value, bval = u->inputs[1]->value;
-            if (bval != 0.0) {
-                const double invb = 1.0 / bval;
-                const double invb2 = invb * invb;
-                const double invb3 = invb2 * invb;
-                for (size_t l = 0; l < L; ++l) {
-                    const double gu = lanes_.gdot[ybase + l];
-                    const double ad = lanes_.dot[abase + l];
-                    const double bd = lanes_.dot[bbase + l];
-                    lanes_.gdot[abase + l] += gu * invb + w * (-bd * invb2);
-                    lanes_.gdot[bbase + l] +=
-                        gu * (-aval * invb2) +
-                        w * ((-ad * bval + 2.0 * aval * bd) * invb3);
-                }
-            }
-            break;
-        }
-
-        case Operator::Sin: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            const double c = std::cos(x), s = std::sin(x);
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * c + w * (-s) * dx;
-            }
-            break;
-        }
-
-        case Operator::Cos: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            const double s = std::sin(x), c = std::cos(x);
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * (-s) + w * (-c) * dx;
-            }
-            break;
-        }
-
-        case Operator::Tan: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            const double t = std::tan(x);
-            const double sec2 = 1.0 + t * t;
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * sec2 + w * (2.0 * t * sec2) * dx;
-            }
-            break;
-        }
-
-        case Operator::Exp: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double ex = std::exp(u->inputs[0]->value);
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * ex + w * ex * dx;
-            }
-            break;
-        }
-
-        case Operator::Log: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            if (x > 0.0) {
-                const double invx = 1.0 / x;
-                const double invx2 = invx * invx;
-                for (size_t l = 0; l < L; ++l) {
-                    const double gu = lanes_.gdot[ybase + l];
-                    const double dx = lanes_.dot[xbase + l];
-                    lanes_.gdot[xbase + l] += gu * invx + w * (-invx2) * dx;
-                }
-            }
-            break;
-        }
-
-        case Operator::Tanh: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            const double t = std::tanh(x);
-            const double sech2 = 1.0 - t * t;
-            const double fpp = -2.0 * t * sech2;
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * sech2 + w * fpp * dx;
-            }
-            break;
-        }
-
-        case Operator::Relu: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            if (x > 0.0) {
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.gdot[xbase + l] += lanes_.gdot[ybase + l];
-            }
-            break;
-        }
-
-        case Operator::Max: {
-            if (u->inputs.size() != 2)
-                break;
-            const size_t abase = lanes_.base(u->inputs[0]->id);
-            const size_t bbase = lanes_.base(u->inputs[1]->id);
-            const double a = u->inputs[0]->value, b = u->inputs[1]->value;
-            if (a >= b) {
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.gdot[abase + l] += lanes_.gdot[ybase + l];
-            } else {
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.gdot[bbase + l] += lanes_.gdot[ybase + l];
-            }
-            break;
-        }
-
-            // ---- New lane kernels ----
-
-        case Operator::Gelu: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            constexpr double inv_sqrt2 = 0.70710678118654752440;
-            constexpr double inv_sqrt2pi = 0.39894228040143267794;
-            const double x = u->inputs[0]->value;
-            const double Phi = 0.5 * (1.0 + std::erf(x * inv_sqrt2));
-            const double phi = inv_sqrt2pi * std::exp(-0.5 * x * x);
-            const double f1 = Phi + x * phi;
-            const double f2 = phi * (2.0 - x * x); // f''(x)
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * f1 + w * f2 * dx;
-            }
-            break;
-        }
-
-        case Operator::Silu: {
-            if (u->inputs.size() != 1)
-                break;
-            const size_t xbase = lanes_.base(u->inputs[0]->id);
-            const double x = u->inputs[0]->value;
-            const double s = 1.0 / (1.0 + std::exp(-x));
-            const double sp = s * (1.0 - s);
-            const double f1 = s + x * sp;
-            const double f2 = 2.0 * sp + x * sp * (1.0 - 2.0 * s);
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-                const double dx = lanes_.dot[xbase + l];
-                lanes_.gdot[xbase + l] += gu * f1 + w * f2 * dx;
-            }
-            break;
-        }
-
-        case Operator::Softmax: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
-
-            ensure_scratch_size(m);
-            // recompute softmax s_j from AoS primals
-            double mmax = -std::numeric_limits<double>::infinity();
-            for (size_t j = 0; j < m; ++j)
-                mmax = std::max(mmax, u->inputs[j]->value);
-            double Z = 0.0;
-            for (size_t j = 0; j < m; ++j) {
-                g_scratch_values[j] = std::exp(u->inputs[j]->value - mmax);
-                Z += g_scratch_values[j];
-            }
-            for (size_t j = 0; j < m; ++j)
-                g_scratch_values[j] /= Z;
-            const size_t i = 0;
-            const double si = g_scratch_values[i];
-
-            for (size_t l = 0; l < L; ++l) {
-                const double gu = lanes_.gdot[ybase + l];
-
-                double avg = 0.0;
-                for (size_t j = 0; j < m; ++j)
-                    avg += g_scratch_values[j] *
-                           lanes_.dot[lanes_.base(u->inputs[j]->id) + l];
-
-                const size_t ibase = lanes_.base(u->inputs[i]->id);
-                const double di = lanes_.dot[ibase + l];
-                const double sdot_i = si * (di - avg);
-
-                for (size_t j = 0; j < m; ++j) {
-                    const size_t jbase = lanes_.base(u->inputs[j]->id);
-                    const double sj = g_scratch_values[j];
-                    const double dj = lanes_.dot[jbase + l];
-                    const double sdot_j = sj * (dj - avg);
-
-                    // gu * J + w * J'[d]
-                    double add = gu * si * ((j == i) ? (1.0 - sj) : -sj);
-                    if (j == i)
-                        add += w * sdot_i * (1.0 - 2.0 * si);
-                    else
-                        add += w * (-sdot_i * sj - si * sdot_j);
-
-                    lanes_.gdot[jbase + l] += add;
-                }
-            }
-            break;
-        }
-
-        default:
-            // no-op or add more kernels here
-            break;
-        }
+        // Replace the entire giant switch statement with:
+        dispatch_op(*u, BackwardLanesFunctor{*this, *u, L, ybase});
     }
+}
+
+void ADGraph::computeForwardPassAndDotLanesTogether() {
+    if (cache_.dirty)
+        rebuildCache_();
+
+    const size_t L = lanes();
+
+    for (ADNode *u : cache_.topo) {
+        if (!u)
+            continue;
+
+        const int uid = u->id;
+        const size_t ybase = lanes_.base(uid);
+
+        // Replace the massive switch statement with:
+        dispatch_op(*u, FusedForwardFunctor{*this, *u, L, ybase});
+    }
+
+    if (cache_.topo.size() != nodes.size()) [[unlikely]]
+        std::cerr << "Warning: cycle or dangling inputs in AD graph.\n";
 }
 
 void ADGraph::resetForwardPass() {
@@ -1438,72 +851,10 @@ void ADGraph::adoptSubgraph(const ADNodePtr &root) {
     // peepholeSimplify_();
 
     markDirty_();
+    // simplifyGraph(); // Add this line at the end
 }
 
 // In ADGraph.cpp
-
-ADNodePtr ADGraph::adoptSubgraphAndReturnRoot(const ADNodePtr& root_src) {
-    if (!root_src) return nullptr;
-
-    // 1) Collect reachable nodes from root_src in topological order (post-order)
-    struct PtrHash { size_t operator()(const ADNode* p) const noexcept {
-        return std::hash<const void*>{}(p);
-    }};
-    struct PtrEq { bool operator()(const ADNode* a, const ADNode* b) const noexcept {
-        return a == b;
-    }};
-
-    std::unordered_set<const ADNode*, PtrHash, PtrEq> visited;
-    visited.reserve(512);
-    std::vector<const ADNode*> order;
-    order.reserve(512);
-
-    std::function<void(const ADNode*)> dfs = [&](const ADNode* u) {
-        if (!u || !visited.insert(u).second) return;
-        for (const auto& in : u->inputs) dfs(in.get());
-        order.push_back(u); // children first
-    };
-    dfs(root_src.get());
-
-    // 2) Clone nodes without wiring inputs yet
-    std::unordered_map<const ADNode*, ADNodePtr, PtrHash, PtrEq> clone;
-    clone.reserve(order.size() * 2);
-
-    for (const ADNode* u : order) {
-        // Deep-copy the node metadata but NOT the inputs (we wire after)
-        auto v = std::make_shared<ADNode>(*u);
-        v->inputs.clear();
-
-        // If you maintain per-graph IDs, assign a new one here (via addNode):
-        addNode(v); // must set v->id and register in this graph
-
-        // Optional: clean per-run caches/epochs if your ADNode has them
-        // v->val_epoch = v->dot_epoch = v->grad_epoch = 0; etc.
-
-        if (v->type == Operator::Var && !v->name.empty())
-            nodeVariables[v->name] = v;
-
-        clone.emplace(u, v);
-    }
-
-    // 3) Wire inputs to the cloned counterparts
-    for (const ADNode* u : order) {
-        ADNodePtr& v = clone[u];
-        v->inputs.reserve(u->inputs.size());
-        for (const auto& in : u->inputs) {
-            auto it = clone.find(in.get());
-            // in must be reachable (we built from DFS), assert for safety:
-            if (it != clone.end()) v->inputs.push_back(it->second);
-        }
-        // If you keep any nodeIndex_ mapping by pointer, update it here
-        // nodeIndex_[v.get()] = v;  // adjust to your layout
-        markDirty_(v.get());
-    }
-
-    markDirty_();          // graph-level dirty
-    rebuildCache_();       // cheap cache rebuild if you have one
-    return clone[root_src.get()];
-}
 
 void ADGraph::updateNodeIndex_() {
     nodeIndex_.clear();
@@ -1627,931 +978,510 @@ ADGraph::rebuildGraphWithUniqueVariables(const ADNodePtr &rootNode) {
     return {newG, newG->nodeVariables};
 }
 
-// Fused forward pass: compute primals AND propagate dot lanes in single
-// traversal
-void ADGraph::computeForwardPassAndDotLanesTogether() {
-    if (cache_.dirty)
-        rebuildCache_();
+void ADGraph::simplifyGraph() {
+    if (!simplification_needed_ && nodes.size() == last_simplification_size_) {
+        return; // No changes since last simplification
+    }
 
-    const size_t L = lanes(); // lane count
+    size_t initial_size = nodes.size();
+    bool changed = true;
+    int iterations = 0;
+    const int max_iterations = 10; // Prevent infinite loops
 
-    for (ADNode *u : cache_.topo) {
-        if (!u)
+    while (changed && iterations < max_iterations) {
+        changed = false;
+
+        // Phase 1: Constant folding
+        constantFolding();
+
+        // Phase 2: Algebraic simplification
+        algebraicSimplification();
+
+        // Phase 3: Peephole optimizations
+        if (peepholeSimplify()) {
+            changed = true;
+        }
+
+        // Phase 4: Dead code elimination
+        size_t before_dce = nodes.size();
+        eliminateDeadCode();
+        if (nodes.size() < before_dce) {
+            changed = true;
+        }
+
+        iterations++;
+    }
+
+    if (nodes.size() != initial_size) {
+        markDirty_();
+        makeNodesUnique(); // Ensure consistency
+    }
+
+    last_simplification_size_ = nodes.size();
+    simplification_needed_ = false;
+
+    std::cout << "Simplification: " << initial_size << " -> " << nodes.size()
+              << " nodes (" << iterations << " iterations)\n";
+}
+
+void ADGraph::constantFolding() {
+    std::vector<ADNodePtr> to_replace;
+
+    for (const auto &node : nodes) {
+        if (!node)
             continue;
 
-        const int uid = u->id;
-        const size_t ybase = lanes_.base(uid);
+        // Skip if already constant or variable
+        if (node->type == Operator::cte || node->type == Operator::Var) {
+            continue;
+        }
 
-        switch (u->type) {
-        case Operator::Var:
-        case Operator::cte:
-            // Variables: value already set, dots already loaded
-            // Constants: value set, dots remain 0
-            break;
-
-        case Operator::Add: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
+        // Check if all inputs are constants
+        bool all_constant = true;
+        for (const auto &input : node->inputs) {
+            if (!input || !isConstant(input)) {
+                all_constant = false;
                 break;
-
-            // FUSED: Compute primal AND dot lanes together
-            double sum_val = 0.0;
-            std::fill_n(&lanes_.dot[ybase], L, 0.0);
-
-            for (const auto &inp : u->inputs) {
-                sum_val += inp->value; // Primal computation
-
-                // Dot lane computation
-                const size_t ibase = lanes_.base(inp->id);
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.dot[ybase + l] += lanes_.dot[ibase + l];
             }
-
-            u->value = sum_val; // Store primal result
-            break;
         }
 
-        case Operator::Subtract: {
-            if (u->inputs.size() != 2)
-                break;
+        if (all_constant) {
+            // Evaluate the operation with constant inputs
+            double result = 0.0;
 
-            const ADNodePtr &a = u->inputs[0];
-            const ADNodePtr &b = u->inputs[1];
-            const int ia = a->id, ib = b->id;
-            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-
-            // FUSED: Primal and dot computation
-            u->value = a->value - b->value;
-
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] =
-                    lanes_.dot[abase + l] - lanes_.dot[bbase + l];
-            break;
-        }
-
-        case Operator::Multiply: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
-
-            if (m == 2) [[likely]] {
-                const ADNodePtr &a = u->inputs[0];
-                const ADNodePtr &b = u->inputs[1];
-                const int ia = a->id, ib = b->id;
-                const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-
-                // FUSED: Primal and dot computation
-                const double aval = a->value;
-                const double bval = b->value;
-                u->value = aval * bval;
-
-                for (size_t l = 0; l < L; ++l) {
-                    const double ad = lanes_.dot[abase + l];
-                    const double bd = lanes_.dot[bbase + l];
-                    lanes_.dot[ybase + l] = ad * bval + aval * bd;
+            switch (node->type) {
+            case Operator::Add:
+                if (node->inputs.size() >= 2) {
+                    result = node->inputs[0]->value + node->inputs[1]->value;
                 }
-            } else {
-                // N-ary multiply with fused computation
-                ensure_scratch_size(m);
-                ensure_base_size(m);
+                break;
 
-                size_t zero_count = 0, zero_idx = 0;
-                double prod_val = 1.0;
-                double prod_nz = 1.0;
-
-                // Single pass: collect values, bases, and compute primal
-                for (size_t j = 0; j < m; ++j) {
-                    const double vj = u->inputs[j]->value;
-                    g_scratch_values[j] = vj;
-                    g_scratch_bases[j] = lanes_.base(u->inputs[j]->id);
-
-                    prod_val *= vj; // Primal product
-
-                    if (vj == 0.0) {
-                        if (++zero_count == 1)
-                            zero_idx = j;
-                    } else {
-                        prod_nz *= vj;
-                    }
+            case Operator::Subtract:
+                if (node->inputs.size() >= 2) {
+                    result = node->inputs[0]->value - node->inputs[1]->value;
                 }
+                break;
 
-                u->value = prod_val; // Store primal result
-
-                // Dot computation using precomputed values
-                for (size_t l = 0; l < L; ++l) {
-                    double yd = 0.0;
-                    if (zero_count == 0) {
-                        for (size_t j = 0; j < m; ++j) {
-                            const double dj =
-                                lanes_.dot[g_scratch_bases[j] + l];
-                            yd += dj * (prod_nz / g_scratch_values[j]);
-                        }
-                    } else if (zero_count == 1) {
-                        const double dz =
-                            lanes_.dot[g_scratch_bases[zero_idx] + l];
-                        yd = dz * prod_nz;
-                    }
-                    lanes_.dot[ybase + l] = yd;
+            case Operator::Multiply:
+                if (node->inputs.size() >= 2) {
+                    result = node->inputs[0]->value * node->inputs[1]->value;
                 }
-            }
-            break;
-        }
-
-        case Operator::Divide: {
-            if (u->inputs.size() != 2)
                 break;
 
-            const ADNodePtr &a = u->inputs[0];
-            const ADNodePtr &b = u->inputs[1];
-            const int ia = a->id, ib = b->id;
-            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-
-            const double aval = a->value;
-            const double bval = b->value;
-
-            // FUSED: Primal and dot computation
-            if (bval == 0.0) {
-                u->value = std::numeric_limits<double>::infinity();
-                std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            } else {
-                u->value = aval / bval;
-                const double invb2 = 1.0 / (bval * bval);
-
-                for (size_t l = 0; l < L; ++l) {
-                    const double ad = lanes_.dot[abase + l];
-                    const double bd = lanes_.dot[bbase + l];
-                    lanes_.dot[ybase + l] = (ad * bval - aval * bd) * invb2;
+            case Operator::Divide:
+                if (node->inputs.size() >= 2 && node->inputs[1]->value != 0.0) {
+                    result = node->inputs[0]->value / node->inputs[1]->value;
                 }
+                break;
+
+            case Operator::Sin:
+                if (!node->inputs.empty()) {
+                    result = std::sin(node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Cos:
+                if (!node->inputs.empty()) {
+                    result = std::cos(node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Tan:
+                if (!node->inputs.empty()) {
+                    result = std::tan(node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Exp:
+                if (!node->inputs.empty()) {
+                    result = std::exp(node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Log:
+                if (!node->inputs.empty() && node->inputs[0]->value > 0.0) {
+                    result = std::log(node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Tanh:
+                if (!node->inputs.empty()) {
+                    result = std::tanh(node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Relu:
+                if (!node->inputs.empty()) {
+                    result = std::max(0.0, node->inputs[0]->value);
+                }
+                break;
+
+            case Operator::Max:
+                if (node->inputs.size() >= 2) {
+                    result = std::max(node->inputs[0]->value,
+                                      node->inputs[1]->value);
+                }
+                break;
+
+            case Operator::Silu:
+                if (!node->inputs.empty()) {
+                    double x = node->inputs[0]->value;
+                    result = x / (1.0 + std::exp(-x)); // x * sigmoid(x)
+                }
+                break;
+
+            case Operator::Gelu:
+                if (!node->inputs.empty()) {
+                    double x = node->inputs[0]->value;
+                    result = 0.5 * x *
+                             (1.0 + std::tanh(std::sqrt(2.0 / M_PI) *
+                                              (x + 0.044715 * x * x * x)));
+                }
+                break;
+
+            default:
+                all_constant = false; // Skip unsupported operations
+                break;
             }
-            break;
+
+            if (all_constant) {
+                auto constant_node = createConstantNode(result);
+                constant_node->name = node->name; // Preserve name if any
+                to_replace.push_back(node);
+                replaceNodeReferences(node, constant_node);
+            }
         }
+    }
+}
 
-        case Operator::Sin: {
-            if (u->inputs.size() != 1)
-                break;
+void ADGraph::algebraicSimplification() {
+    for (const auto &node : nodes) {
+        if (!node)
+            continue;
 
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-
-            // FUSED: Compute sin and cos together (often optimized by compiler)
-            const double sinx = std::sin(xval);
-            const double cosx = std::cos(xval);
-
-            u->value = sinx;
-
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = cosx * lanes_.dot[xbase + l];
-            break;
+        auto simplified = applyAlgebraicRule(node);
+        if (simplified && simplified != node) {
+            replaceNodeReferences(node, simplified);
         }
+    }
+}
 
-        case Operator::Cos: {
-            if (u->inputs.size() != 1)
-                break;
+ADNodePtr ADGraph::applyAlgebraicRule(const ADNodePtr &node) {
+    if (!node || node->inputs.empty())
+        return nullptr;
 
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
+    switch (node->type) {
+    case Operator::Add:
+        if (node->inputs.size() >= 2) {
+            // x + 0 = x
+            if (isZero(node->inputs[1]))
+                return node->inputs[0];
+            if (isZero(node->inputs[0]))
+                return node->inputs[1];
 
-            const double xval = x->value;
-
-            // FUSED: Compute cos and sin together
-            const double cosx = std::cos(xval);
-            const double sinx = std::sin(xval);
-
-            u->value = cosx;
-
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = -sinx * lanes_.dot[xbase + l];
-            break;
+            // x + x = 2*x (if inputs are the same)
+            if (node->inputs[0] == node->inputs[1]) {
+                auto two = createConstantNode(2.0);
+                // Would need to create multiplication node here
+                // This requires access to node creation methods
+            }
         }
+        break;
 
-        case Operator::Tan: {
-            if (u->inputs.size() != 1)
-                break;
-
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-            const double tanx = std::tan(xval);
-
-            u->value = tanx;
-
-            const double sec2 = 1.0 + tanx * tanx;
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = sec2 * lanes_.dot[xbase + l];
-            break;
+    case Operator::Subtract:
+        if (node->inputs.size() >= 2) {
+            // x - 0 = x
+            if (isZero(node->inputs[1]))
+                return node->inputs[0];
+            // x - x = 0
+            if (node->inputs[0] == node->inputs[1])
+                return createConstantNode(0.0);
         }
+        break;
 
-        case Operator::Exp: {
-            if (u->inputs.size() != 1)
-                break;
-
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-            const double ex = std::exp(xval);
-
-            u->value = ex; // Primal
-
-            // Dot: both f(x) and f'(x) are exp(x)
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = ex * lanes_.dot[xbase + l];
-            break;
+    case Operator::Multiply:
+        if (node->inputs.size() >= 2) {
+            // x * 0 = 0
+            if (isZero(node->inputs[0]) || isZero(node->inputs[1])) {
+                return createConstantNode(0.0);
+            }
+            // x * 1 = x
+            if (isOne(node->inputs[1]))
+                return node->inputs[0];
+            if (isOne(node->inputs[0]))
+                return node->inputs[1];
         }
+        break;
 
-        case Operator::Log: {
-            if (u->inputs.size() != 1)
-                break;
+    case Operator::Divide:
+        if (node->inputs.size() >= 2) {
+            // x / 1 = x
+            if (isOne(node->inputs[1]))
+                return node->inputs[0];
+            // 0 / x = 0 (assuming x != 0)
+            if (isZero(node->inputs[0]) && !isZero(node->inputs[1])) {
+                return createConstantNode(0.0);
+            }
+        }
+        break;
 
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-
-            u->value = std::log(xval);
-
-            if (xval > 0.0) {
-                const double invx = 1.0 / xval;
-                for (size_t l = 0; l < L; ++l)
-                    lanes_.dot[ybase + l] = invx * lanes_.dot[xbase + l];
+    case Operator::Relu:
+        // relu(0) = 0, relu(positive_constant) = constant
+        if (!node->inputs.empty() && isConstant(node->inputs[0])) {
+            double val = node->inputs[0]->value;
+            if (val <= 0.0) {
+                return createConstantNode(0.0);
             } else {
-                std::fill_n(&lanes_.dot[ybase], L, 0.0);
+                return node->inputs[0]; // relu(positive) = positive
             }
-            break;
         }
+        break;
 
-        case Operator::Tanh: {
-            if (u->inputs.size() != 1)
-                break;
-
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-            const double th = std::tanh(xval);
-
-            u->value = th; // Primal
-
-            const double sech2 = 1.0 - th * th; // Derivative
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = sech2 * lanes_.dot[xbase + l];
-            break;
+    case Operator::Tanh:
+        // tanh(0) = 0
+        if (!node->inputs.empty() && isZero(node->inputs[0])) {
+            return createConstantNode(0.0);
         }
+        break;
 
-        case Operator::Relu: {
-            if (u->inputs.size() != 1)
-                break;
-
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-
-            // FUSED: Primal and dot computation
-            if (xval > 0.0) {
-                u->value = xval;
-                std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
-            } else {
-                u->value = 0.0;
-                std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            }
-            break;
+    case Operator::Silu:
+        // silu(0) = 0
+        if (!node->inputs.empty() && isZero(node->inputs[0])) {
+            return createConstantNode(0.0);
         }
+        break;
 
-        case Operator::Max: {
-            if (u->inputs.size() != 2)
-                break;
-
-            const ADNodePtr &a = u->inputs[0];
-            const ADNodePtr &b = u->inputs[1];
-            const int ia = a->id, ib = b->id;
-            const size_t abase = lanes_.base(ia), bbase = lanes_.base(ib);
-
-            const double aval = a->value;
-            const double bval = b->value;
-
-            // FUSED: Primal and dot computation
-            if (aval >= bval) {
-                u->value = aval;
-                std::copy_n(&lanes_.dot[abase], L, &lanes_.dot[ybase]);
-            } else {
-                u->value = bval;
-                std::copy_n(&lanes_.dot[bbase], L, &lanes_.dot[ybase]);
-            }
-            break;
+    case Operator::Gelu:
+        // gelu(0) = 0
+        if (!node->inputs.empty() && isZero(node->inputs[0])) {
+            return createConstantNode(0.0);
         }
+        break;
 
-        case Operator::Gelu: {
-            if (u->inputs.size() != 1)
-                break;
-
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            constexpr double inv_sqrt2 = 0.70710678118654752440;
-            constexpr double inv_sqrt2pi = 0.39894228040143267794;
-            const double xval = x->value;
-
-            // FUSED: Compute GELU and its derivative
-            const double erf_term = std::erf(xval * inv_sqrt2);
-            const double Phi = 0.5 * (1.0 + erf_term);
-            const double phi = inv_sqrt2pi * std::exp(-0.5 * xval * xval);
-
-            u->value = xval * Phi; // GELU(x) = x * Φ(x/√2)
-
-            const double f1 = Phi + xval * phi; // f'(x)
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = f1 * lanes_.dot[xbase + l];
-            break;
+    case Operator::Exp:
+        // exp(0) = 1
+        if (!node->inputs.empty() && isZero(node->inputs[0])) {
+            return createConstantNode(1.0);
         }
+        break;
 
-        case Operator::Silu: {
-            if (u->inputs.size() != 1)
-                break;
-
-            const ADNodePtr &x = u->inputs[0];
-            const int ix = x->id;
-            const size_t xbase = lanes_.base(ix);
-
-            const double xval = x->value;
-
-            // FUSED: Compute SiLU and its derivative
-            const double sigmoid = 1.0 / (1.0 + std::exp(-xval));
-
-            u->value = xval * sigmoid; // SiLU(x) = x * σ(x)
-
-            const double sigmoid_prime = sigmoid * (1.0 - sigmoid);
-            const double f1 = sigmoid + xval * sigmoid_prime; // f'(x)
-            for (size_t l = 0; l < L; ++l)
-                lanes_.dot[ybase + l] = f1 * lanes_.dot[xbase + l];
-            break;
+    case Operator::Log:
+        // log(1) = 0
+        if (!node->inputs.empty() && isOne(node->inputs[0])) {
+            return createConstantNode(0.0);
         }
+        break;
 
-        case Operator::Softmax: {
-            const size_t m = u->inputs.size();
-            if (m == 0)
-                break;
+    default:
+        break;
+    }
 
-            ensure_scratch_size(m);
+    return nullptr; // No simplification found
+}
+void ADGraph::compactNodeIds_() {
+    // Build new contiguous ids keyed by raw pointer
+    std::unordered_map<const ADNode *, int> new_id;
+    new_id.reserve(nodes.size());
+    int next = 0;
+    for (const auto &sp : nodes)
+        if (sp)
+            new_id[sp.get()] = next++;
 
-            // FUSED: Compute softmax and prepare for dot computation
-            // First pass: find max for numerical stability
-            double mmax = -std::numeric_limits<double>::infinity();
-            for (size_t j = 0; j < m; ++j)
-                mmax = std::max(mmax, u->inputs[j]->value);
+    // Assign new ids on the nodes (do NOT touch inputs' ids directly)
+    for (const auto &sp : nodes)
+        if (sp)
+            sp->id = new_id[sp.get()];
 
-            // Second pass: compute exp(x_i - max) and sum
-            double Z = 0.0;
-            for (size_t j = 0; j < m; ++j) {
-                g_scratch_values[j] = std::exp(u->inputs[j]->value - mmax);
-                Z += g_scratch_values[j];
-            }
+    // Rebuild cache so adj/radj/indeg/topo match new ids
+    rebuildCacheFull_();
+}
 
-            // Third pass: normalize to get softmax values
-            for (size_t j = 0; j < m; ++j)
-                g_scratch_values[j] /= Z; // s_j = softmax values
+void ADGraph::eliminateDeadCode() {
+    // 1) Mark reachable from variables and roots (no rebuild up front)
+    std::unordered_set<const ADNode *> reachable;
+    std::queue<const ADNode *> q;
 
-            // Store primal result (assuming this is component 0)
-            const size_t i = 0; // component index (first input)
-            u->value = g_scratch_values[i];
-
-            // Dot computation for softmax derivative
-            const double si = g_scratch_values[i];
-
-            for (size_t l = 0; l < L; ++l) {
-                double avg = 0.0;
-                for (size_t j = 0; j < m; ++j)
-                    avg += g_scratch_values[j] *
-                           lanes_.dot[lanes_.base(u->inputs[j]->id) + l];
-
-                const size_t ibase = lanes_.base(u->inputs[i]->id);
-                const double di = lanes_.dot[ibase + l];
-                lanes_.dot[ybase + l] = si * (di - avg);
-            }
-            break;
-        }
-
-            // case Operator::Abs: {
-            //     if (u->inputs.size() != 1) break;
-
-            //     const ADNodePtr &x = u->inputs[0];
-            //     const int ix = x->id;
-            //     const size_t xbase = lanes_.base(ix);
-
-            //     const double xval = x->value;
-
-            //     // FUSED: Primal and dot computation
-            //     u->value = std::abs(xval);
-
-            //     if (xval > 0.0) {
-            //         std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
-            //     } else if (xval < 0.0) {
-            //         for (size_t l = 0; l < L; ++l)
-            //             lanes_.dot[ybase + l] = -lanes_.dot[xbase + l];
-            //     } else {
-            //         // At x=0, abs is not differentiable; use 0 derivative
-            //         std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            //     }
-            //     break;
-            // }
-
-            // case Operator::Sqrt: {
-            //     if (u->inputs.size() != 1) break;
-
-            //     const ADNodePtr &x = u->inputs[0];
-            //     const int ix = x->id;
-            //     const size_t xbase = lanes_.base(ix);
-
-            //     const double xval = x->value;
-
-            //     if (xval > 0.0) {
-            //         const double sqrtx = std::sqrt(xval);
-            //         u->value = sqrtx;
-
-            //         const double deriv = 0.5 / sqrtx; // d/dx sqrt(x) =
-            //         1/(2*sqrt(x)) for (size_t l = 0; l < L; ++l)
-            //             lanes_.dot[ybase + l] = deriv * lanes_.dot[xbase +
-            //             l];
-            //     } else {
-            //         u->value = 0.0;
-            //         std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            //     }
-            //     break;
-            // }
-
-            // case Operator::Pow: {
-            //     if (u->inputs.size() != 2) break;
-
-            //     const ADNodePtr &base = u->inputs[0];
-            //     const ADNodePtr &exponent = u->inputs[1];
-            //     const int ibase = base->id, iexp = exponent->id;
-            //     const size_t base_base = lanes_.base(ibase), exp_base =
-            //     lanes_.base(iexp);
-
-            //     const double b = base->value;
-            //     const double e = exponent->value;
-
-            //     if (b > 0.0) {
-            //         const double result = std::pow(b, e);
-            //         u->value = result;
-
-            //         // For z = b^e, dz/db = e * b^(e-1), dz/de = b^e * ln(b)
-            //         const double db_coeff = e * std::pow(b, e - 1.0);
-            //         const double de_coeff = result * std::log(b);
-
-            //         for (size_t l = 0; l < L; ++l) {
-            //             const double db = lanes_.dot[base_base + l];
-            //             const double de = lanes_.dot[exp_base + l];
-            //             lanes_.dot[ybase + l] = db_coeff * db + de_coeff *
-            //             de;
-            //         }
-            //     } else {
-            //         u->value = 0.0;
-            //         std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            //     }
-            //     break;
-            // }
-
-            // case Operator::Sigmoid: {
-            //     if (u->inputs.size() != 1) break;
-
-            //     const ADNodePtr &x = u->inputs[0];
-            //     const int ix = x->id;
-            //     const size_t xbase = lanes_.base(ix);
-
-            //     const double xval = x->value;
-            //     const double sigmoid = 1.0 / (1.0 + std::exp(-xval));
-
-            //     u->value = sigmoid;
-
-            //     const double deriv = sigmoid * (1.0 - sigmoid);
-            //     for (size_t l = 0; l < L; ++l)
-            //         lanes_.dot[ybase + l] = deriv * lanes_.dot[xbase + l];
-            //     break;
-            // }
-
-            // case Operator::LeakyRelu: {
-            //     if (u->inputs.size() != 1) break;
-
-            //     const ADNodePtr &x = u->inputs[0];
-            //     const int ix = x->id;
-            //     const size_t xbase = lanes_.base(ix);
-
-            //     const double xval = x->value;
-            //     constexpr double alpha = 0.01; // typical leaky ReLU slope
-
-            //     // FUSED: Primal and dot computation
-            //     if (xval > 0.0) {
-            //         u->value = xval;
-            //         std::copy_n(&lanes_.dot[xbase], L, &lanes_.dot[ybase]);
-            //     } else {
-            //         u->value = alpha * xval;
-            //         for (size_t l = 0; l < L; ++l)
-            //             lanes_.dot[ybase + l] = alpha * lanes_.dot[xbase +
-            //             l];
-            //     }
-            //     break;
-            // }
-
-        default:
-            // Fall back to separate computation for unimplemented ops
-            _dispatch_op(*u, ForwardFunctor{*this, *u});
-            // Note: This will NOT compute dot lanes for unknown ops
-            // You may want to add a warning or handle this case differently
-            std::fill_n(&lanes_.dot[ybase], L, 0.0);
-            break;
+    // Variables are always live
+    for (const auto &kv : nodeVariables) {
+        if (kv.second) {
+            const ADNode *p = kv.second.get();
+            if (reachable.insert(p).second)
+                q.push(p);
         }
     }
 
-    if (cache_.topo.size() != nodes.size()) [[unlikely]]
-        std::cerr << "Warning: cycle or dangling inputs in AD graph.\n";
-}
-// Call this after adoptSubgraph(...) or right before heavy evaluation.
-// Centralized symbolic simplification for ADGraph class
-void ADGraph::simplifyExpression(std::vector<ADNodePtr>& outputs) {
-    auto is_commutative = [](Operator op) -> bool {
-        return op == Operator::Add || op == Operator::Multiply || op == Operator::Max;
-    };
-
-    auto make_const = [&](double v) -> ADNodePtr {
-        auto c = std::make_shared<ADNode>();
-        c->type = Operator::cte;
-        c->value = v;
-        addNode(c);
-        return c;
-    };
-
-    auto rebuild_ptr_map = [&]() -> std::unordered_map<ADNode*, ADNodePtr> {
-        std::unordered_map<ADNode*, ADNodePtr> m;
-        m.reserve(nodes.size() * 2);
-        for (auto &sp : nodes) if (sp) m.emplace(sp.get(), sp);
-        return m;
-    };
-
-    auto make_id_maps = [&]() {
-        std::unordered_map<ADNode*, int> idx;
-        idx.reserve(nodes.size() * 2);
-        for (int i = 0; i < (int)nodes.size(); ++i)
-            if (nodes[i]) idx[nodes[i].get()] = i;
-        return idx;
-    };
-
-    auto get_stable_id = [&](ADNode *u,
-                             const std::unordered_map<ADNode*, int> &ptr2idx) -> int {
-        if (u && u->id >= 0) return u->id; // prefer stable id if you have one
-        auto it = ptr2idx.find(u);
-        return (it == ptr2idx.end()) ? -1 : it->second;
-    };
-
-    auto build_signature = [&](ADNode *u,
-                               const std::unordered_map<ADNode*, int> &ptr2idx) -> std::string {
-        std::string s;
-        s.reserve(64);
-        s.append(std::to_string((int)u->type)).push_back('|');
-
-        if (u->type == Operator::cte) {
-            s.append("c|").append(std::to_string(u->value));
-            return s;
+    // Roots = nodes with no forward references (your helper is fine)
+    auto roots =
+        findNodesWithoutForwardReferences(); // may rebuild if cache_.dirty; ok
+    for (const auto &r : roots) {
+        if (r) {
+            const ADNode *p = r.get();
+            if (reachable.insert(p).second)
+                q.push(p);
         }
-        if (u->type == Operator::Var) {
-            s.append("v|").append(std::to_string(get_stable_id(u, ptr2idx)));
-            return s;
-        }
+    }
 
-        s.append(std::to_string((int)u->inputs.size())).push_back('|');
-        std::vector<int> child_ids;
-        child_ids.reserve(u->inputs.size());
-        for (auto &inp : u->inputs) child_ids.push_back(get_stable_id(inp.get(), ptr2idx));
-        if (is_commutative(u->type)) std::sort(child_ids.begin(), child_ids.end());
-        for (int id : child_ids) { s.append(std::to_string(id)); s.push_back(','); }
-        return s;
-    };
-
-    auto replace_uses = [&](ADNode *from,
-                            ADNode *to,
-                            const std::unordered_map<ADNode*, ADNodePtr> &ptr2sp) {
-        auto it_sp = ptr2sp.find(to);
-        if (it_sp == ptr2sp.end()) return;
-        const ADNodePtr &to_sp = it_sp->second;
-
-        // Update all node inputs
-        for (auto &n : nodes) {
-            if (!n) continue;
-            bool touched = false;
-            for (auto &inp : n->inputs) {
-                if (inp && inp.get() == from) { inp = to_sp; touched = true; }
+    // BFS over inputs using the node's own inputs (no cache needed here)
+    while (!q.empty()) {
+        const ADNode *u = q.front();
+        q.pop();
+        for (const auto &in : u->inputs) {
+            if (in) {
+                const ADNode *v = in.get();
+                if (reachable.insert(v).second)
+                    q.push(v);
             }
-            if (touched) markDirty_(n.get());
         }
-    };
+    }
 
-    // Also patch the outputs if they point to `from`
-    auto replace_in_outputs = [&](ADNode *from,
-                                  ADNode *to,
-                                  const std::unordered_map<ADNode*, ADNodePtr> &ptr2sp) {
-        auto it_sp = ptr2sp.find(to);
-        if (it_sp == ptr2sp.end()) return;
-        const ADNodePtr &to_sp = it_sp->second;
+    // 2) Collect & delete unreachable
+    std::vector<ADNodePtr> to_remove;
+    to_remove.reserve(nodes.size());
+    for (const auto &n : nodes)
+        if (!n || !reachable.count(n.get()))
+            to_remove.push_back(n);
 
-        for (auto &r : outputs) {
-            if (r && r.get() == from) r = to_sp;
-        }
-    };
+    for (const auto &n : to_remove)
+        if (n)
+            deleteNode(n);
 
-    bool changed = true;
-    int iterations = 0;
-    const int maxIterations = 10;
+    // 3) Compact ids + single rebuild to keep adjacency consistent
+    compactNodeIds_();
+}
 
-    while (changed && iterations < maxIterations) {
-        changed = false;
-        iterations++;
+bool ADGraph::peepholeSimplify() {
+    bool changed = false;
 
-        if (cache_.dirty) rebuildCache_();
+    // Look for specific patterns that can be optimized
+    for (const auto &node : nodes) {
+        if (!node)
+            continue;
 
-        auto ptr2sp  = rebuild_ptr_map();
-        auto ptr2idx = make_id_maps();
-        std::unordered_map<std::string, ADNode*> cse_map; // fresh per pass
+        // Pattern: (x + y) - y = x
+        if (node->type == Operator::Subtract && node->inputs.size() >= 2) {
+            auto left = node->inputs[0];
+            auto right = node->inputs[1];
 
-        std::vector<ADNode*> topo = cache_.topo;
-
-        for (ADNode *u : topo) {
-            if (!u) continue;
-            if (ptr2sp.find(u) == ptr2sp.end()) continue; // node was removed
-
-            // ---------- Constant folding ----------
-            auto all_const = [&]() {
-                if (u->inputs.empty()) return false;
-                for (auto &inp : u->inputs) if (!inp || inp->type != Operator::cte) return false;
-                return true;
-            }();
-
-            if (all_const) {
-                double result = 0.0;
-                bool canFold  = true;
-                auto arity_is = [&](size_t k){ return u->inputs.size() == k; };
-                auto in = [&](int i){ return u->inputs[i]->value; };
-
-                switch (u->type) {
-                    case Operator::Add: { double s=0.0; for (auto &i:u->inputs) s+=i->value; result=s; break; }
-                    case Operator::Multiply: { double p=1.0; for (auto &i:u->inputs) p*=i->value; result=p; break; }
-                    case Operator::Subtract: if (arity_is(2)) result = in(0)-in(1); else canFold=false; break;
-                    case Operator::Divide:   if (arity_is(2) && in(1)!=0.0) result = in(0)/in(1); else canFold=false; break;
-                    case Operator::Max:      if (arity_is(2)) result = std::max(in(0),in(1)); else canFold=false; break;
-                    case Operator::Sin:      if (arity_is(1)) result = std::sin(in(0)); else canFold=false; break;
-                    case Operator::Cos:      if (arity_is(1)) result = std::cos(in(0)); else canFold=false; break;
-                    case Operator::Tan:      if (arity_is(1)) result = std::tan(in(0)); else canFold=false; break;
-                    case Operator::Exp:      if (arity_is(1)) result = std::exp(in(0)); else canFold=false; break;
-                    case Operator::Log:      if (arity_is(1) && in(0)>0.0) result = std::log(in(0)); else canFold=false; break;
-                    case Operator::Tanh:     if (arity_is(1)) result = std::tanh(in(0)); else canFold=false; break;
-                    case Operator::Relu:     if (arity_is(1)) result = std::max(0.0,in(0)); else canFold=false; break;
-                    case Operator::Gelu:     if (arity_is(1)) { double x=in(0); result = x*0.5*(1.0+std::erf(x*0.7071067811865475)); } else canFold=false; break;
-                    case Operator::Silu:     if (arity_is(1)) { double x=in(0); result = x/(1.0+std::exp(-x)); } else canFold=false; break;
-                    default: canFold=false;
+            if (left && left->type == Operator::Add &&
+                left->inputs.size() >= 2) {
+                // Check if right operand of subtraction matches either operand
+                // of addition
+                if (left->inputs[1] == right) {
+                    replaceNodeReferences(node, left->inputs[0]);
+                    changed = true;
+                    continue;
                 }
-
-                if (canFold) {
-                    u->type = Operator::cte;
-                    u->value = result;
-                    u->inputs.clear();
-                    markDirty_(u);
+                if (left->inputs[0] == right) {
+                    replaceNodeReferences(node, left->inputs[1]);
                     changed = true;
                     continue;
                 }
             }
+        }
 
-            // ---------- Algebraic simplifications ----------
-            auto replace_with = [&](const ADNodePtr &src) {
-                u->type = src->type;
-                u->value = src->value;
-                u->inputs = src->inputs;
-                markDirty_(u);
-                changed = true;
-            };
+        // Pattern: x * (y / x) = y (assuming x != 0)
+        if (node->type == Operator::Multiply && node->inputs.size() >= 2) {
+            auto left = node->inputs[0];
+            auto right = node->inputs[1];
 
-            switch (u->type) {
-                case Operator::Add: {
-                    if (u->inputs.empty()) {
-                        u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                        markDirty_(u); changed = true; break;
-                    }
-                    std::vector<ADNodePtr> newInputs;
-                    newInputs.reserve(u->inputs.size());
-                    double constSum = 0.0; bool hasConst = false;
-
-                    for (auto &inp : u->inputs) {
-                        if (!inp) continue;
-                        if (inp->type == Operator::cte) {
-                            constSum += inp->value; hasConst = true;
-                        } else if (inp->type == Operator::Add) {
-                            for (auto &nested : inp->inputs) if (nested) newInputs.push_back(nested);
-                            changed = true;
-                        } else {
-                            newInputs.push_back(inp);
-                        }
-                    }
-                    if (hasConst && constSum != 0.0) {
-                        newInputs.push_back(make_const(constSum));
-                        changed = true;
-                    }
-                    std::unordered_map<ADNode*, int> counts;
-                    counts.reserve(newInputs.size()*2);
-                    for (auto &inp : newInputs) counts[inp.get()]++;
-                    std::vector<ADNodePtr> merged; merged.reserve(newInputs.size());
-                    for (auto &kv : counts) {
-                        ADNode *term = kv.first; int c = kv.second;
-                        if (c == 1) {
-                            merged.push_back(ptr2sp[term]);
-                        } else {
-                            auto coeff = make_const((double)c);
-                            auto mult  = std::make_shared<ADNode>();
-                            mult->type = Operator::Multiply;
-                            mult->inputs = {coeff, ptr2sp[term]};
-                            addNode(mult);
-                            merged.push_back(mult);
-                            changed = true;
-                        }
-                    }
-                    if (merged.empty()) {
-                        u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                        markDirty_(u); changed = true;
-                    } else if (merged.size() == 1) {
-                        replace_with(merged[0]);
-                    } else if (merged != u->inputs) {
-                        u->inputs = std::move(merged);
-                        markDirty_(u); changed = true;
-                    }
-                    break;
-                }
-
-                case Operator::Multiply: {
-                    if (u->inputs.empty()) {
-                        u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
-                        markDirty_(u); changed = true; break;
-                    }
-                    std::vector<ADNodePtr> newInputs;
-                    newInputs.reserve(u->inputs.size());
-                    double constProd = 1.0; bool hasConst=false, hasZero=false;
-
-                    for (auto &inp : u->inputs) {
-                        if (!inp) continue;
-                        if (inp->type == Operator::cte) {
-                            if (inp->value == 0.0) { hasZero = true; break; }
-                            if (inp->value != 1.0) { constProd *= inp->value; hasConst = true; }
-                            if (inp->value != 1.0) changed = true;
-                        } else if (inp->type == Operator::Multiply) {
-                            for (auto &nested : inp->inputs) if (nested) newInputs.push_back(nested);
-                            changed = true;
-                        } else {
-                            newInputs.push_back(inp);
-                        }
-                    }
-                    if (hasZero) {
-                        u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                        markDirty_(u); changed = true; break;
-                    }
-                    if (hasConst && constProd != 1.0) {
-                        newInputs.insert(newInputs.begin(), make_const(constProd));
-                        changed = true;
-                    }
-                    if (newInputs.empty()) {
-                        u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
-                        markDirty_(u); changed = true;
-                    } else if (newInputs.size() == 1) {
-                        replace_with(newInputs[0]);
-                    } else if (newInputs != u->inputs) {
-                        u->inputs = std::move(newInputs);
-                        markDirty_(u); changed = true;
-                    }
-                    break;
-                }
-
-                case Operator::Subtract: {
-                    if (u->inputs.size() == 2) {
-                        auto &a = u->inputs[0]; auto &b = u->inputs[1];
-                        if (b && b->type == Operator::cte && b->value == 0.0) {
-                            replace_with(a);
-                        } else if (a && b && a.get() == b.get()) {
-                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        }
-                    }
-                    break;
-                }
-
-                case Operator::Divide: {
-                    if (u->inputs.size() == 2) {
-                        auto &a = u->inputs[0]; auto &b = u->inputs[1];
-                        if (b && b->type == Operator::cte && b->value == 1.0) {
-                            replace_with(a);
-                        } else if (a && a->type == Operator::cte && a->value == 0.0) {
-                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        } else if (a && b && a.get() == b.get()) {
-                            u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        }
-                    }
-                    break;
-                }
-
-                case Operator::Sin:
-                    if (u->inputs.size() == 1) {
-                        auto &x = u->inputs[0];
-                        if (x && x->type == Operator::cte && x->value == 0.0) {
-                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        }
-                    }
-                    break;
-
-                case Operator::Cos:
-                    if (u->inputs.size() == 1) {
-                        auto &x = u->inputs[0];
-                        if (x && x->type == Operator::cte && x->value == 0.0) {
-                            u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        }
-                    }
-                    break;
-
-                case Operator::Exp:
-                    if (u->inputs.size() == 1) {
-                        auto &x = u->inputs[0];
-                        if (x && x->type == Operator::cte && x->value == 0.0) {
-                            u->type = Operator::cte; u->value = 1.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        } else if (x && x->type == Operator::Log && x->inputs.size() == 1) {
-                            replace_with(x->inputs[0]); // exp(log(y)) = y
-                        }
-                    }
-                    break;
-
-                case Operator::Log:
-                    if (u->inputs.size() == 1) {
-                        auto &x = u->inputs[0];
-                        if (x && x->type == Operator::cte && x->value == 1.0) {
-                            u->type = Operator::cte; u->value = 0.0; u->inputs.clear();
-                            markDirty_(u); changed = true;
-                        } else if (x && x->type == Operator::Exp && x->inputs.size() == 1) {
-                            replace_with(x->inputs[0]); // log(exp(y)) = y
-                        }
-                    }
-                    break;
-
-                default: break;
-            }
-
-            // ---------- CSE (and root remap) ----------
-            if (u->type != Operator::Var && u->type != Operator::cte) {
-                std::string sig = build_signature(u, ptr2idx);
-                auto it = cse_map.find(sig);
-                if (it != cse_map.end() && it->second != u) {
-                    ADNode *canonical = it->second;
-                    replace_uses(u, canonical, ptr2sp);
-                    replace_in_outputs(u, canonical, ptr2sp); // keep outputs pointing to the canonical
+            if (right && right->type == Operator::Divide &&
+                right->inputs.size() >= 2) {
+                if (left == right->inputs[1]) { // x * (y / x)
+                    replaceNodeReferences(node, right->inputs[0]);
                     changed = true;
-                } else {
-                    cse_map.emplace(std::move(sig), u);
+                    continue;
                 }
             }
         }
-
-        if (changed) rebuildCacheFull_();
     }
 
-    // ---------- Final cleanup: keep everything reachable from outputs ----------
-    std::unordered_set<ADNode*> reachable;
-    reachable.reserve(nodes.size() * 2);
-
-    std::function<void(ADNode*)> dfs = [&](ADNode *node) {
-        if (!node || reachable.count(node)) return;
-        reachable.insert(node);
-        for (auto &inp : node->inputs) if (inp) dfs(inp.get());
-    };
-
-    // anchor from outputs
-    for (auto &r : outputs) if (r) dfs(r.get());
-    // also keep your original anchors if you want
-    for (const auto &kv : nodeVariables) if (kv.second) dfs(kv.second.get());
-    for (const auto &kv : nodeIndex_)    if (kv.second) dfs(kv.second.get());
-
-    nodes.erase(std::remove_if(nodes.begin(), nodes.end(),
-                   [&](const ADNodePtr &sp) {
-                       return sp && (reachable.find(sp.get()) == reachable.end());
-                   }),
-                nodes.end());
-
-    rebuildCacheFull_();
+    return changed;
 }
 
+// Helper methods
+ADNodePtr ADGraph::createConstantNode(double value) {
+    auto node = std::make_shared<ADNode>();
+    node->type = Operator::cte;
+    node->value = value;
+    node->val_epoch = cur_val_epoch_;
+    addNode(node);
+    return node;
+}
+
+bool ADGraph::isConstant(const ADNodePtr &node) const {
+    return node && node->type == Operator::cte;
+}
+
+bool ADGraph::isZero(const ADNodePtr &node) const {
+    return isConstant(node) && std::abs(node->value) < 1e-12;
+}
+
+bool ADGraph::isOne(const ADNodePtr &node) const {
+    return isConstant(node) && std::abs(node->value - 1.0) < 1e-12;
+}
+
+void ADGraph::replaceNodeReferences(const ADNodePtr &oldNode,
+                                    const ADNodePtr &newNode) {
+    if (!oldNode || !newNode || oldNode == newNode)
+        return;
+
+    // Update all nodes that reference oldNode in their inputs
+    for (const auto &node : nodes) {
+        if (!node)
+            continue;
+
+        for (auto &input : node->inputs) {
+            if (input == oldNode) {
+                input = newNode;
+                markDirty_(node.get());
+            }
+        }
+    }
+
+    // Update node index if oldNode had a name
+    if (!oldNode->name.empty()) {
+        nodeIndex_[oldNode->name] = newNode;
+        newNode->name = oldNode->name;
+    }
+
+    // Update nodeVariables if it was a variable
+    std::vector<std::string> keys_to_update;
+    for (const auto &kv : nodeVariables) {
+        if (kv.second == oldNode) {
+            keys_to_update.push_back(kv.first);
+        }
+    }
+    for (const auto &key : keys_to_update) {
+        nodeVariables[key] = newNode;
+    }
+
+    // Mark the old node for removal but don't delete it immediately
+    // Let eliminateDeadCode handle the actual removal
+    simplification_needed_ = true;
+    markDirty_();
+}
+
+std::vector<ADNodePtr> ADGraph::findNodesWithoutForwardReferences() const {
+    std::unordered_set<ADNodePtr> referenced;
+
+    // Collect all nodes that are referenced as inputs
+    for (const auto &node : nodes) {
+        if (!node)
+            continue;
+        for (const auto &input : node->inputs) {
+            if (input) {
+                referenced.insert(input);
+            }
+        }
+    }
+
+    // Find nodes that are not referenced by others
+    std::vector<ADNodePtr> roots;
+    for (const auto &node : nodes) {
+        if (node && referenced.find(node) == referenced.end()) {
+            roots.push_back(node);
+        }
+    }
+
+    return roots;
+}

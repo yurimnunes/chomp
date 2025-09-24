@@ -14,15 +14,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Build options
-option(AD_ENABLE_OPENMP   "Enable OpenMP"                     ON)
+option(AD_ENABLE_OPENMP   "Enable OpenMP"                     OFF)
 option(AD_ENABLE_PIQP     "Build piqp_cpp Python bindings"    OFF)
 option(AD_ENABLE_OSQP     "Build osqp_cpp Python bindings"    OFF)
 option(AD_ENABLE_QDLDL    "Build qdldl_cpp Python bindings"   OFF)
-option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"       ON)
+option(AD_ENABLE_AMDQG    "Build amdqg Python bindings"       OFF)
 option(AD_ENABLE_L1CORE   "Build l1core Python bindings"      OFF)
 option(AD_ENABLE_CHOLMOD  "Enable HYKKT via SuiteSparse"      OFF)
-option(AD_ENABLE_SPECTRA  "Fetch and enable Spectra via CPM"  ON)
+option(AD_ENABLE_SPECTRA  "Fetch and enable Spectra via CPM"  OFF)
 option(AD_ENABLE_GUROBI   "Enable GUROBI linkage"             OFF)
+option(AD_ENABLE_STDEXEC "Enable stdexec usage"               OFF)
+option(AD_ENABLE_FORETREE "Build foretree Python bindings"   OFF)
 
 # ------------------------------------------------------------------
 # CPM bootstrap (before any CPMAddPackage)
@@ -43,13 +45,17 @@ endif()
 # Dependencies
 # ------------------------------------------------------------------
 
-cpmaddpackage(
+if (AD_ENABLE_STDEXEC)
+  message(STATUS "stdexec enabled")
+  cpmaddpackage(
   NAME stdexec
   GITHUB_REPOSITORY NVIDIA/stdexec
   GIT_TAG main
   OPTIONS "STDEXEC_BUILD_TESTS OFF" "STDEXEC_BUILD_EXAMPLES OFF" "STDEXEC_BUILD_BENCHMARKS OFF" "STDEXEC_BUILD_DOCS OFF" "BUILD_TESTING OFF"
 )
-
+else()
+  message(STATUS "stdexec disabled")
+endif()
 
 # fmt
 find_package(fmt CONFIG QUIET)
@@ -288,7 +294,7 @@ set(AD_SOURCES
 )
 ad_add_nanobind_module(ad ${AD_SOURCES})
 target_link_libraries(ad PRIVATE m dl)  # system libs where available
-_ad_link_gurobi(ad)                      # optional GUROBI
+# _ad_link_gurobi(ad)                      # optional GUROBI
 
 # chomp (nanobind)
 ad_add_nanobind_module(chomp
@@ -300,8 +306,6 @@ ad_add_nanobind_module(chomp
 ad_use_cholmod(chomp)
 # _ad_link_gurobi(chomp)
 # link openmp to chomp if available
-  target_link_libraries(chomp PRIVATE OpenMP::OpenMP_CXX)# Spectra::Spectra)
-
 
   find_package(TBB COMPONENTS tbb)
 if(TARGET TBB::tbb)
@@ -318,11 +322,10 @@ else()
   target_compile_definitions(ad PRIVATE FF_NO_TBB)
 endif()
 
+if(AD_ENABLE_FORETREE)
 # foretree (pybind11)
 ad_add_pybind_module(foretree src/foretree_pybind.cpp)
-
-# foreforest (pybind11 + optional oneTBB)
-ad_add_pybind_module(foreforest src/foreforest.cpp)
+target_include_directories(foreforest PRIVATE ${stdexec_SOURCE_DIR}/include)
 find_package(TBB QUIET COMPONENTS tbb)
 if(TARGET TBB::tbb)
   target_link_libraries(foreforest PRIVATE TBB::tbb)
@@ -330,6 +333,8 @@ else()
   message(WARNING "oneTBB not found. Building foreforest without parallel backend.")
   target_compile_definitions(foreforest PRIVATE FF_NO_TBB)
 endif()
+endif()
+
 
 # Optional modules
 if(AD_ENABLE_L1CORE)
@@ -363,7 +368,8 @@ if(AD_ENABLE_QDLDL)
   ad_add_pybind_module(qdldl_cpp src/qdldl_bindings.cpp)
 endif()
 
-target_include_directories(foreforest PRIVATE ${stdexec_SOURCE_DIR}/include)
+# target_include_directories(ad PRIVATE ${stdexec_SOURCE_DIR}/include)
+# target_include_directories(chomp PRIVATE ${stdexec_SOURCE_DIR}/include)
 
 # ------------------------------------------------------------------
 # Summary

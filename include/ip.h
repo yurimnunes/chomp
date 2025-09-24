@@ -34,7 +34,6 @@
 #include "linesearch.h"
 #include "regularizer.h"
 
-#include "../src/ad_bindings.cpp" // pyu, pyconv
 #include "model.h"                // Model
 #include <chrono>
 #include <iomanip> // std::setprecision
@@ -327,6 +326,8 @@ inline void cap_bound_duals_sigma_box(dvec &zL, dvec &zU, const Bounds &B,
 // ---------- Main Interior Point Stepper ----------
 class InteriorPointStepper {
 public:
+    kkt::HYKKTFlow *flow = nullptr;
+
     Bounds get_bounds(const dvec &x) {
         const int n = static_cast<int>(x.size());
         Bounds B;
@@ -364,14 +365,21 @@ public:
     double richardson_tolerance_ = 1e-8;
     int max_richardson_order_ = 3;
 
-    ModelC* m_ = nullptr;
-    InteriorPointStepper(nb::object cfg, nb::object hess, ModelC* cfg_model)
-        : cfg_(std::move(cfg)), hess_(std::move(hess)),
-          m_(cfg_model) {
+    ModelC *m_ = nullptr;
+    InteriorPointStepper(nb::object cfg, nb::object hess, ModelC *cfg_model)
+        : cfg_(std::move(cfg)), hess_(std::move(hess)), m_(cfg_model) {
         load_defaults_();
         load_gondzio_defaults_();
         std::shared_ptr<Funnel> funnel = std::shared_ptr<Funnel>();
         ls_ = std::make_shared<LineSearcher>(cfg_, nb::none(), funnel);
+
+        kkt::ChompConfig cfg_solver;
+        cfg_solver.sym_ordering = "amd";
+        cfg_solver.prec_type = "ssor";
+        cfg_solver.cg_tol = 1e-8;
+        cfg_solver.cg_maxit = 200;
+
+        flow = new kkt::HYKKTFlow(cfg_solver);
     }
 
     std::tuple<dvec, double, bool>
@@ -407,8 +415,8 @@ public:
     }
 
     std::tuple<dvec, dvec, dvec, SolverInfo>
-    step(const dvec &x, const dvec &lam, const dvec &nu,
-         int it, std::optional<IPState> /*ip_state_opt*/ = std::nullopt) {
+    step(const dvec &x, const dvec &lam, const dvec &nu, int it,
+         std::optional<IPState> /*ip_state_opt*/ = std::nullopt) {
 
 #if IP_PROFILE
         IP_TIMER("step()");
@@ -430,10 +438,10 @@ public:
         double mu = st.mu;
 
         const bool use_shifted =
-            pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", false);
+            get_attr_or<bool>(cfg_, "ip_use_shifted_barrier", false);
         double tau_shift = use_shifted ? st.tau_shift : 0.0;
         const bool shift_adapt =
-            pyu::getattr_or<bool>(cfg_, "ip_shift_adaptive", true);
+            get_attr_or<bool>(cfg_, "ip_shift_adaptive", true);
 
         IP_LAP("init/state");
 
@@ -459,8 +467,8 @@ public:
         spmat JI = (mI > 0) ? m_->get_JI().value().sparseView()
                             : spmat(mI, n); // empty OK
 
-        spmat JE =
-            (mE > 0) ? m_->get_JE().value().sparseView() : spmat(mE, n); // FIX 5
+        spmat JE = (mE > 0) ? m_->get_JE().value().sparseView()
+                            : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE");
 
         double theta = m_->constraint_violation(x);
@@ -475,14 +483,14 @@ public:
         IP_LAP("bounds & shifts (A)");
 
         double bound_shift =
-            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0)
+            use_shifted ? get_attr_or<double>(cfg_, "ip_shift_bounds", 0.0)
                         : 0.0;
         if (use_shifted && shift_adapt)
             bound_shift = adaptive_shift_bounds_(x, B, it);
         IP_LAP("bounds & shifts (B)");
 
         // -------------------- Quick convergence check --------------------
-        const double tol = pyu::getattr_or<double>(cfg_, "tol", 1e-8);
+        const double tol = get_attr_or<double>(cfg_, "tol", 1e-8);
 
         auto compute_error_ =
             [&](const dvec &g_in, const spmat &JI_in, const spmat &JE_in,
@@ -498,7 +506,7 @@ public:
             r_d += zU_in;
 
             const double s_max =
-                pyu::getattr_or<double>(cfg_, "ip_s_max", 100.0);
+                get_attr_or<double>(cfg_, "ip_s_max", 100.0);
             const int denom_ct = static_cast<int>(s_in.size()) + mE + n;
             const double sum_mults = lam_in.lpNorm<1>() + nu_in.lpNorm<1>() +
                                      zL_in.lpNorm<1>() + zU_in.lpNorm<1>();
@@ -549,8 +557,8 @@ public:
 
         // -------------------- Sigmas & Hessian --------------------
         const double eps_abs =
-            pyu::getattr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
-        const double cap = pyu::getattr_or<double>(cfg_, "sigma_cap", 1e8);
+            get_attr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
+        const double cap = get_attr_or<double>(cfg_, "sigma_cap", 1e8);
 
         Sigmas Sg =
             detail::build_sigmas(zL, zU, B, lmb, s, cI, tau_shift, bound_shift,
@@ -634,10 +642,10 @@ public:
         if (comp_now * clamp_min(mI, 1) > 10.0 * mu)
             mu = std::min(comp_now * clamp_min(mI, 1), 10.0);
         mu = clamp_min(sigma * mu_aff,
-                       pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12));
+                       get_attr_or<double>(cfg_, "ip_mu_min", 1e-12));
 
         // Trust region clipping
-        const double dx_cap = pyu::getattr_or<double>(cfg_, "ip_dx_max", 1e3);
+        const double dx_cap = get_attr_or<double>(cfg_, "ip_dx_max", 1e3);
         const double nx = dx.norm();
         if (nx > dx_cap && nx > 0.0) {
             const double sc = dx_cap / nx;
@@ -652,24 +660,24 @@ public:
         IP_LAP("barrier & TR clip");
 
         // -------------------- Fraction-to-boundary + LS --------------------
-        const double tau_pri = pyu::getattr_or<double>(
-            cfg_, "ip_tau_pri", pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
-        const double tau_dual = pyu::getattr_or<double>(
+        const double tau_pri = get_attr_or<double>(
+            cfg_, "ip_tau_pri", get_attr_or<double>(cfg_, "ip_tau", 0.995));
+        const double tau_dual = get_attr_or<double>(
             cfg_, "ip_tau_dual",
-            pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
+            get_attr_or<double>(cfg_, "ip_tau", 0.995));
         const double a_ftb = detail::alpha_ftb_vec(
             x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), lmb,
             (mI ? dlam : dvec()), B, tau_pri, tau_dual);
         const double alpha_max =
-            std::min(a_ftb, pyu::getattr_or<double>(cfg_, "ip_alpha_max", 1.0));
+            std::min(a_ftb, get_attr_or<double>(cfg_, "ip_alpha_max", 1.0));
 
         double alpha = std::min(1.0, alpha_max);
         int ls_iters = 0;
         bool needs_restoration = false;
 
-        auto [refined_dx, error_est, converged_rich] =
-            compute_enhanced_step(dx, x, alpha, safe_inf_norm(g), it);
-        dx = refined_dx;
+        // auto [refined_dx, error_est, converged_rich] =
+        //     compute_enhanced_step(dx, x, alpha, safe_inf_norm(g), it);
+        // dx = refined_dx;
         IP_LAP("richardson refine");
 
         auto ls_res =
@@ -681,9 +689,9 @@ public:
         IP_LAP("line search");
 
         // -------------------- Restoration path --------------------
-        const double ls_min_alpha = pyu::getattr_or<double>(
+        const double ls_min_alpha = get_attr_or<double>(
             cfg_, "ls_min_alpha",
-            pyu::getattr_or<double>(cfg_, "ip_alpha_min", 1e-10));
+            get_attr_or<double>(cfg_, "ip_alpha_min", 1e-10));
         if (alpha <= ls_min_alpha && needs_restoration) {
             dvec dxf = -g;
             const double ng = dxf.norm();
@@ -739,8 +747,8 @@ public:
 
         spmat JI_new = (mI > 0) ? m_->get_JI().value().sparseView()
                                 : spmat(mI, n); // empty OK
-        spmat JE_new =
-            (mE > 0) ? m_->get_JE().value().sparseView() : spmat(mE, n); // FIX 5
+        spmat JE_new = (mE > 0) ? m_->get_JE().value().sparseView()
+                                : spmat(mE, n); // FIX 5
         IP_LAP("build JI/JE new");
 
         double theta_new = m_->constraint_violation(x_new);
@@ -885,13 +893,13 @@ private:
         set_if_missing("sigma_cap", nb::float_(1e8));
         set_if_missing("ip_kkt_method", nb::str("hykkt"));
         set_if_missing("tol", nb::float_(1e-6));
-        set_if_missing("ls_backtrack", nb::float_(pyu::getattr_or<double>(
+        set_if_missing("ls_backtrack", nb::float_(get_attr_or<double>(
                                            cfg_, "ip_alpha_backtrack", 0.5)));
-        set_if_missing("ls_armijo_f", nb::float_(pyu::getattr_or<double>(
+        set_if_missing("ls_armijo_f", nb::float_(get_attr_or<double>(
                                           cfg_, "ip_armijo_coeff", 1e-4)));
         set_if_missing("ls_max_iter",
-                       nb::int_(pyu::getattr_or<int>(cfg_, "ip_ls_max", 5)));
-        set_if_missing("ls_min_alpha", nb::float_(pyu::getattr_or<double>(
+                       nb::int_(get_attr_or<int>(cfg_, "ip_ls_max", 5)));
+        set_if_missing("ls_min_alpha", nb::float_(get_attr_or<double>(
                                            cfg_, "ip_alpha_min", 1e-10)));
     }
 
@@ -907,14 +915,14 @@ private:
         dvec cI = (s.mI > 0) ? m_->get_cI().value() : dvec::Zero(s.mI);
         std::cout << "Initial cI done.\n";
         const double mu0 =
-            clamp_min(pyu::getattr_or<double>(cfg_, "ip_mu_init", 1e-2), 1e-12);
+            clamp_min(get_attr_or<double>(cfg_, "ip_mu_init", 1e-2), 1e-12);
         const bool use_shifted =
-            pyu::getattr_or<bool>(cfg_, "ip_use_shifted_barrier", true);
+            get_attr_or<bool>(cfg_, "ip_use_shifted_barrier", true);
         const double tau_shift =
-            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_tau", 0.1)
+            use_shifted ? get_attr_or<double>(cfg_, "ip_shift_tau", 0.1)
                         : 0.0;
         const double bound_shift =
-            use_shifted ? pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.1)
+            use_shifted ? get_attr_or<double>(cfg_, "ip_shift_bounds", 0.1)
                         : 0.0;
 
         if (s.mI > 0) {
@@ -956,7 +964,7 @@ private:
                                                int it) const {
         if (!s.size())
             return 0.0;
-        double base = pyu::getattr_or<double>(cfg_, "ip_shift_tau", 1e-3);
+        double base = get_attr_or<double>(cfg_, "ip_shift_tau", 1e-3);
         double min_s = s.minCoeff();
         double max_v = (cI.size() > 0) ? cI.cwiseAbs().maxCoeff() : 0.0;
         if (min_s < 1e-6 || max_v > 1e2)
@@ -984,14 +992,13 @@ private:
             if (B.hasU[i])
                 min_gap = std::min(min_gap, B.ub[i] - x[i]);
         }
-        double b0 = pyu::getattr_or<double>(cfg_, "ip_shift_bounds", 0.0);
+        double b0 = get_attr_or<double>(cfg_, "ip_shift_bounds", 0.0);
         if (min_gap < 1e-8)
             return std::min(1.0, clamp_min(b0, 1e-3) * (1 + 0.05 * it));
         if (min_gap > 1e-2)
             return clamp_min(b0 * 0.9, 0.0);
         return b0;
     }
-
     [[nodiscard]] KKTResult solve_KKT_(const spmat &W, const dvec &rhs_x,
                                        const std::optional<spmat> &JE,
                                        const std::optional<dvec> &rpE,
@@ -1007,19 +1014,54 @@ private:
         if (mE == 0 && (method_cpp == "hykkt" || method_cpp == "hykkt_cholmod"))
             method_cpp = "ldl";
 
+        // // ---------- New: fast path using HYKKTFlow (handles reuse internally)
+        // // ----------
+        // if ((method_cpp == "hykkt" || method_cpp == "hykkt_cholmod") &&
+        //     mE > 0) {
+        //         std::cout << "Using HYKKTFlow solver.\n";
+        //     // Create once; reuse across IP iterations (symbolic + AMD cached
+        //     // inside) if (!flow) {
+        //     //     // You can map fields from your ChompConfig to hykkt_cfg_
+        //     //     here if needed hykkt_cfg_.sym_ordering       = "amd";
+        //     //     hykkt_cfg_.schur_dense_cutoff = 0.05;  // m <= 5% of n →
+        //     //     dense Schur hykkt_cfg_.use_prec           = true;  // Jacobi
+        //     //     by default hykkt_cfg_.cg_tol             = 1e-8;
+        //     //     hykkt_cfg_.cg_maxit           = 200;
+        //     //     hykkt_cfg_.use_simd           = true;
+
+        //     //     hykkt_flow_ = std::make_unique<kkt::HYKKTFlow>(hykkt_cfg_);
+        //     // }
+
+        //     // delta: your IP regularization for W; if you have a value, pass it
+        //     // here
+        //     const double delta = 0.0;
+
+        //     // Flow step (reuses ordering + symbolic + CG warm starts)
+        //     auto [dx, dy] = flow->step(
+        //         W,
+        //         *JE, // G
+        //         r1,
+        //         r2.value(), // we know mE>0
+        //         delta,
+        //         std::nullopt // or std::optional<double>(gamma_override)
+        //     );
+
+        //     // If your KKTResult third field must be non-null, you can keep
+        //     // nullptr; the flow already handles reuse internally on subsequent
+        //     // calls.
+        //     return {std::move(dx), std::move(dy), /*reusable*/ nullptr};
+        // }
+
+        // ---------- Old path for non-HYKKT methods (unchanged) ----------
         const bool can_reuse = kkt_factorization_valid_ && cached_kkt_solver_ &&
                                matrices_equal(W, cached_kkt_matrix_);
 
         if (can_reuse) {
+            std::cout << "Reusing KKT factorization.\n";
             auto [dx, dy] = cached_kkt_solver_->solve(rhs_x, r2, 1e-8, 200);
             return {std::move(dx), std::move(dy), cached_kkt_solver_};
         } else {
             kkt::ChompConfig conf;
-            // conf.cg_tol = 1e-6;
-            // conf.cg_maxit = 200;
-            // conf.ip_hess_reg0 = 1e-8;
-            // conf.schur_dense_cutoff = 0.25;
-
             auto &reg = kkt::default_registry();
             auto strat = reg.get(method_cpp);
 
@@ -1047,7 +1089,7 @@ private:
             W, -r_d, haveJE ? std::optional<spmat>(*JE) : std::nullopt,
             (r_pE && r_pE->size() > 0) ? std::optional<dvec>(*r_pE)
                                        : std::nullopt,
-            pyu::getattr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
+            get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
 
         dvec dx_aff = std::move(res.dx);
         const int mI = static_cast<int>(s.size());
@@ -1079,11 +1121,11 @@ private:
             }
         }
 
-        const double tau_pri = pyu::getattr_or<double>(
-            cfg_, "ip_tau_pri", pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
-        const double tau_dual = pyu::getattr_or<double>(
+        const double tau_pri = get_attr_or<double>(
+            cfg_, "ip_tau_pri", get_attr_or<double>(cfg_, "ip_tau", 0.995));
+        const double tau_dual = get_attr_or<double>(
             cfg_, "ip_tau_dual",
-            pyu::getattr_or<double>(cfg_, "ip_tau", 0.995));
+            get_attr_or<double>(cfg_, "ip_tau", 0.995));
         double alpha_aff = 1.0;
 
         if (mI > 0) {
@@ -1121,7 +1163,7 @@ private:
 
         alpha_aff = clamp01(alpha_aff);
 
-        const double mu_min = pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12);
+        const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
         double sum_parts = 0.0;
         int denom_cnt = 0;
 
@@ -1160,7 +1202,7 @@ private:
                 ? clamp_min(sum_parts / clamp_min(denom_cnt, 1), mu_min)
                 : clamp_min(mu, mu_min);
 
-        const double pwr = pyu::getattr_or<double>(cfg_, "ip_sigma_power", 3.0);
+        const double pwr = get_attr_or<double>(cfg_, "ip_sigma_power", 3.0);
         double sigma =
             (alpha_aff > 0.9)
                 ? 0.0
@@ -1169,7 +1211,7 @@ private:
                         0.0, 1.0);
 
         const double theta_clip =
-            pyu::getattr_or<double>(cfg_, "ip_theta_clip", 1e-2);
+            get_attr_or<double>(cfg_, "ip_theta_clip", 1e-2);
         if (theta > theta_clip)
             sigma = clamp_min(sigma, 0.5);
 
@@ -1180,19 +1222,19 @@ private:
                                     double theta, KKT &kkt, bool accepted,
                                     double cond_H, double sigma, double mu_aff,
                                     bool use_shifted, double tau_shift) {
-        const double mu_min = pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12);
-        const double kappa = pyu::getattr_or<double>(cfg_, "kappa_mu", 1.5);
+        const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
+        const double kappa = get_attr_or<double>(cfg_, "kappa_mu", 1.5);
         const double theta_tol =
-            pyu::getattr_or<double>(cfg_, "tol_feas", 1e-6);
-        const double comp_tol = pyu::getattr_or<double>(cfg_, "tol_comp", 1e-6);
+            get_attr_or<double>(cfg_, "tol_feas", 1e-6);
+        const double comp_tol = get_attr_or<double>(cfg_, "tol_comp", 1e-6);
         const double cond_max =
-            pyu::getattr_or<double>(cfg_, "cond_threshold", 1e6);
+            get_attr_or<double>(cfg_, "cond_threshold", 1e6);
 
         const double comp =
             detail::complementarity(s, lam, mu, tau_shift, use_shifted);
         const bool good =
             (accepted && theta <= theta_tol && comp <= comp_tol &&
-             kkt.stat <= pyu::getattr_or<double>(cfg_, "tol_stat", 1e-6) &&
+             kkt.stat <= get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
              (std::isnan(cond_H) || cond_H <= cond_max));
 
         const double comp_ratio = comp / clamp_min(mu, 1e-12);
@@ -1224,21 +1266,21 @@ private:
 
     void load_gondzio_defaults_() {
         gondzio_config_.max_corrections =
-            pyu::getattr_or<int>(cfg_, "gondzio_max_corrections", 2);
+            get_attr_or<int>(cfg_, "gondzio_max_corrections", 2);
         gondzio_config_.gamma_a =
-            pyu::getattr_or<double>(cfg_, "gondzio_gamma_a", 0.1);
+            get_attr_or<double>(cfg_, "gondzio_gamma_a", 0.1);
         gondzio_config_.gamma_b =
-            pyu::getattr_or<double>(cfg_, "gondzio_gamma_b", 10.0);
+            get_attr_or<double>(cfg_, "gondzio_gamma_b", 10.0);
         gondzio_config_.beta_min =
-            pyu::getattr_or<double>(cfg_, "gondzio_beta_min", 0.1);
+            get_attr_or<double>(cfg_, "gondzio_beta_min", 0.1);
         gondzio_config_.beta_max =
-            pyu::getattr_or<double>(cfg_, "gondzio_beta_max", 10.0);
+            get_attr_or<double>(cfg_, "gondzio_beta_max", 10.0);
         gondzio_config_.tau_min =
-            pyu::getattr_or<double>(cfg_, "gondzio_tau_min", 0.005);
+            get_attr_or<double>(cfg_, "gondzio_tau_min", 0.005);
         gondzio_config_.use_adaptive_gamma =
-            pyu::getattr_or<bool>(cfg_, "gondzio_adaptive_gamma", true);
+            get_attr_or<bool>(cfg_, "gondzio_adaptive_gamma", true);
         gondzio_config_.progress_threshold =
-            pyu::getattr_or<double>(cfg_, "gondzio_progress_threshold", 0.1);
+            get_attr_or<double>(cfg_, "gondzio_progress_threshold", 0.1);
     }
 
     struct GondzioStepData {
@@ -1449,9 +1491,9 @@ private:
         R.dzU = dzU_base;
 
         const double tau_pri =
-            pyu::getattr_or<double>(cfg_, "ip_tau_pri", 0.995);
+            get_attr_or<double>(cfg_, "ip_tau_pri", 0.995);
         const double tau_dual =
-            pyu::getattr_or<double>(cfg_, "ip_tau_dual", 0.995);
+            get_attr_or<double>(cfg_, "ip_tau_dual", 0.995);
         std::tie(R.alpha_pri, R.alpha_dual) =
             compute_gondzio_step_lengths(s, R.ds, lam, R.dlam, zL, R.dzL, zU,
                                          R.dzU, R.dx, B, tau_pri, tau_dual);
@@ -1474,7 +1516,7 @@ private:
 
             auto corr_res = solve_KKT_(
                 W, rhs_corr_x, JE, std::nullopt,
-                pyu::getattr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
+                get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
 
             R.dx += corr_res.dx;
             if (JE && corr_res.dy.size() > 0)
@@ -1514,7 +1556,7 @@ private:
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, use_shifted,
             tau_shift, bound_shift, mu, theta);
 
-        const double mu_min = pyu::getattr_or<double>(cfg_, "ip_mu_min", 1e-12);
+        const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
         const double mu_target = clamp_min(sigma * mu_aff, mu_min);
 
         // Basic corrector RHS for Mehrotra
@@ -1556,7 +1598,7 @@ private:
 
         auto base_res = solve_KKT_(
             W, rhs_x, JE, r_pE,
-            pyu::getattr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
+            get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
 
         GondzioStepData gondzio_result = gondzio_multiple_corrections(
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, mu_target,

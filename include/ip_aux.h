@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <vector>
+#include <numeric>
 
 // Enhanced barrier parameter adaptation
 struct AdaptiveBarrierConfig {

@@ -50,7 +50,10 @@ enum class Operator {
     Silu,    // NEW
     Gelu,    // NEW
     Relu,    // NEW
-    Softmax  // NEW
+    Softmax,
+    Abs,     // NEW
+    Sqrt,    // NEW
+    Pow      // NEW
 };
 enum class NLP { NA, Bilinear };
 

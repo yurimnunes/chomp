@@ -30,45 +30,6 @@ using TrustRegionManager = ::TrustRegionManager;
 using TRResult = ::TRResult;
 using TRInfo = ::TRInfo;
 
-template <class T>
-static inline std::optional<T> opt_from_py(const nb::handle &h) {
-    if (!h || h.is_none())
-        return std::nullopt;
-    try {
-        return nb::cast<T>(h);
-    } catch (const nb::cast_error &) {
-        return std::nullopt;
-    }
-}
-
-static inline std::optional<dvec> opt_vec_from_py(const nb::handle &h) {
-    return opt_from_py<dvec>(h);
-}
-
-static inline std::optional<dmat> opt_mat_from_py(const nb::handle &h) {
-    return opt_from_py<dmat>(h);
-}
-
-static inline std::optional<dvec> get_opt_vec_attr(const nb::handle &obj,
-                                                   const char *name) {
-    if (!obj || !nb::hasattr(obj, name))
-        return std::nullopt;
-
-    try {
-        nb::object v = obj.attr(name);
-        if (v.is_none())
-            return std::nullopt;
-
-        auto vec_opt = opt_vec_from_py(v);
-        if (vec_opt && vec_opt->size() == 0)
-            return std::nullopt;
-
-        return vec_opt;
-    } catch (const nb::cast_error &) {
-        return std::nullopt;
-    }
-}
-
 // Vectorized box clipping: y = min(max(x, lb), ub) where lb/ub may be absent
 static inline dvec clip_box(const dvec &x, const std::optional<dvec> &lb,
                             const std::optional<dvec> &ub) {
@@ -86,28 +47,6 @@ static inline dvec clip_box(const dvec &x, const std::optional<dvec> &lb,
         y = y.cwiseMin(*ub);
     }
     return y;
-}
-
-// Get attribute with fallback; works with any castable T.
-template <class T>
-static inline T get_attr_or(const nb::handle &obj, const char *name,
-                            const T &fallback) {
-    if (!obj || !nb::hasattr(obj, name))
-        return fallback;
-    try {
-        return nb::cast<T>(obj.attr(name));
-    } catch (const nb::cast_error &) {
-        return fallback;
-    }
-}
-
-// dict.get(k, None) — but via C++
-// Note: nanobind dict keys should be nb::handle/nb::str, not raw char*
-static inline nb::object get_or_none(const nb::dict &d, const char *k) {
-    nb::str key(k);
-    if (d.contains(key))
-        return nb::object(d[key]); // borrow; nanobind handles ref mgmt
-    return nb::none();
 }
 
 // ------------------------ SQP Stepper (C++) ------------------------ //
@@ -243,27 +182,6 @@ public:
             (std::abs(f1 - f0) <
              get_attr_or<double>(cfg_, "tol_obj_change", 1e-12));
 
-        // ---- 7) Optional quasi-Newton update ----
-        // const std::string hmode = get_attr_or<std::string>(
-        //     cfg_, "hessian_mode", std::string("exact"));
-        // if (hmode == "bfgs" || hmode == "lbfgs" || hmode == "hybrid") {
-        //     // Prefer a dedicated model method if available
-        //     if (nb::hasattr(model, "hessian_update")) {
-        //         // pass acceptance flag if your model supports it
-        //         try {
-        //             model.attr("hessian_update")(p, g1 - g0,
-        //                                          "accepted"_a =
-        //                                          tinfo.accepted);
-        //         } catch (const nb::python_error &) {
-        //             // fall back silently to hess_ if model refuses the call
-        //             if (nb::hasattr(hess_, "update"))
-        //                 hess_.attr("update")(p, g1 - g0);
-        //         }
-        //     } else if (nb::hasattr(hess_, "update")) {
-        //         hess_.attr("update")(p, g1 - g0);
-        //     }
-        // }
-
         // ---- 8) Pack & return ----
         const double step_norm = tinfo.step_norm;
         const double rho =
@@ -339,23 +257,6 @@ private:
     template <class T> void ensure_default(const char *name, const T &val) {
         if (!nb::hasattr(cfg_, name))
             cfg_.attr(name) = val;
-    }
-
-    static inline std::optional<dvec> get_opt_vec(const nb::handle &obj,
-                                                  const char *name) {
-        if (!obj || !nb::hasattr(obj, name))
-            return std::nullopt;
-
-        try {
-            // nb::gil_scoped_acquire gil; // touching Python
-            nb::object v = obj.attr(name);
-            if (v.is_none())
-                return std::nullopt;
-            return to_dense_optional<dvec>(
-                v); // uses your helper; handles ndarray/sparse
-        } catch (const nb::python_error &) {
-            return std::nullopt; // treat Python-side errors as "absent"
-        }
     }
 
     static KKT compute_kkt(const dvec &g, const std::optional<dmat> &JE,

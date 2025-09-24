@@ -345,6 +345,7 @@ private:
                       std::vector<ADNode *> &topoOrder,
                       const std::vector<std::vector<int>> &adjList);
     bool buildTopoOrderDFS_();
+    void compactNodeIds_();
 
     // Convenience exec helpers (scalar/AoS — unchanged)
     void executeUnaryOp(ADNode *node, std::function<double(double)> forward_fn,
@@ -365,6 +366,29 @@ private:
                           cur_grad_epoch_) +=
             node->gradient * derivative_fn(input->value);
     }
+
+public:
+    // New simplification methods
+    void simplifyGraph();
+    bool peepholeSimplify();
+    void eliminateDeadCode();
+    void constantFolding();
+    void algebraicSimplification();
+
+private:
+    // Simplification helpers
+    ADNodePtr createConstantNode(double value);
+    ADNodePtr applyAlgebraicRule(const ADNodePtr &node);
+    bool isConstant(const ADNodePtr &node) const;
+    bool isZero(const ADNodePtr &node) const;
+    bool isOne(const ADNodePtr &node) const;
+    void replaceNodeReferences(const ADNodePtr &oldNode,
+                               const ADNodePtr &newNode);
+    std::vector<ADNodePtr> findNodesWithoutForwardReferences() const;
+
+    // Simplification cache/flags
+    mutable bool simplification_needed_ = false;
+    size_t last_simplification_size_ = 0;
 };
 
 // ============================ pick_graph helper ==============================
