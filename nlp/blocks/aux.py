@@ -187,26 +187,6 @@ class SQPConfig:
 
 
 # ======================================
-# Small helpers
-# ======================================
-def _clean_vec(v, m: int) -> np.ndarray:
-    """
-    Return a 1-D float array of length m with None/NaN/inf handled.
-    - None -> zeros
-    - wrong-length / scalar -> resized to length m
-    - NaN -> 0, +inf/-inf -> large finite
-    """
-    if m <= 0:
-        return np.zeros(0, dtype=float)
-    if v is None:
-        return np.zeros(m, dtype=float)
-    a = np.asarray(v, dtype=float).ravel()
-    if a.size != m:
-        a = np.resize(a, m).astype(float, copy=False)
-    return np.nan_to_num(a, nan=0.0, posinf=1e20, neginf=-1e20)
-
-
-# ======================================
 # AutoDiff Model
 # ======================================
 
