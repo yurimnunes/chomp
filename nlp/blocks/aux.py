@@ -49,8 +49,8 @@ if HAVE_PIQP:
         S.max_iter = cfg.piqp_max_iter
         S.verbose = cfg.piqp_verbose
         # Sensible scaling from TR radius (harmless defaults otherwise)
-        S.rho_init = cfg.tr_delta0 * 1e-2
-        S.delta_init = cfg.tr_delta0 * 1e-1
+        S.rho_init = cfg.delta0 * 1e-2
+        S.delta_init = cfg.delta0 * 1e-1
         S.rho_floor = 1e-12
         S.delta_floor = 1e-12
         return S
@@ -801,7 +801,7 @@ class RestorationManager:
 
         # TR radius fallback
         if (tr_radius is None) or (tr_radius <= 0.0):
-            tr_radius = getattr(self.cfg, "tr_delta0", 1.0)
+            tr_radius = getattr(self.cfg, "delta0", 1.0)
 
         # Optional bounds on x → bounds on p
         lb = getattr(model, "lb", None)
