@@ -147,7 +147,7 @@ public:
         const std::optional<spmat> JE0 = model->get_JE();
         const std::optional<spmat> JI0 = model->get_JI();
 
-        std::cout << "Line search eval done.\n";
+        // std::cout << "Line search eval done.\n";
 
         // quick slack checks
         if (s.size() == 0 || (s.array() <= 0.0).any()) {
@@ -205,7 +205,7 @@ public:
                 pred_df = 0.0;
         }
 
-        std::cout << "Line search precomputes done.\n";
+        // std::cout << "Line search precomputes done.\n";
         // θ linear prediction: JE@dx and JI@dx (support scipy.sparse)
         const dvec je_dx = JE0 ? JE0.value() * dx : dvec();
         const dvec ji_dx = JI0 ? JI0.value() * dx : dvec();

@@ -16,15 +16,16 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 # Third-party
 # =========================
 import numpy as np
-import piqp_cpp as piqp
-import scipy.linalg as la
 import scipy.sparse as sp
-from scipy.sparse.linalg import ArpackNoConvergence, eigsh, svds
 
 import ad as AD
-from nlp.blocks.reg import Regularizer
 
-
+HAVE_PIQP = False
+try:
+    import piqp_cpp as piqp
+    HAVE_PIQP = True
+except:
+    pass
 # ======================================
 # Enums
 # ======================================
@@ -36,23 +37,23 @@ class RegMode(Enum):
     INERTIA_FIX = "inertia_fix"
     SPECTRAL = "spectral"
 
-
-def _cfg_to_piqp(cfg: "SQPConfig") -> piqp.PIQPSettings:
-    """
-    Map SQPConfig essentials into PIQP settings.
-    Keep these minimal; tune the rest via PIQP itself if needed.
-    """
-    S = piqp.PIQPSettings()
-    S.eps_abs = cfg.piqp_eps_abs
-    S.eps_rel = cfg.piqp_eps_rel
-    S.max_iter = cfg.piqp_max_iter
-    S.verbose = cfg.piqp_verbose
-    # Sensible scaling from TR radius (harmless defaults otherwise)
-    S.rho_init = cfg.tr_delta0 * 1e-2
-    S.delta_init = cfg.tr_delta0 * 1e-1
-    S.rho_floor = 1e-12
-    S.delta_floor = 1e-12
-    return S
+if HAVE_PIQP:
+    def _cfg_to_piqp(cfg: "SQPConfig") -> piqp.PIQPSettings:
+        """
+        Map SQPConfig essentials into PIQP settings.
+        Keep these minimal; tune the rest via PIQP itself if needed.
+        """
+        S = piqp.PIQPSettings()
+        S.eps_abs = cfg.piqp_eps_abs
+        S.eps_rel = cfg.piqp_eps_rel
+        S.max_iter = cfg.piqp_max_iter
+        S.verbose = cfg.piqp_verbose
+        # Sensible scaling from TR radius (harmless defaults otherwise)
+        S.rho_init = cfg.tr_delta0 * 1e-2
+        S.delta_init = cfg.tr_delta0 * 1e-1
+        S.rho_floor = 1e-12
+        S.delta_floor = 1e-12
+        return S
 
 
 # ======================================
@@ -309,11 +310,7 @@ class Model:
         self.cfg = cfg
 
         self._compile_derivatives()
-
-        # --- NEW: attach HessianManager (regularizer can be supplied via cfg.regularizer) ---
-        regularizer = getattr(cfg, "regularizer", None) if cfg is not None else None
-        self.hess_manager = HessianManager(self.n, cfg, regularizer)  # uses cfg.hessian_mode etc.
-
+        
     # ---------- derivative compilation ----------
     def _compile_derivatives(self) -> None:
         self.f_grad = AD.sym_grad(self.f, self.n)
@@ -530,35 +527,6 @@ class Model:
         self._cache_x = x_key
         return {k: res.get(k, None) for k in want}
 
-    # def lagrangian_hessian(
-    #     self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
-    # ) -> Union[np.ndarray, sp.spmatrix, spla.LinearOperator]:
-    #     """
-    #     Return ∇²L according to the currently configured hybrid policy.
-    #     May return a scipy.sparse.linalg.LinearOperator (e.g., L-BFGS).
-    #     """
-    #     n, mI, mE = self.n, self.m_ineq, self.m_eq
-    #     x = _as_float_array(x, (n,))
-    #     lam = _as_float_array(lam).ravel()[:mI]
-    #     nu  = _as_float_array(nu ).ravel()[:mE]
-    #     if not (np.isfinite(x).all() and np.isfinite(lam).all() and np.isfinite(nu).all()):
-    #         raise ValueError("Non-finite values in x, lam, or nu")
-
-    #     return self.hess_manager.get_hessian(self, x, lam, nu)
-
-    # ---------- optional helpers for the solver ----------
-    def hessian_update(self, s: np.ndarray, y: np.ndarray, *, accepted: bool = True) -> None:
-        """
-        Forward solver's step/grad-diff to the internal HessianManager.
-        Use Lagrangian gradient difference for y.
-        """
-        print("[HES] Hessian update called")
-        self.hess_manager.update(s, y, accepted=accepted)
-
-    def reset_hessian(self) -> None:
-        """Reset quasi-Newton state to identity & clear memory."""
-        self.hess_manager.reset()
-        
     def lagrangian_hessian(
         self, x: np.ndarray, lam: np.ndarray, nu: np.ndarray
     ) -> np.ndarray | sp.spmatrix:
@@ -968,435 +936,3 @@ class RestorationManager:
             "wE": float(self.wE),
             "wI": float(self.wI),
         }
-
-
-# ======================================
-# Hessian Manager (exact / BFGS / L-BFGS)
-# ======================================
-
-import logging
-import time
-from typing import List, Optional, Tuple, Union
-
-import numpy as np
-import scipy.linalg as nla
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
-
-
-class HessianManager:
-    """
-    Quasi-Newton manager for SQP/IP:
-      Modes: "exact", "bfgs", "lbfgs", "hybrid"
-      - hybrid = exact for warmup & periodic refresh, otherwise BFGS/L-BFGS
-      - supports sparse or dense storage (materialized H only matters for exact/BFGS)
-      - L-BFGS is exposed as a LinearOperator (no accidental identity!)
-      - optional symmetry fix and regularizer hook
-    """
-
-    # --------------------------------------------------------------------- init
-    def __init__(self, n: int, cfg: "SQPConfig", regularizer: Optional["Regularizer"] = None):
-        self.n = int(n)
-        self.cfg = cfg
-        self.regularizer = regularizer
-
-        # Config with fallbacks
-        self.mode = getattr(cfg, "hessian_mode", "hybrid")                # "exact"|"bfgs"|"lbfgs"|"hybrid"
-        self.hybrid_quasi_mode = getattr(cfg, "hybrid_quasi_mode", "lxbfgs")  # "bfgs"|"lbfgs"
-        self.use_sparse = bool(getattr(cfg, "use_sparse_hessian", False))
-        self.lbfgs_memory = int(getattr(cfg, "lbfgs_memory", 10))
-        # kept for backwards compat; we use relative test below, not this absolute clamp
-        self.curv_thresh = float(getattr(cfg, "bfgs_curvature_threshold", 1e-8))
-        self.powell_damping = bool(getattr(cfg, "bfgs_powell_damping", True))
-        self.exact_warmup = int(getattr(cfg, "hessian_exact_warmup", 8))
-        self.refresh_period = int(getattr(cfg, "hessian_refresh_period", 50))
-        self.symmetrize = bool(getattr(cfg, "symmetrize_hessian", True))
-        self.profile = bool(getattr(cfg, "profile_hessian_eval", False))
-        # ignored: we always return operator for lbfgs to avoid identity
-        self.return_operator = bool(getattr(cfg, "hessian_return_operator", False))
-
-        # Optional SPD bump after symmetrization (helps KKT)
-        self.diag_bump = float(getattr(cfg, "hessian_diagonal_bump", 0.0))
-        self.curv_rel_thresh = float(getattr(cfg, "bfgs_curvature_rel_threshold", 1e-8))
-        self.powell_tau = float(getattr(cfg, "bfgs_powell_tau", 0.2))
-
-        # State
-        self.iteration = -1
-        self.last_exact_iter = -1
-        self.H = sp.eye(n, format="csr") if self.use_sparse else np.eye(n)  # materialized only for exact/BFGS
-        self.memory: List[Tuple[np.ndarray, np.ndarray, float]] = []  # (s, y, rho) where rho=1/(s·y) with damped y
-        self.H0 = None  # initial matrix for L-BFGS (np.ndarray | spmatrix | LinearOperator)
-
-    # ---------------------------------------------------------------- main API
-    def get_hessian(
-        self, model: "Model", x: np.ndarray, lam: np.ndarray, nu: np.ndarray
-    ) -> Union[np.ndarray, sp.spmatrix, spla.LinearOperator]:
-        """Return Hessian (materialized for exact/BFGS, LinearOperator for L-BFGS)."""
-        self.iteration += 1
-
-        mode = self.mode
-        if mode == "hybrid":
-            if self._want_exact():
-                H = self._eval_exact(model, x, lam, nu)
-                self.last_exact_iter = self.iteration
-                return self._maybe_regularize(model, x, H)
-            # fall through into chosen quasi mode
-            mode = self.hybrid_quasi_mode
-
-        if mode == "exact":
-            H = self._eval_exact(model, x, lam, nu)
-            self.last_exact_iter = self.iteration
-            return self._maybe_regularize(model, x, H)
-
-        if mode == "bfgs":
-            # Materialized H (dense recommended). Regularize on output.
-            return self._maybe_regularize(model, x, self.H)
-
-        if mode == "lbfgs":
-            # Always return an operator; never return identity.
-            #return self._lbfgs_operator()
-            return self.materialize_lbfgs()
-
-
-        raise ValueError(f"Unknown hessian_mode: {self.mode}")
-
-    # -------------------------------------------------------------- quasi update
-    def update(self, s: np.ndarray, y: np.ndarray, *, accepted: bool = True):
-        """
-        Quasi-Newton update after a solver step:
-          s = x_{k+1}-x_k
-          y = ∇L_{k+1}-∇L_k  (use *Lagrangian* gradient difference)
-        """
-        n = self.n
-        if s.shape != (n,) or y.shape != (n,):
-            raise ValueError(f"Bad shapes for update: s={s.shape}, y={y.shape}, expected {(n,)}")
-
-        if not (np.isfinite(s).all() and np.isfinite(y).all()):
-            logging.debug("Skipping Hessian update: non-finite s or y")
-            return
-        if not accepted and getattr(self.cfg, "skip_update_when_rejected", True):
-            return
-
-        # Relative curvature check
-        s_norm = float(np.linalg.norm(s))
-        y_norm = float(np.linalg.norm(y))
-        if s_norm == 0.0 or y_norm == 0.0:
-            return
-
-        sy = float(np.dot(s, y))
-        rel_ok = sy > self.curv_rel_thresh * s_norm * y_norm
-        if not rel_ok and self.powell_damping:
-            y = self._powell_damped_y(s, y)  # uses current H (or H0/Id fallback) for Hs
-            sy = float(np.dot(s, y))
-            rel_ok = sy > self.curv_rel_thresh * s_norm * y_norm
-        if not rel_ok:
-            # still bad curvature → skip
-            return
-
-        eff_mode = self.mode if self.mode != "hybrid" else self.hybrid_quasi_mode
-        if eff_mode == "bfgs":
-            self._bfgs_inplace(s, y)  # BFGS on materialized H
-        elif eff_mode == "lbfgs":
-            self._lbfgs_store(s, y)
-
-    # -------------------------------------------------------------- L-BFGS core
-    def _apply_H0(self, v: np.ndarray) -> np.ndarray:
-        """Apply initial matrix H0; fallback to scalar γI if H0 is None and we have memory."""
-        if self.H0 is None:
-            if not self.memory:
-                return v.copy()
-            # γ from last pair
-            sL, yL, _ = self.memory[-1]
-            yy = float(np.dot(yL, yL)) or 1e-16
-            sy = float(np.dot(sL, yL))
-            gamma = sy / yy
-            return gamma * v
-        H0 = self.H0
-        if sp.issparse(H0):
-            return (H0 @ v).A.ravel()
-        elif isinstance(H0, np.ndarray):
-            return H0 @ v
-        else:
-            # LinearOperator
-            return H0 @ v
-
-    def lbfgs_matvec(self, v: np.ndarray) -> np.ndarray:
-        """Two-loop recursion for L-BFGS: returns approx H v, with general H0."""
-        v = np.asarray(v)
-        if v.shape != (self.n,):
-            raise ValueError(f"v has shape {v.shape}, expected {(self.n,)}")
-
-        if not self.memory:
-            return self._apply_H0(v)
-
-        q = v.copy()
-        m = len(self.memory)
-        alpha = np.empty(m, dtype=float)
-
-        # backward loop
-        for i in range(m - 1, -1, -1):
-            s, y, rho = self.memory[i]
-            alpha[i] = rho * np.dot(s, q)
-            q -= alpha[i] * y
-
-        # initial application
-        r = self._apply_H0(q)
-
-        # forward loop
-        for i in range(m):
-            s, y, rho = self.memory[i]
-            beta = rho * np.dot(y, r)
-            r += s * (alpha[i] - beta)
-
-        return r
-
-    def _lbfgs_store(self, s: np.ndarray, y: np.ndarray):
-        """Store a (s,y,ρ) pair for L-BFGS. ρ computed with (possibly damped) y, no clamping."""
-        sy = float(np.dot(s, y))
-        if sy <= 0.0:
-            # should not happen due to checks, but be safe
-            return
-        rho = 1.0 / sy
-        self.memory.append((s.copy(), y.copy(), rho))
-        if len(self.memory) > self.lbfgs_memory:
-            self.memory.pop(0)
-
-    def _lbfgs_operator(self) -> spla.LinearOperator:
-        n = self.n
-
-        def mv(v):
-            return self.lbfgs_matvec(np.asarray(v))
-
-        # symmetry → rmatvec == matvec
-        return spla.LinearOperator((n, n), matvec=mv, rmatvec=mv, dtype=float)
-
-    # -------------------------------------------------------------- BFGS update
-    def _bfgs_inplace(self, s: np.ndarray, y: np.ndarray):
-        """Full BFGS on materialized H. Prefer dense H for performance."""
-        n = self.n
-        sy = float(np.dot(s, y))
-        if sy <= 0.0:
-            return
-        rho = 1.0 / sy
-
-        if isinstance(self.H, np.ndarray):
-            V = np.eye(n) - rho * np.outer(s, y)
-            self.H = V.T @ self.H @ V + rho * np.outer(s, s)
-        else:
-            # Sparse BFGS is costly; convert to dense for update (or prefer L-BFGS).
-            H = self.H.toarray()
-            V = np.eye(n) - rho * np.outer(s, y)
-            H = V.T @ H @ V + rho * np.outer(s, s)
-            self.H = sp.csr_matrix(H) if self.use_sparse else H
-
-    # ------------------------------------------------------------------- reset
-    def reset(self):
-        """Reset to identity and clear memory; also reset H0."""
-        self.H = sp.eye(self.n, format="csr") if self.use_sparse else np.eye(self.n)
-        self.H0 = None
-        self.memory.clear()
-        self.last_exact_iter = -1
-
-    # -------------------------------------------------------------- internals
-    def _want_exact(self) -> bool:
-        if self.iteration < self.exact_warmup:
-            return True
-        if self.refresh_period > 0 and (self.iteration - self.last_exact_iter) >= self.refresh_period:
-            return True
-        return False
-
-    def _eval_exact(self, model: "Model", x: np.ndarray, lam: np.ndarray, nu: np.ndarray):
-        """Compute exact ∇²L, symmetrize, (optionally) bump diag, convert format, seed H/H0, clear L-BFGS memory."""
-        t0 = time.time()
-        H = model.lag_hessian.hess(x, lam, nu)  # must be shape (n,n)
-        if self.profile:
-            print(f"[HessianManager] exact ∇²L time: {time.time() - t0:.6f}s")
-
-        # Force symmetry
-        if self.symmetrize:
-            H = 0.5 * (H + H.T) if not sp.issparse(H) else 0.5 * (H + H.T)
-
-        # Optional SPD bump (before regularizer so it can adjust further if desired)
-        if self.diag_bump > 0.0:
-            if sp.issparse(H):
-                H = H + self.diag_bump * sp.eye(self.n, format="csr")
-            else:
-                H = H + self.diag_bump * np.eye(self.n)
-
-        # Conform to storage preference for materialized paths
-        if self.use_sparse and not sp.issparse(H):
-            H = sp.csr_matrix(H)
-        if (not self.use_sparse) and sp.issparse(H):
-            H = H.toarray()
-
-        # Seed BFGS matrix and L-BFGS initial H0, then clear pairs
-        if self.mode in ("bfgs", "hybrid"):
-            self.H = H
-        self._set_H0(H)
-        self.memory.clear()
-
-        return H
-
-    def _maybe_regularize(self, model: "Model", x: np.ndarray, H):
-        if self.regularizer is None:
-            return H
-        try:
-            # Optional gradient norm to guide regularizer
-            try:
-                g = model.eval_all(x, components=["g"]).get("g", None)
-                g = None if g is None else np.asarray(g).ravel()
-                gnorm = float(np.linalg.norm(g)) if (g is not None and g.size) else None
-            except Exception:
-                gnorm = None
-
-            Hreg, _ = self.regularizer.regularize(
-                H,
-                iteration=self.iteration,
-                model_quality=getattr(self.cfg, "model_quality", None),
-                constraint_count=getattr(model, "m_eq", 0),
-                grad_norm=gnorm,
-            )
-            return Hreg
-        except Exception as e:
-            logging.debug(f"Regularizer failed; using raw H. Reason: {e}")
-            return H
-
-    def _set_H0(self, H):
-        """Store H as H0 (used by L-BFGS). Maintain user's sparse/dense preference."""
-        if self.use_sparse and not sp.issparse(H):
-            H = sp.csr_matrix(H)
-        if (not self.use_sparse) and sp.issparse(H):
-            H = H.toarray()
-        self.H0 = H
-
-    # ----------------------------------------------------------- Powell damping
-    def _powell_damped_y(self, s: np.ndarray, y: np.ndarray) -> np.ndarray:
-        """
-        Powell damping: ỹ = θ y + (1-θ) Hs  with θ chosen so sᵀỹ ≥ τ sᵀHs.
-        Hs uses current materialized H if available, otherwise H0, otherwise identity.
-        """
-        tau = self.powell_tau
-
-        Hs = self._apply_current_H(s)  # uses H (if materialized) else H0 else s
-        sHs = float(np.dot(s, Hs))
-        if sHs <= 0.0:
-            return y  # fall back; let curvature check handle skipping
-
-        sy = float(np.dot(s, y))
-        theta = 1.0
-        if sy < tau * sHs:
-            theta = (1.0 - tau) * sHs / (sHs - sy + 1e-16)
-            theta = max(0.0, min(1.0, theta))
-        return theta * y + (1.0 - theta) * Hs
-
-    def _apply_current_H(self, v: np.ndarray) -> np.ndarray:
-        """Apply current materialized H if present; otherwise H0; otherwise identity."""
-        if isinstance(self.H, np.ndarray):
-            return self.H @ v
-        if sp.issparse(self.H):
-            return (self.H @ v).A.ravel()
-        # No materialized H → use H0 (may be operator)
-        if self.H0 is not None:
-            return self._apply_H0(v)
-        return v.copy()
-
-    def _get_H0_dense_fallback(self) -> np.ndarray:
-        """
-        Return a dense H0 to use in compact materialization:
-        - If self.H0 is a dense array, return copy.
-        - If self.H0 is sparse, densify.
-        - If self.H0 is a LinearOperator or None, fall back to gamma*I,
-            where gamma = (s_m^T y_m) / (y_m^T y_m) using the last pair.
-        - If no pairs exist, return I.
-        """
-        if isinstance(self.H0, np.ndarray):
-            return self.H0.copy()
-        if sp.issparse(self.H0):
-            return self.H0.toarray()
-
-        # H0 is operator or None → gamma*I fallback
-        m = len(self.memory)
-        n = self.n
-        if m == 0:
-            return np.eye(n)
-        sL, yL, _ = self.memory[-1]
-        yy = float(np.dot(yL, yL)) or 1e-16
-        sy = float(np.dot(sL, yL))
-        gamma = sy / yy
-        return gamma * np.eye(n)
-
-
-    def materialize_lbfgs(self) -> Union[np.ndarray, sp.csr_matrix]:
-        """
-        Build a full matrix H from L-BFGS memory using the compact representation:
-            H = H0 + Z M Z^T,  Z = [S, H0 Y],
-        where M is a 2m x 2m block matrix built from S^T Y.
-        Returns dense (ndarray) or CSR according to self.use_sparse.
-        """
-        n = self.n
-        m = len(self.memory)
-
-        # --- Base cases -----------------------------------------------------------
-        # No pairs -> just return H0 (or gamma*I fallback)
-        if m == 0:
-            H0 = self._get_H0_dense_fallback()
-            return sp.csr_matrix(H0) if self.use_sparse else H0
-
-        # Gather S, Y (n x m)
-        S = np.column_stack([s for (s, _, _) in self.memory])
-        Y = np.column_stack([y for (_, y, _) in self.memory])
-
-        # --- Choose H0 (dense) ----------------------------------------------------
-        # Use dense H0 for building; if H0 is sparse/operator/None, fall back to gamma I.
-        H0 = self._get_H0_dense_fallback()
-
-        # Compute HY = H0 @ Y
-        HY = H0 @ Y
-
-        # --- Small matrices -------------------------------------------------------
-        # STY = S^T Y (m x m); split into R (upper), L (strict lower), D = diag(diag)
-        STY = S.T @ Y
-        # Numerical guard: if diagonal is tiny, bump it a bit
-        diag_STY = np.diag(STY).copy()
-        eps = float(getattr(self.cfg, "lbfgs_compact_eps", 1e-12))
-        diag_STY = np.where(np.abs(diag_STY) < eps, np.sign(diag_STY + (diag_STY == 0)) * eps, diag_STY)
-
-        R = np.triu(STY)                # upper triangular
-        L = np.tril(STY, k=-1)          # strict lower
-        D = np.diag(diag_STY)           # diagonal
-
-        # Solve with R (triangular), avoid forming inverses explicitly
-        # We'll need inv(R) and inv(R^T) applied to matrices:
-        #   Solve R X = B   -> X = solve_triangular(R, B, lower=False)
-        #   Solve R^T X = B -> X = solve_triangular(R, B, lower=True, trans='T')
-
-        # Build M blocks:
-        #   M = [[ R^{-T} D R^{-1},   -R^{-T] ],
-        #        [   -R^{-1},           0    ]]
-        # Compute A = R^{-1}, AT = R^{-T} via triangular solves on I
-        I_m = np.eye(m)
-        A   = nla.solve_triangular(R, I_m, lower=False, check_finite=False)
-        AT  = nla.solve_triangular(R, I_m, lower=True,  trans='T', check_finite=False)
-
-        M11 = AT @ D @ A
-        M12 = -AT
-        M21 = -A
-        # M22 is zero block; we’ll assemble M via concatenation
-        top = np.concatenate([M11, M12], axis=1)          # (m x 2m)
-        bot = np.concatenate([M21, np.zeros((m, m))], 1)  # (m x 2m)
-        M = np.concatenate([top, bot], axis=0)            # (2m x 2m)
-
-        # --- Assemble Z and compute Z M Z^T --------------------------------------
-        Z = np.concatenate([S, HY], axis=1)               # (n x 2m)
-        # H = H0 + Z @ M @ Z.T
-        # Do it as T = M @ Z.T  (2m x n), then add Z @ T
-        T = M @ Z.T                                       # (2m x n)
-        H = H0 + Z @ T                                    # (n x n)
-
-        # Symmetrize for safety and apply optional SPD bump
-        H = 0.5 * (H + H.T)
-        bump = float(getattr(self.cfg, "hessian_diagonal_bump", 0.0))
-        if bump > 0.0:
-            H = H + bump * np.eye(n)
-
-        return sp.csr_matrix(H) if self.use_sparse else H

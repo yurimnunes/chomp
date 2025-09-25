@@ -1,10 +1,8 @@
 // sqp_stepper.cpp
-// C++23 + pybind11 implementation of the Python SQPStepper
+// C++23 + nanobind implementation of the Python SQPStepper
 // - Instantiates native TrustRegionManager (no TR passed from Python)
-// - Calls your Python Model/Regularizer/QP via pybind11
-// - Depends on Eigen + pybind11
-//
-// Build target: module name `sqp_cpp` exposing class `SQPStepper`
+// - Calls your Python Model/Regularizer/QP via nanobind
+// - Depends on Eigen + nanobind
 
 #include <nanobind/eigen/dense.h>
 #include <nanobind/nanobind.h>
@@ -15,6 +13,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 
 #include "../include/tr.h" // TrustRegionManager, TRConfig, TRResult, TRInfo
 #include "definitions.h"
@@ -34,9 +33,7 @@ using TRInfo = ::TRInfo;
 static inline dvec clip_box(const dvec &x, const std::optional<dvec> &lb,
                             const std::optional<dvec> &ub) {
     dvec y = x;
-
     if (lb) {
-        // Safety: size check (no-throw fast path if sizes match)
         if (NB_UNLIKELY(lb->size() != x.size()))
             throw std::invalid_argument("clip_box: lb size mismatch");
         y = y.cwiseMax(*lb);
@@ -53,51 +50,66 @@ static inline dvec clip_box(const dvec &x, const std::optional<dvec> &lb,
 class SQPStepper {
 public:
     // Single constructor: builds native TrustRegionManager from cfg
-    explicit SQPStepper(nb::object cfg, nb::object hess_mgr,
+    explicit SQPStepper(nb::object cfg,
                         nb::object qp_solver, nb::object regularizer,
                         nb::object restoration, ModelC *model = nullptr)
-        : cfg_(std::move(cfg)), hess_(std::move(hess_mgr)),
+        : cfg_(std::move(cfg)), 
           qp_(std::move(qp_solver)), reg_(std::move(regularizer)),
           rest_(std::move(restoration)), tr_(build_tr_config_from_cfg_(cfg_)),
           model_(model) {
+        if (!model_)
+            throw std::invalid_argument("SQPStepper: ModelC* model must not be null");
         init_misc_();
     }
 
     std::shared_ptr<regx::Regularizer> regularizer_ =
         std::make_shared<regx::Regularizer>();
 
-    ModelC *model_ = nullptr; // optional ModelC pointer for AD Hessians
+    ModelC *model_ = nullptr; // optional ModelC pointer for AD/LBFGS Hessians
 
     std::tuple<dvec, dvec, dvec, SolverInfo>
     step(const dvec &x_in, const dvec &lam_in, const dvec &nu_in, int it) {
         // ---- 0) Box clipping ----
         std::optional<dvec> lb = model_->get_lb();
         std::optional<dvec> ub = model_->get_ub();
-        auto mI = model_->get_mI();
-        auto mE = model_->get_mE();
-        auto n = model_->get_n();
+        const int mI = model_->get_mI();
+        const int mE = model_->get_mE();
+        const int n  = model_->get_n();
+
         dvec x = clip_box(x_in, lb, ub);
 
         // ---- 1) Evaluate once at x ----
-        std::vector<std::string> need_strs = {"f", "g", "JI", "JE", "cI", "cE"};
-
+        const std::vector<std::string> need_strs = {"f", "g", "JI", "JE", "cI", "cE"};
         model_->eval_all(x, need_strs);
 
         const double f0 = model_->get_f().value();
-        const dvec g0 = model_->get_g().value();
+        const dvec   g0 = model_->get_g().value();
 
-        spmat JI =
-            (mI > 0) ? model_->get_JI().value() : spmat(mI, n);
-        spmat JE =
-            (mE > 0) ? model_->get_JE().value() : spmat(mE, n);
-        dvec cI = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
-        dvec cE = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
+        spmat JI = (mI > 0) ? model_->get_JI().value() : spmat(mI, n);
+        spmat JE = (mE > 0) ? model_->get_JE().value() : spmat(mE, n);
+        dvec  cI = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
+        dvec  cE = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
 
         const double theta0 = model_->constraint_violation(x);
 
-        // ---- 2) Lagrangian Hessian + regularization ----
-        auto H_obj = model_->hess(x, lam_in, nu_in);
-        spmat H0 = H_obj;
+        // ---- 2) Lagrangian Hessian (exact or LBFGS) + regularization ----
+        const std::string hmode =
+            get_attr_or<std::string>(cfg_, "hessian_mode", std::string("lbfgs"));
+
+        spmat H0;
+        if (hmode == "exact") {
+            // Compute/return exact AD Lagrangian Hessian (no LBFGS side-effects)
+            H0 = model_->hess(x, lam_in, nu_in);
+        } else if (hmode == "lbfgs") {
+            // IMPORTANT:
+            // Do NOT update LBFGS here. Only *materialize* the current approximation.
+            // The memory will be updated *after* we decide acceptance.
+            model_->set_use_lbfgs_hess(true);
+            H0 = model_->lbfgs_matrix(
+                get_attr_or<double>(cfg_, "lbfgs_sparse_threshold", 1e-12));
+        } else {
+            throw std::runtime_error("Unknown hessian_mode: " + hmode);
+        }
 
         auto [H, reg_info] = regularizer_->regularize(H0, it);
         H.makeCompressed();
@@ -111,24 +123,22 @@ public:
 
         const double tr_delta_at_call = tr_.get_delta();
         const double gnorm = g0.norm();
-        std::cout << "[SQP] it=" << it << " f=" << f0 << " ||g||=" << gnorm
-                  << " theta=" << theta0 << " delta=" << tr_.get_delta()
-                  << "\n";
+        (void)tr_delta_at_call; (void)gnorm;
 
         // ---- 3) Native TR solve (dense path) ----
-        TRResult out = tr_.solve_dense(H, g0,
-                                       /*A_ineq*/ JI, /*b_ineq*/ cI,
-                                       /*A_eq*/ JE, /*b_eq*/ cE,
-                                       /*model*/ model_,
-                                       /*x*/ std::optional<dvec>(x),
-                                       /*lb*/ lb,
-                                       /*ub*/ ub,
-                                       /*mu*/ 0.0,
-                                       /*f_old*/ std::optional<double>(f0));
+        TRResult out = tr_.solve_dense(
+            H, g0,
+            /*A_ineq*/ JI, /*b_ineq*/ cI,
+            /*A_eq*/   JE, /*b_eq*/   cE,
+            /*model*/  model_,
+            /*x*/ std::optional<dvec>(x),
+            /*lb*/ lb, /*ub*/ ub,
+            /*mu*/ 0.0,
+            /*f_old*/ std::optional<double>(f0));
 
-        const dvec &p = out.p;
+        const dvec &p       = out.p;
         const dvec &lam_usr = out.lam;
-        const dvec &nu_new = out.nu;
+        const dvec &nu_new  = out.nu;
         const TRInfo &tinfo = out.info;
 
         if (!p.allFinite()) {
@@ -140,18 +150,15 @@ public:
         }
 
         // ---- 4) Trial evaluation ----
-        const dvec x_trial = x + p;
-
+        const dvec x_trial = clip_box(x + p, lb, ub);
         model_->eval_all(x_trial, need_strs);
 
         const double f1 = model_->get_f().value();
-        const dvec g1 = model_->get_g().value();
-        spmat JI1 =
-            (mI > 0) ? model_->get_JI().value() : spmat(mI, n);
-        spmat JE1 =
-            (mE > 0) ? model_->get_JE().value() : spmat(mE, n);
-        dvec cI1 = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
-        dvec cE1 = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
+        const dvec   g1 = model_->get_g().value();
+        spmat JI1 = (mI > 0) ? model_->get_JI().value() : spmat(mI, n);
+        spmat JE1 = (mE > 0) ? model_->get_JE().value() : spmat(mE, n);
+        dvec  cI1 = (mI > 0) ? model_->get_cI().value() : dvec::Zero(mI);
+        dvec  cE1 = (mE > 0) ? model_->get_cE().value() : dvec::Zero(mE);
 
         const double theta1 = model_->constraint_violation(x_trial);
 
@@ -165,27 +172,31 @@ public:
 
         // ---- 6) Convergence test ----
         const double cEn = (model_->get_cE() ? model_->get_cE()->norm() : 0.0);
-        const double cIn =
-            (model_->get_cI() ? model_->get_cI()->cwiseMax(0.0).lpNorm<Eigen::Infinity>() : 0.0);
+        const double cIn = (model_->get_cI() ? model_->get_cI()
+                                                  ->cwiseMax(0.0)
+                                                  .lpNorm<Eigen::Infinity>()
+                                            : 0.0);
         const double g_scale = std::max(1.0, g0.norm() + std::max(cEn, cIn));
 
         const bool converged =
-            ((kkt.stat / g_scale) <=
-                 get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
-             (kkt.ineq / g_scale) <=
-                 get_attr_or<double>(cfg_, "tol_feas", 1e-6) &&
-             (kkt.eq / g_scale) <=
-                 get_attr_or<double>(cfg_, "tol_feas", 1e-6) &&
-             ((kkt.comp / g_scale) <=
-                  get_attr_or<double>(cfg_, "tol_comp", 1e-6) ||
-              kkt.ineq <= 1e-10)) ||
-            (std::abs(f1 - f0) <
-             get_attr_or<double>(cfg_, "tol_obj_change", 1e-12));
+            ((kkt.stat / g_scale) <= get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
+             (kkt.ineq / g_scale) <= get_attr_or<double>(cfg_, "tol_feas", 1e-6) &&
+             (kkt.eq   / g_scale) <= get_attr_or<double>(cfg_, "tol_feas", 1e-6) &&
+             ((kkt.comp / g_scale) <= get_attr_or<double>(cfg_, "tol_comp", 1e-6) ||
+               kkt.ineq <= 1e-10)) ||
+            (std::abs(f1 - f0) < get_attr_or<double>(cfg_, "tol_obj_change", 1e-12));
+
+        // ---- 7) LBFGS memory update *only if accepted* ----
+        // This is the "update-only" hook: no Hessian recompute here.
+        if (hmode == "lbfgs" && tinfo.accepted) {
+            // Push (s,y) using the accepted x_{k+1}, λ_{k+1}, ν_{k+1}
+            // No materialization of H occurs here.
+            model_->lbfgs_update(x_trial, lam_usr, nu_new);
+        }
 
         // ---- 8) Pack & return ----
         const double step_norm = tinfo.step_norm;
-        const double rho =
-            std::numeric_limits<double>::quiet_NaN(); // not exposed by TR
+        const double rho = std::numeric_limits<double>::quiet_NaN(); // not exposed by TR
         const bool accepted = tinfo.accepted;
 
         SolverInfo info =
@@ -204,8 +215,6 @@ private:
     static TRConfig build_tr_config_from_cfg_(const nb::object &cfg) {
         TRConfig tc; // start with C++ defaults
 
-        // nb::gil_scoped_acquire gil;
-
         // Core TR params
         tc.delta0 = get_attr_or<double>(cfg, "delta0", tc.delta0);
         tc.delta_min = get_attr_or<double>(cfg, "delta_min", tc.delta_min);
@@ -216,10 +225,8 @@ private:
         tc.gamma2 = get_attr_or<double>(cfg, "gamma2", tc.gamma2);
         tc.zeta = get_attr_or<double>(cfg, "zeta", tc.zeta);
         tc.norm_type = get_attr_or<std::string>(cfg, "norm_type", tc.norm_type);
-        tc.metric_shift =
-            get_attr_or<double>(cfg, "metric_shift", tc.metric_shift);
-        tc.curvature_aware =
-            get_attr_or<bool>(cfg, "curvature_aware", tc.curvature_aware);
+        tc.metric_shift = get_attr_or<double>(cfg, "metric_shift", tc.metric_shift);
+        tc.curvature_aware = get_attr_or<bool>(cfg, "curvature_aware", tc.curvature_aware);
         tc.criticality_enabled = get_attr_or<bool>(cfg, "criticality_enabled",
                                                    tc.criticality_enabled);
 
@@ -227,8 +234,7 @@ private:
         tc.cg_tol = get_attr_or<double>(cfg, "cg_tol", tc.cg_tol);
         tc.cg_tol_rel = get_attr_or<double>(cfg, "cg_tol_rel", tc.cg_tol_rel);
         tc.cg_maxiter = get_attr_or<int>(cfg, "cg_maxiter", tc.cg_maxiter);
-        tc.neg_curv_tol =
-            get_attr_or<double>(cfg, "neg_curv_tol", tc.neg_curv_tol);
+        tc.neg_curv_tol = get_attr_or<double>(cfg, "neg_curv_tol", tc.neg_curv_tol);
         tc.box_mode = get_attr_or<std::string>(cfg, "box_mode", tc.box_mode);
         tc.use_prec = get_attr_or<bool>(cfg, "use_prec", tc.use_prec);
         tc.prec_kind = get_attr_or<std::string>(cfg, "prec_kind", tc.prec_kind);
@@ -250,7 +256,8 @@ private:
         ensure_default("tol_obj_change", 1e-12);
         ensure_default("tr_delta0", 1.0);
         ensure_default("filter_theta_min", 1e-8);
-        ensure_default("hessian_mode", std::string("exact"));
+        ensure_default("hessian_mode", std::string("lbfgs")); // "exact" or "lbfgs"
+        ensure_default("lbfgs_sparse_threshold", 1e-12);
         ensure_default("soc_violation_ratio", 0.9);
     }
 
@@ -267,35 +274,28 @@ private:
                            const dvec &zU, const std::optional<dvec> &lb,
                            const std::optional<dvec> &ub) {
         dvec r = g;
-        if (JE && JE->size() > 0)
-            r += JE->transpose() * nu;
-        if (JI && JI->size() > 0 && lam_user.size() > 0)
-            r += JI->transpose() * lam_user;
-        if (zU.size() == r.size())
-            r += zU; // +z_U
-        if (zL.size() == r.size())
-            r -= zL; // -z_L
+        if (JE && JE->size() > 0) r += JE->transpose() * nu;
+        if (JI && JI->size() > 0 && lam_user.size() > 0) r += JI->transpose() * lam_user;
+        if (zU.size() == r.size()) r += zU; // +z_U
+        if (zL.size() == r.size()) r -= zL; // -z_L
         const double stat = r.lpNorm<Eigen::Infinity>();
 
         const double feas_eq = cE ? cE->lpNorm<Eigen::Infinity>() : 0.0;
         double feas_in = 0.0;
         if (cI) {
             dvec tmp = *cI;
-            for (int i = 0; i < tmp.size(); ++i)
-                tmp[i] = std::max(0.0, tmp[i]);
+            for (int i = 0; i < tmp.size(); ++i) tmp[i] = std::max(0.0, tmp[i]);
             feas_in = tmp.lpNorm<Eigen::Infinity>();
         }
         double feas_box = 0.0;
         if (lb) {
             dvec t = (*lb) - xval;
-            for (int i = 0; i < t.size(); ++i)
-                t[i] = std::max(0.0, t[i]);
+            for (int i = 0; i < t.size(); ++i) t[i] = std::max(0.0, t[i]);
             feas_box = std::max(feas_box, t.lpNorm<Eigen::Infinity>());
         }
         if (ub) {
             dvec t = xval - (*ub);
-            for (int i = 0; i < t.size(); ++i)
-                t[i] = std::max(0.0, t[i]);
+            for (int i = 0; i < t.size(); ++i) t[i] = std::max(0.0, t[i]);
             feas_box = std::max(feas_box, t.lpNorm<Eigen::Infinity>());
         }
         const double ineq = std::max(feas_in, feas_box);
@@ -341,7 +341,6 @@ private:
         d.alpha = alpha;
         d.rho = rho;
         d.tr_radius = tr_delta;
-
         return d;
     }
 };

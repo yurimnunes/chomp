@@ -183,12 +183,12 @@ public:
         std::cout << "Model creation took " << elapsed.count() << " seconds.\n";
 
         // Managers (Python side)
-        auto HessianManager      = import_attr("nlp.blocks.aux", "HessianManager");
+        // auto HessianManager      = import_attr("nlp.blocks.aux", "HessianManager");
         auto RestorationManager  = import_attr("nlp.blocks.aux", "RestorationManager");
         auto Regularizer         = import_attr("nlp.blocks.reg", "Regularizer");
         auto QPSolver            = import_attr("nlp.blocks.qp",  "QPSolver");
 
-        hess_ = HessianManager(n_, cfg_);
+        // hess_ = HessianManager(n_, cfg_);
         rest_ = RestorationManager(cfg_);
         reg_  = Regularizer(cfg_);
         qp_   = QPSolver(cfg_, Regularizer(cfg_));
@@ -218,10 +218,10 @@ public:
 
         // IP stepper + state
         ip_state_   = IPState();                    // default-init
-        ip_stepper_ = new InteriorPointStepper(cfg_, hess_, m);
+        ip_stepper_ = new InteriorPointStepper(cfg_, m);
 
         // SQP stepper
-        sqp_stepper_ = new SQPStepper(cfg_, hess_, qp_, reg_, rest_, m);
+        sqp_stepper_ = new SQPStepper(cfg_, qp_, reg_, rest_, m);
 
         // Trackers
         last_header_row_ = -1;

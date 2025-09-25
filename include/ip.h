@@ -326,8 +326,6 @@ inline void cap_bound_duals_sigma_box(dvec &zL, dvec &zU, const Bounds &B,
 // ---------- Main Interior Point Stepper ----------
 class InteriorPointStepper {
 public:
-    kkt::HYKKTFlow *flow = nullptr;
-
     Bounds get_bounds(const dvec &x) {
         const int n = static_cast<int>(x.size());
         Bounds B;
@@ -366,20 +364,12 @@ public:
     int max_richardson_order_ = 3;
 
     ModelC *m_ = nullptr;
-    InteriorPointStepper(nb::object cfg, nb::object hess, ModelC *cfg_model)
-        : cfg_(std::move(cfg)), hess_(std::move(hess)), m_(cfg_model) {
+    InteriorPointStepper(nb::object cfg, ModelC *cfg_model)
+        : cfg_(std::move(cfg)), m_(cfg_model) {
         load_defaults_();
         load_gondzio_defaults_();
         std::shared_ptr<Funnel> funnel = std::shared_ptr<Funnel>();
         ls_ = std::make_shared<LineSearcher>(cfg_, nb::none(), funnel);
-
-        kkt::ChompConfig cfg_solver;
-        cfg_solver.sym_ordering = "amd";
-        cfg_solver.prec_type = "ssor";
-        cfg_solver.cg_tol = 1e-8;
-        cfg_solver.cg_maxit = 200;
-
-        flow = new kkt::HYKKTFlow(cfg_solver);
     }
 
     std::tuple<dvec, double, bool>

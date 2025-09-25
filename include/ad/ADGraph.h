@@ -399,15 +399,6 @@ private:
     mutable bool simplification_needed_ = false;
     size_t last_simplification_size_ = 0;
 
-    enum class Fam { Other, Add, Mul };
-
-    static inline Fam familyOf(Operator t) {
-        if (t == Operator::Add || t == Operator::Subtract)
-            return Fam::Add;
-        if (t == Operator::Multiply || t == Operator::Divide)
-            return Fam::Mul;
-        return Fam::Other;
-    }
 
     // Quantize doubles for constant key stability (same helper you had)
     static inline double qfp(double x, double s = 1e12) {

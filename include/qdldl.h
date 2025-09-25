@@ -600,43 +600,49 @@ inline void solve_with_ordering(const LDLFactors<FloatT, IntT> &F,
         [&](std::size_t i){ x[i] = xp[(size_t)ord.perm[i]]; });
 }
 
+
+// drop-in: a tight symmetric SpMV kernel for upper CSC (no diagonal double-count)
+template <std::floating_point FloatT, std::signed_integral IntT>
+inline void sym_spmv_upper(const qdldl23::SparseUpperCSC<FloatT, IntT>& A,
+                           const FloatT* __restrict__ x,
+                           FloatT* __restrict__ y) {
+    const IntT n = A.n;
+    std::fill(y, y + (size_t)n, FloatT{0});
+    for (IntT j = 0; j < n; ++j) {
+        const FloatT xj = x[(size_t)j];
+        const IntT p0 = A.Ap[(size_t)j], p1 = A.Ap[(size_t)j + 1];
+        for (IntT p = p0; p < p1; ++p) {
+            const IntT i = A.Ai[(size_t)p];
+            const FloatT v = A.Ax[(size_t)p];
+            y[(size_t)i] += v * xj;                // A(i,j)*x(j)
+            if (i != j) y[(size_t)j] += v * x[(size_t)i]; // A(j,i)*x(i)
+        }
+    }
+}
+
+
 // --------- Residual-based refinement (single-thread; no atomics) ----------
-template <std::floating_point FloatT = double,
-          std::signed_integral IntT = int32_t>
-inline void refine(const SparseUpperCSC<FloatT, IntT> &A,
-                   const LDLFactors<FloatT, IntT> &F, FloatT *x,
-                   const FloatT *b, int iters = 2,
-                   const Ordering<IntT> *ord = nullptr) {
+template <std::floating_point FloatT, std::signed_integral IntT>
+inline void refine(const SparseUpperCSC<FloatT, IntT>& A,
+                   const LDLFactors<FloatT, IntT>& F, FloatT* x,
+                   const FloatT* b, int iters = 2,
+                   const Ordering<IntT>* ord = nullptr) {
     const IntT n = A.n;
     std::vector<FloatT> r((size_t)n), t((size_t)n);
     for (int it = 0; it < iters; ++it) {
-        // r = b - A*x  (use upper symmetric structure)
-        std::fill(r.begin(), r.end(), FloatT{0});
-        for (IntT j = 0; j < n; ++j) {
-            const FloatT xj = x[(size_t)j];
-            for (IntT p = A.Ap[(size_t)j]; p < A.Ap[(size_t)j + 1]; ++p) {
-                const IntT i = A.Ai[(size_t)p];
-                const FloatT v = A.Ax[(size_t)p];
-                r[(size_t)i] += v * xj;
-                if (i != j)
-                    r[(size_t)j] += v * x[(size_t)i];
-            }
-        }
-        for (IntT i = 0; i < n; ++i)
-            r[(size_t)i] = b[(size_t)i] - r[(size_t)i];
-
-        // t = A^{-1} r
+        sym_spmv_upper(A, x, r.data());
+        for (IntT i = 0; i < n; ++i) r[(size_t)i] = b[(size_t)i] - r[(size_t)i];
         std::copy(r.begin(), r.end(), t.begin());
-        if (ord)
-            solve_with_ordering(F, *ord, t.data());
-        else
-            solve(F, t.data());
-
-        // x += t
-        detail::qd_par_for_n(static_cast<std::size_t>(n),
-            [&](std::size_t i){ x[i] += t[i]; });
+        if (ord) solve_with_ordering(F, *ord, t.data());
+        else     solve(F, t.data());
+#if QDLDL23_HAS_STDEXEC
+        detail::qd_par_for_n((size_t)n, [&](size_t i){ x[i] += t[i]; });
+#else
+        for (IntT i = 0; i < n; ++i) x[(size_t)i] += t[(size_t)i];
+#endif
     }
 }
+
 
 // --------- Aliases ----------
 using SparseD32 = SparseUpperCSC<double, int32_t>;

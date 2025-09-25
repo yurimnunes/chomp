@@ -42,336 +42,6 @@ using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 
-// ------------------------------ KKT assembly --------------------------
-
-/**
- * ReusedK
- * --------
- * Keeps:
- *  - AMD permutation (optional)
- *  - Symbolic analysis for LLT or LDLT (chosen once, with automatic fallback)
- *
- * Usage:
- *   ReusedK RK;
- *   RK.analyze_once(K0, use_amd=true);   // first iteration
- *   ...
- *   RK.refactor(Kt);                         // next iterations (same sparsity)
- *   x = RK.solve(b);                         // solve K x = b
- *
- * Notes:
- *  - If LLT fails during analyze_once(), we switch to LDLT and lock into it.
- *  - During refactor(), if the locked solver fails, we throw (pattern likely
- * changed).
- *  - If you *know* SPD can sometimes break, just start with LDLT by calling
- *    analyze_once(..., ..., force_ldlt=true).
- */
-struct ReusedK {
-    // configuration
-    bool use_amd = false;
-    bool locked_ldlt = false; // once we fall back, we keep LDLT forever
-
-    // permutation
-    Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> P;
-
-    // solvers (one active at a time)
-    std::shared_ptr<Eigen::SimplicialLLT<spmat>> llt;
-    std::shared_ptr<Eigen::SimplicialLDLT<spmat>> ldlt;
-
-    // quick status flags
-    bool analyzed = false;
-    bool is_spd() const { return analyzed && !locked_ldlt; }
-
-    // Clears all state (forces re-analyze next time)
-    void reset() {
-        use_amd = false;
-        locked_ldlt = false;
-        P.resize(0);
-        llt.reset();
-        ldlt.reset();
-        analyzed = false;
-    }
-
-    // Optional: switch ordering mode before analyze
-    void set_use_amd(bool v) { use_amd = v; }
-
-    /**
-     * analyze_once: run ordering + symbolic analysis exactly once.
-     * @param K          matrix to analyze (pattern reference)
-     * @param amd        whether to use AMD ordering
-     * @param force_ldlt force LDLT (skip LLT attempt)
-     */
-    void analyze_once(const spmat &K, bool amd = true,
-                      bool force_ldlt = false) {
-        if (analyzed)
-            return; // already done
-        use_amd = amd;
-
-        const int n = K.rows();
-        if (K.cols() != n)
-            throw std::invalid_argument("ReusedK: K must be square");
-
-        // Build permutation
-        if (use_amd) {
-            Eigen::AMDOrdering<int> ord;
-            ord(K, P);
-        } else {
-            P.setIdentity(n);
-        }
-
-        // Permuted pattern
-        spmat Kp = use_amd ? spmat((P.transpose() * K) * P) : K;
-        Kp.makeCompressed();
-
-        if (!force_ldlt) {
-            // Try LLT (SPD)
-            llt = std::make_shared<Eigen::SimplicialLLT<spmat>>();
-            llt->analyzePattern(Kp);
-            llt->factorize(Kp);
-            if (llt->info() == Eigen::Success) {
-                ldlt.reset();
-                locked_ldlt = false;
-                analyzed = true;
-                return;
-            }
-        }
-
-        // Fallback to LDLT (indefinite-safe)
-        ldlt = std::make_shared<Eigen::SimplicialLDLT<spmat>>();
-        ldlt->analyzePattern(Kp);
-        ldlt->factorize(Kp);
-        if (ldlt->info() != Eigen::Success) {
-            llt.reset();
-            ldlt.reset();
-            analyzed = false;
-            throw std::runtime_error(
-                "ReusedK::analyze_once: factorization failed");
-        }
-
-        llt.reset();
-        locked_ldlt = true;
-        analyzed = true;
-    }
-
-    /**
-     * refactor: numeric refactorization for the same sparsity pattern.
-     * Must call analyze_once() first; throws if numeric factorization fails.
-     */
-    void refactor(const spmat &K) {
-        if (!analyzed)
-            throw std::logic_error(
-                "ReusedK::refactor: analyze_once() not called");
-
-        spmat Kp = use_amd ? spmat((P.transpose() * K) * P) : K;
-        Kp.makeCompressed();
-
-        if (!locked_ldlt) {
-            // LLT path
-            llt->factorize(Kp);
-            if (llt->info() == Eigen::Success)
-                return;
-
-            // If LLT failed now (SPD broke), try switching permanently to LDLT
-            ldlt = std::make_shared<Eigen::SimplicialLDLT<spmat>>();
-            ldlt->analyzePattern(
-                Kp); // same pattern, but LDLT needs its own symbolic
-            ldlt->factorize(Kp);
-            if (ldlt->info() != Eigen::Success) {
-                ldlt.reset();
-                throw std::runtime_error(
-                    "ReusedK::refactor: LLT failed and LDLT failed");
-            }
-            llt.reset();
-            locked_ldlt = true;
-            return;
-        }
-
-        // LDLT path (locked)
-        ldlt->factorize(Kp);
-        if (ldlt->info() != Eigen::Success)
-            throw std::runtime_error(
-                "ReusedK::refactor: LDLT factorization failed");
-    }
-
-    /**
-     * solve: y = K^{-1} b  (uses last numeric factors)
-     */
-    dvec solve(const dvec &b) const {
-        if (!analyzed)
-            throw std::logic_error("ReusedK::solve: analyze_once() not called");
-
-        if (use_amd) {
-            dvec bp = P.transpose() * b;
-            if (!locked_ldlt) {
-                return P * llt->solve(bp);
-            } else {
-                return P * ldlt->solve(bp);
-            }
-        } else {
-            if (!locked_ldlt)
-                return llt->solve(b);
-            else
-                return ldlt->solve(b);
-        }
-    }
-
-    /**
-     * solve_inplace: b ← K^{-1} b  (overwrites b)
-     * Note: Eigen’s SimplicialLLT/LDLT don’t have solveInPlace for sparse by
-     * default, so we just assign the returned vector back to b.
-     */
-    void solve_inplace(dvec &b) const { b = solve(b); }
-
-    /**
-     * Multi-RHS solve: X = K^{-1} B
-     * (Columns solved independently; no extra symbolic cost.)
-     */
-    // Put this in ReusedK (replacing the previous dmat overload)
-    // Efficient multi-RHS solve: X = K^{-1} B
-    dmat solve(const dmat &B) const {
-        if (!analyzed)
-            throw std::logic_error(
-                "ReusedK::solve(B): analyze_once() not called");
-
-        dmat X;
-        if (!locked_ldlt) {
-            // SPD: K = P * (L L^T) * P^T
-            // 1) permute RHS once: Bp = P^T * B
-            dmat Bp = use_amd ? (P.transpose() * B).eval() : B;
-
-            // 2) Y = L^{-1} Bp   (forward solve on all columns)
-            dmat Y = Bp;
-            llt->matrixL().solveInPlace(Y);
-
-            // 3) Xp = L^{-T} Y    (backward solve on all columns)
-            dmat Xp = Y;
-            llt->matrixL().transpose().solveInPlace(Xp);
-
-            // 4) undo permutation: X = P * Xp
-            X = use_amd ? (P * Xp).eval() : Xp;
-        } else {
-            // Indefinite: K = P * (L D L^T) * P^T
-            dmat Bp = use_amd ? (P.transpose() * B).eval() : B;
-
-            // Forward: Y = L^{-1} Bp
-            dmat Y = Bp;
-            ldlt->matrixL().solveInPlace(Y);
-
-            // Scale by D^{-1}
-            const dvec &D = ldlt->vectorD();
-            for (int i = 0; i < Y.rows(); ++i) {
-                const double invd = std::abs(D[i]) > 1e-30 ? 1.0 / D[i] : 0.0;
-                Y.row(i) *= invd;
-            }
-
-            // Backward: Xp = L^{-T} Y
-            dmat Xp = Y;
-            ldlt->matrixL().transpose().solveInPlace(Xp);
-
-            X = use_amd ? (P * Xp).eval() : Xp;
-        }
-        return X;
-    }
-};
-
-class HYKKTFlow {
-public:
-    explicit HYKKTFlow(ChompConfig cfg) : cfg_(std::move(cfg)) {}
-
-    // Reset persistent state between *problems* (not between IP steps)
-    void reset() {
-        rk_.reset();
-        dy_prev_.reset();
-        gamma_.reset();
-        G_cached_.resize(0, 0);
-        analyzed_ = false;
-    }
-    std::pair<dvec, dvec>
-    step(const spmat &W, const spmat &G, const dvec &r1, const dvec &r2,
-         double delta, std::optional<double> gamma_user = std::nullopt) {
-        const int n = W.rows(), m = G.rows();
-        if (m == 0 || G.cols() != n)
-            throw std::invalid_argument("HYKKTFlow::step: invalid G");
-
-        // 1) gamma
-        if (gamma_user)
-            gamma_ = *gamma_user;
-        if (!gamma_)
-            gamma_ = compute_gamma_heuristic(W, G, delta);
-        const double gamma = *gamma_;
-
-        // 2) K
-        spmat K = build_augmented_system_inplace(W, G, delta, gamma);
-
-        // 3) analyze once / refactor
-        if (!rk_)
-            rk_ = std::make_shared<ReusedK>();
-        if (!analyzed_) {
-            rk_->analyze_once(K, /*amd=*/true);
-            analyzed_ = true;
-        } else {
-            rk_->refactor(K);
-        }
-        auto Ks = [&](const dvec &b) -> dvec { return rk_->solve(b); };
-
-        // 4) Schur RHS
-        const dvec s = r1 + gamma * (G.transpose() * r2);
-        const dvec rhs_s = G * Ks(s) - r2;
-
-        // 5) Dense or iterative Schur
-        const bool small_m =
-            (m <= std::max(1, int(0.05 * n))); // default cutoff
-
-        dvec dy;
-        if (small_m) {
-            const spmat Gt = G.transpose();
-            dmat Z(n, m);
-            Z.setZero();
-            dvec rhs(n);
-            for (int j = 0; j < m; ++j) {
-                rhs.setZero();
-                for (spmat::InnerIterator it(Gt, j); it; ++it)
-                    rhs[it.row()] = it.value();
-                Z.col(j) = Ks(rhs);
-            }
-            const dmat S = G * Z;
-            dy = Eigen::LLT<dmat>(S.selfadjointView<Eigen::Lower>())
-                     .solve(rhs_s);
-        } else {
-            // Light Jacobi preconditioner by default
-            dvec diagKinv = K.diagonal().cwiseMax(1e-12).cwiseInverse();
-            dvec dS = schur_diag_hat(G, diagKinv);
-            for (int i = 0; i < dS.size(); ++i)
-                dS[i] = 1.0 / std::max(dS[i], 1e-18);
-            std::optional<dvec> JacobiMinv = std::move(dS);
-
-            LinOp S_op{m, [&](const dvec &y, dvec &out) {
-                           out = G * Ks(G.transpose() * y);
-                       }};
-            auto [dy_sol, _] = cg(S_op, rhs_s, JacobiMinv, 1e-8, 200, dy_prev_,
-                                  std::nullopt, true);
-            dy = std::move(dy_sol);
-        }
-        dy_prev_ = dy;
-
-        // 6) Back-substitute
-        const dvec dx = Ks(s - G.transpose() * dy);
-        return {dx, dy};
-    }
-
-    // Accessors (optional)
-    const std::shared_ptr<ReusedK> &reusedK() const { return rk_; }
-    std::optional<double> gamma() const { return gamma_; }
-
-private:
-    ChompConfig cfg_;
-    std::shared_ptr<ReusedK> rk_;
-    bool analyzed_ = false;
-
-    std::optional<double> gamma_;
-    std::optional<dvec> dy_prev_;
-    spmat G_cached_; // kept if your Schur op needs a persistent G
-};
-
 // ------------------------------ HYKKT ---------------------------------
 // ------------------------------ HYKKT ---------------------------------
 class HYKKTStrategy final : public KKTStrategy {
@@ -419,7 +89,7 @@ public:
         for (int tries = 0; tries < 10; ++tries) {
             spmat K = build_augmented_system_inplace(W, G, delta1, gamma);
 
-            auto [solver_fn, is_spd] = create_or_refactor_solver(K, cfg);
+            auto [solver_fn, is_spd] = create_or_refactor_solver_qdldl(K, cfg);
             if (solver_fn) {
                 Ks = std::move(solver_fn);
                 used_llt = is_spd;
@@ -475,6 +145,24 @@ private:
         std::shared_ptr<Eigen::SimplicialLDLT<spmat>> ldlt;
         bool analyzed_llt{false}, analyzed_ldlt{false};
     };
+
+    struct QDLDLCache {
+        int n{-1};
+        bool use_amd{false};
+
+        // ordering
+        qdldl23::Ordering<int32_t> ord; // identity or AMD
+        bool have_ord{false};
+
+        // symbolic (for permuted matrix)
+        qdldl23::Symb32 Sperm;
+        bool have_S{false};
+
+        // numeric factors for permuted matrix
+        qdldl23::LDL32 F;
+        bool have_F{false};
+    };
+    mutable std::optional<QDLDLCache> qcache_;
     mutable std::optional<SymbolicCache> sym_; // persisted across calls
 
     // ======================= heuristics (yours) ======================
@@ -601,6 +289,81 @@ private:
                 return P * yp;
             }
             return L->solve(b);
+        };
+        return {f, false};
+    }
+
+    // Returns (solve function, is_spd==false since LDLᵀ; we don’t rely on SPD)
+    std::pair<std::function<dvec(const dvec &)>, bool>
+    create_or_refactor_solver_qdldl(const spmat &K,
+                                    const ChompConfig &cfg) const {
+        using namespace qdldl23;
+        const int n = K.rows();
+        const bool want_amd = (cfg.sym_ordering == "amd");
+
+        // (Re)build cache on size/order change
+        if (!qcache_ || qcache_->n != n || qcache_->use_amd != want_amd) {
+            qcache_.emplace();
+            qcache_->n = n;
+            qcache_->use_amd = want_amd;
+            qcache_->have_ord = false;
+            qcache_->have_S = false;
+            qcache_->have_F = false;
+        }
+
+        // Convert to upper CSC (explicit diagonals)
+        SparseD32 A = eigen_to_upper_csc(K);
+
+        // Ordering: AMD or identity (Eigen AMD gives old->new perm)
+        if (!qcache_->have_ord) {
+            if (want_amd) {
+                Eigen::AMDOrdering<int> amd;
+                Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> P;
+                P.setIdentity(n);
+                amd(K, P);
+                std::vector<int32_t> perm((size_t)n);
+                for (int i = 0; i < n; ++i)
+                    perm[(size_t)i] = (int32_t)P.indices()[i];
+                qcache_->ord = Ordering<int32_t>::from_perm(std::move(perm));
+            } else {
+                qcache_->ord = Ordering<int32_t>::identity((int32_t)n);
+            }
+            qcache_->have_ord = true;
+        }
+
+        // Analyze once on permuted structure
+        if (!qcache_->have_S) {
+            const auto B = permute_symmetric_upper(A, qcache_->ord);
+            qcache_->Sperm = analyze_fast(B);
+            qcache_->have_S = true;
+        }
+
+        // Numeric refactorization on current values (permuted)
+        // try {
+        qcache_->F = refactorize_with_ordering(A, qcache_->Sperm, qcache_->ord);
+        qcache_->have_F = true;
+        // } catch (const FactorizationError&) {
+        //     // Signal failure; caller will bump δ₁ and retry
+        //     return {nullptr, false};
+        // } catch (const InvalidMatrixError&) {
+        //     return {nullptr, false};
+        // }
+
+        // Solve closure: uses the cached factors + ordering
+        auto f = [F = qcache_->F, ord = qcache_->ord](const dvec &b) -> dvec {
+            dvec x = b;
+            // In-place solve on a copy (qdldl23 expects raw pointer)
+            qdldl23::solve_with_ordering(F, ord, x.data());
+            // Optional: a couple of refinement steps (cheap & robust)
+            qdldl23::refine(
+                /*A: we need it in upper form matching factors*/
+                // NOTE: refinement expects the *same* matrix used in
+                // factorization. We can regenerate the permuted upper CSC on
+                // the fly for robustness: but to keep it cheap, skip refinement
+                // here; enable if needed: refine(Aperm, F, x.data(), b.data(),
+                // 1, &ord);
+                qdldl23::SparseD32{}, F, x.data(), b.data(), 0, &ord);
+            return x;
         };
         return {f, false};
     }

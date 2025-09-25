@@ -14,8 +14,8 @@
 #include "../include/ad/Expression.h"
 #include "../include/ad/Variable.h"
 
-#include <Eigen/Dense>
 #include <Eigen/Core>
+#include <Eigen/Dense>
 #include <Eigen/SparseCore>
 
 #include <atomic>
@@ -42,7 +42,6 @@ using namespace nb::literals;
 using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
-
 
 // ---------- Memory pool for hot allocations ----------
 static std::pmr::unsynchronized_pool_resource g_pool{
@@ -1127,6 +1126,90 @@ public:
     }
 };
 
+// -----------------------------------------------------------------------------
+// Matrix-free HVP operator: y = (H_L(x,λ,ν) + sigma I) * v
+// Reuses LagHessFn graph + permutations; no allocations on hot path.
+// -----------------------------------------------------------------------------
+// ============================================================================
+// Matrix-free HVP operator for LagHessFn + Eigen glue
+// ============================================================================
+
+class CompiledHvpOp {
+public:
+    using Vec = Eigen::VectorXd;
+
+    explicit CompiledHvpOp(std::shared_ptr<LagHessFn> &L, double sigma = 0.0)
+        : L_(L), sigma_(sigma) {
+        L_->build_permutations_once_();
+        const std::size_t n = L_->x_nodes.size();
+
+        // Persistent scratch (no hot-path allocations):
+        Vcol_.assign(n, 0.0); // graph-order input vector (k=1, ld=1)
+        Ycol_.assign(n, 0.0); // graph-order output vector
+        y_x_.assign(n, 0.0);  // x-order output vector
+    }
+
+    inline Eigen::Index rows() const {
+        return static_cast<Eigen::Index>(L_->x_nodes.size());
+    }
+    inline Eigen::Index cols() const {
+        return static_cast<Eigen::Index>(L_->x_nodes.size());
+    }
+
+    template <typename DerivedIn, typename DerivedOut>
+    inline void perform_op(const Eigen::MatrixBase<DerivedIn> &x,
+                           Eigen::MatrixBase<DerivedOut> &y) const {
+        const std::size_t n = static_cast<std::size_t>(x.size());
+
+        // 1) Map x (x-order) -> Vcol_ (graph-order)
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t gi = static_cast<std::size_t>(L_->x2g_[i]);
+            Vcol_[gi] = x[static_cast<Eigen::Index>(i)];
+        }
+
+        // 2) Single-column HVP: Ycol_ = H * Vcol_
+        {
+            nb::gil_scoped_release nogil;
+            // args: (root, V, ldV=1, Y, ldY=1, k=1)
+            L_->g->hessianMultiVectorProduct(L_->L_root, Vcol_.data(), 1,
+                                            Ycol_.data(), 1, 1);
+        }
+
+        // 3) Map back to x-order: y_x_ <- perm^-1(Ycol_)
+        for (std::size_t gi = 0; gi < n; ++gi) {
+            const std::size_t xi = static_cast<std::size_t>(L_->g2x_[gi]);
+            y_x_[xi] = Ycol_[gi];
+        }
+
+        // 4) Write to Eigen destination
+        Eigen::Map<Vec>(y.derived().data(), y.size()) = Eigen::Map<const Vec>(
+            y_x_.data(), static_cast<Eigen::Index>(y_x_.size()));
+
+        // 5) Optional Tikhonov shift: y += sigma * x
+        if (sigma_ != 0.0) {
+            y.derived().noalias() += sigma_ * x.derived();
+        }
+    }
+
+    inline Vec operator*(const Vec &x) const {
+        Vec y(rows());
+        perform_op(x, y);
+        return y;
+    }
+
+    inline void set_sigma(double s) { sigma_ = s; }
+    inline double sigma() const { return sigma_; }
+
+private:
+    std::shared_ptr<LagHessFn> &L_;
+    double sigma_;
+
+    // Persistent scratch
+    mutable std::vector<double> Vcol_; // n x 1 (graph order)
+    mutable std::vector<double> Ycol_; // n x 1 (graph order)
+    mutable std::vector<double> y_x_;  // n     (x order)
+};
+
 // ---------- Caches ----------
 struct FnKey {
     PyObject *f;
@@ -1422,11 +1505,9 @@ static inline std::pair<dvec, dmat> batch_value_grad_from_gradfns_eigen(
 // tol: keep entries with |grad| > tol (use 0.0 to keep exact nonzeros)
 // reserve_nnz_per_row: optional hint to pre-reserve triplets
 
-static inline std::pair<dvec, spmat>
-batch_value_grad_from_gradfns_sparse(const std::vector<std::shared_ptr<GradFn>> &gfs,
-                                     const dvec &x,
-                                     double tol = 0.0,
-                                     int reserve_nnz_per_row = 0) {
+static inline std::pair<dvec, spmat> batch_value_grad_from_gradfns_sparse(
+    const std::vector<std::shared_ptr<GradFn>> &gfs, const dvec &x,
+    double tol = 0.0, int reserve_nnz_per_row = 0) {
     const Eigen::Index m = static_cast<Eigen::Index>(gfs.size());
     const Eigen::Index n = x.size();
 
@@ -1477,14 +1558,16 @@ batch_value_grad_from_gradfns_sparse(const std::vector<std::shared_ptr<GradFn>> 
             // append sparse row j
             if (tol <= 0.0) {
                 for (Eigen::Index i = 0; i < n; ++i) {
-                    const double g = gf->var_nodes[static_cast<size_t>(i)]->gradient;
+                    const double g =
+                        gf->var_nodes[static_cast<size_t>(i)]->gradient;
                     if (g != 0.0)
                         triplets.emplace_back(static_cast<SIndex>(j),
                                               static_cast<SIndex>(i), g);
                 }
             } else {
                 for (Eigen::Index i = 0; i < n; ++i) {
-                    const double g = gf->var_nodes[static_cast<size_t>(i)]->gradient;
+                    const double g =
+                        gf->var_nodes[static_cast<size_t>(i)]->gradient;
                     if (std::abs(g) > tol)
                         triplets.emplace_back(static_cast<SIndex>(j),
                                               static_cast<SIndex>(i), g);

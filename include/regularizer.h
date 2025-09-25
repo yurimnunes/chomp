@@ -164,7 +164,7 @@ public:
         // Use diagonal bounds as initial estimates
         double min_eig = 1e30, max_eig = -1e30;
         
-        #pragma omp parallel for reduction(min:min_eig) reduction(max:max_eig)
+        // #pragma omp parallel for reduction(min:min_eig) reduction(max:max_eig)
         for (int i = 0; i < n; ++i) {
             double d = A.coeff(i, i);
             min_eig = std::min(min_eig, d);
@@ -583,7 +583,7 @@ private:
         const int n = H.rows();
         double min_diag = 1e30, max_diag = -1e30;
         
-        #pragma omp parallel for reduction(min:min_diag) reduction(max:max_diag) if(cfg_.enable_parallel)
+        // #pragma omp parallel for reduction(min:min_diag) reduction(max:max_diag) if(cfg_.enable_parallel)
         for (int i = 0; i < n; ++i) {
             double d = H.coeff(i, i);
             min_diag = std::min(min_diag, d);
@@ -593,7 +593,7 @@ private:
         // Use Gershgorin circles for bounds refinement
         double min_gershgorin = 1e30, max_gershgorin = -1e30;
         
-        #pragma omp parallel for reduction(min:min_gershgorin) reduction(max:max_gershgorin) if(cfg_.enable_parallel)
+        // #pragma omp parallel for reduction(min:min_gershgorin) reduction(max:max_gershgorin) if(cfg_.enable_parallel)
         for (int i = 0; i < n; ++i) {
             double diag = H.coeff(i, i);
             double radius = 0.0;
@@ -658,7 +658,7 @@ private:
         spmat result = H;
         
         // In-place diagonal addition for sparse matrices
-        #pragma omp parallel for if(cfg_.enable_parallel && n > 1000)
+        // #pragma omp parallel for if(cfg_.enable_parallel && n > 1000)
         for (int i = 0; i < n; ++i) {
             result.coeffRef(i, i) += sigma;
         }
@@ -856,7 +856,7 @@ private:
         const int n = A.rows();
         dvec d_inv(n);
         
-        #pragma omp parallel for simd
+        // #pragma omp parallel for simd
         for (int i = 0; i < n; ++i) {
             double diag = A.coeff(i, i);
             d_inv(i) = (std::abs(diag) > 1e-16) ? (1.0 / diag) : 1.0;
@@ -930,7 +930,7 @@ private:
         for (int iter = 0; iter < iters; ++iter) {
             std::fill_n(work_vec_.data(), n, 0.0);
             
-            #pragma omp parallel for schedule(dynamic, 64)
+            // #pragma omp parallel for schedule(dynamic, 64)
             for (int i = 0; i < n; ++i) {
                 double sum = 0.0;
                 for (spmat::InnerIterator it(A, i); it; ++it) {

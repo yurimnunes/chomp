@@ -315,7 +315,8 @@ target_include_directories(chomp PRIVATE ${Python3_INCLUDE_DIRS})
 target_include_directories(ad PRIVATE ${Python3_INCLUDE_DIRS})
 
 # _ad_link_gurobi(chomp)
-# link openmp to chomp if available
+# # link openmp to chomp if available
+target_link_libraries(chomp PRIVATE OpenMP::OpenMP_CXX)
 
   find_package(TBB COMPONENTS tbb)
 if(TARGET TBB::tbb)

@@ -24,6 +24,7 @@ public:
     ADNodePtr node{};
     ADNodePtr rootNode{};
 
+    
     // Construct with graph (creates an empty node placeholder)
     explicit Expression(const ADGraphPtr &graphIn);
 
