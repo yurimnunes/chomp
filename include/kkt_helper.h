@@ -27,10 +27,57 @@
 #include <utility>
 #include <vector>
 
+// --- tiny CSR builder from Eigen (pattern-only)
+static CSR eigen_to_csr_pattern(const spmat &A) {
+    const int n = A.rows();
+    std::vector<std::vector<i32>> rows(n);
+    for (int j = 0; j < A.outerSize(); ++j) {
+        for (spmat::InnerIterator it(A, j); it; ++it) {
+            rows[it.row()].push_back(it.col());
+        }
+    }
+    CSR C(n);
+    C.indptr[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        auto &r = rows[i];
+        std::sort(r.begin(), r.end());
+        r.erase(std::unique(r.begin(), r.end()), r.end());
+        C.indptr[i + 1] = C.indptr[i] + (i32)r.size();
+    }
+    C.indices.resize(C.indptr.back());
+    for (int i = 0, w = 0; i < n; ++i)
+        for (int v : rows[i])
+            C.indices[(size_t)w++] = (i32)v;
+    return C;
+}
+
+// --- build qdldl23::Ordering from your AMD
+static qdldl23::Ordering<int32_t>
+qdldl_order_from_my_amd(const spmat &K, bool symmetrize_union = true,
+                        int dense_cutoff = -1) {
+    // 1) pattern to CSR
+    CSR A = eigen_to_csr_pattern(K);
+
+    // 2) run your AMD → p_new2old
+    AMDReorderingArray my_amd(/*aggressive_absorption=*/true, dense_cutoff);
+    std::vector<i32> p_new2old =
+        my_amd.amd_order(A, /*symmetrize=*/symmetrize_union);
+
+    // 3) invert to old->new as qdldl expects
+    std::vector<int32_t> perm_old2new(p_new2old.size());
+    for (int32_t newi = 0; newi < (int32_t)p_new2old.size(); ++newi) {
+        int32_t oldi = p_new2old[(size_t)newi];
+        perm_old2new[(size_t)oldi] = newi;
+    }
+
+    return qdldl23::Ordering<int32_t>::from_perm(std::move(perm_old2new));
+}
+
 namespace kkt {
 // Faster KKT assembly: single copy of W, no extra diagonal pass, streamed
 // inserts.
-// ====================== assemble_KKT (row-major right block) ======================
+// ====================== assemble_KKT (row-major right block)
+// ======================
 [[nodiscard]] inline spmat assemble_KKT(spmat W, double delta,
                                         const std::optional<spmat> &Gopt,
                                         bool *out_hasE) {
@@ -42,13 +89,16 @@ namespace kkt {
 
     // In-place diagonal regularization
     if (delta != 0.0) {
-        for (int i = 0; i < n; ++i) W.coeffRef(i, i) += delta;
+        for (int i = 0; i < n; ++i)
+            W.coeffRef(i, i) += delta;
         W.makeCompressed();
     }
 
     const bool hasE = Gopt && (Gopt->rows() > 0);
-    if (out_hasE) *out_hasE = hasE;
-    if (!hasE) return W;
+    if (out_hasE)
+        *out_hasE = hasE;
+    if (!hasE)
+        return W;
 
     const spmat &G = *Gopt;
     if (G.cols() != n)
@@ -67,13 +117,15 @@ namespace kkt {
     for (int j = 0; j < n; ++j) {
         const int wj = W.outerIndexPtr()[j + 1] - W.outerIndexPtr()[j];
         int gj = 0;
-        for (spmat::InnerIterator it(G, j); it; ++it) ++gj;
+        for (spmat::InnerIterator it(G, j); it; ++it)
+            ++gj;
         reserve[j] = wj + gj;
     }
     // Right block (n..n+m-1): G row nnz
     for (int i = 0; i < G_r.outerSize(); ++i) {
         int nnz = 0;
-        for (spmatR::InnerIterator it(G_r, i); it; ++it) ++nnz;
+        for (spmatR::InnerIterator it(G_r, i); it; ++it)
+            ++nnz;
         reserve[n + i] = nnz;
     }
 
@@ -247,7 +299,8 @@ eigen_to_upper_csc(const spmat &A, double diag_eps = 0.0) {
     // Scale each column j by s = sqrt(max(1e-18, diagKinv[j]))
     for (int j = 0; j < Gs.outerSize(); ++j) {
         const double s = std::sqrt(std::max(1e-18, diagKinv[j]));
-        if (s == 1.0) continue;
+        if (s == 1.0)
+            continue;
         for (spmat::InnerIterator it(Gs, j); it; ++it)
             it.valueRef() *= s;
     }
@@ -422,9 +475,8 @@ inline double maybe_simd_dot(const double *a, const double *b, int n,
 // Optimized CG for SPD with symmetric preconditioning (Jacobi / SSOR)
 [[nodiscard]] inline std::pair<dvec, CGInfo>
 cg(const LinOp &A, const dvec &b,
-   const std::optional<dvec> &JacobiMinvDiag = std::nullopt,
-   double tol = 1e-10, int maxit = 200,
-   const std::optional<dvec> &x0 = std::nullopt,
+   const std::optional<dvec> &JacobiMinvDiag = std::nullopt, double tol = 1e-10,
+   int maxit = 200, const std::optional<dvec> &x0 = std::nullopt,
    const std::optional<SSORPrecond> &ssor = std::nullopt,
    bool use_simd = true) {
     const int n = A.n;
@@ -516,7 +568,7 @@ cg(const LinOp &A, const dvec &b,
         }
 
         const double rz_new = maybe_simd_dot(r.data(), z.data(), n, use_simd);
-        const double beta   = rz_new / std::max(rz, 1e-300);
+        const double beta = rz_new / std::max(rz, 1e-300);
         rz = rz_new;
 
         // p = z + β p
@@ -582,9 +634,9 @@ inline dvec schur_diag_hat(const spmat &G, const dvec &d) {
 }
 
 // ------------------------------ Small Dense Solvers -------------------
-template<int N>
-struct SmallDenseSolver {
-    static dvec solve(const Eigen::Matrix<double,N,N>& A, const Eigen::Matrix<double,N,1>& b) {
+template <int N> struct SmallDenseSolver {
+    static dvec solve(const Eigen::Matrix<double, N, N> &A,
+                      const Eigen::Matrix<double, N, 1> &b) {
         if constexpr (N <= 4) {
             return A.llt().solve(b); // Very fast for tiny systems
         } else if constexpr (N <= 12) {
@@ -596,46 +648,46 @@ struct SmallDenseSolver {
 };
 
 // Specialization for 2x2
-template<>
-struct SmallDenseSolver<2> {
-    static dvec solve(const Eigen::Matrix2d& A, const Eigen::Vector2d& b) {
-        const double det = A(0,0)*A(1,1) - A(0,1)*A(1,0);
+template <> struct SmallDenseSolver<2> {
+    static dvec solve(const Eigen::Matrix2d &A, const Eigen::Vector2d &b) {
+        const double det = A(0, 0) * A(1, 1) - A(0, 1) * A(1, 0);
         if (std::abs(det) < 1e-16) {
             return A.llt().solve(b); // Fallback
         }
-        
+
         dvec x(2);
-        x(0) = (A(1,1)*b(0) - A(0,1)*b(1)) / det;
-        x(1) = (A(0,0)*b(1) - A(1,0)*b(0)) / det;
+        x(0) = (A(1, 1) * b(0) - A(0, 1) * b(1)) / det;
+        x(1) = (A(0, 0) * b(1) - A(1, 0) * b(0)) / det;
         return x;
     }
 };
 
 // Specialization for 3x3
-template<>
-struct SmallDenseSolver<3> {
-    static dvec solve(const Eigen::Matrix3d& A, const Eigen::Vector3d& b) {
-        const double det = A(0,0)*(A(1,1)*A(2,2) - A(1,2)*A(2,1)) -
-                          A(0,1)*(A(1,0)*A(2,2) - A(1,2)*A(2,0)) +
-                          A(0,2)*(A(1,0)*A(2,1) - A(1,1)*A(2,0));
-        
+template <> struct SmallDenseSolver<3> {
+    static dvec solve(const Eigen::Matrix3d &A, const Eigen::Vector3d &b) {
+        const double det = A(0, 0) * (A(1, 1) * A(2, 2) - A(1, 2) * A(2, 1)) -
+                           A(0, 1) * (A(1, 0) * A(2, 2) - A(1, 2) * A(2, 0)) +
+                           A(0, 2) * (A(1, 0) * A(2, 1) - A(1, 1) * A(2, 0));
+
         if (std::abs(det) < 1e-14) {
             return A.llt().solve(b); // Fallback
         }
-        
+
         dvec x(3);
-        x(0) = (b(0)*(A(1,1)*A(2,2) - A(1,2)*A(2,1)) - 
-                A(0,1)*(b(1)*A(2,2) - A(1,2)*b(2)) + 
-                A(0,2)*(b(1)*A(2,1) - A(1,1)*b(2))) / det;
-        x(1) = (A(0,0)*(b(1)*A(2,2) - A(1,2)*b(2)) - 
-                b(0)*(A(1,0)*A(2,2) - A(1,2)*A(2,0)) + 
-                A(0,2)*(A(1,0)*b(2) - b(1)*A(2,0))) / det;
-        x(2) = (A(0,0)*(A(1,1)*b(2) - b(1)*A(2,1)) - 
-                A(0,1)*(A(1,0)*b(2) - b(1)*A(2,0)) + 
-                b(0)*(A(1,0)*A(2,1) - A(1,1)*A(2,0))) / det;
+        x(0) = (b(0) * (A(1, 1) * A(2, 2) - A(1, 2) * A(2, 1)) -
+                A(0, 1) * (b(1) * A(2, 2) - A(1, 2) * b(2)) +
+                A(0, 2) * (b(1) * A(2, 1) - A(1, 1) * b(2))) /
+               det;
+        x(1) = (A(0, 0) * (b(1) * A(2, 2) - A(1, 2) * b(2)) -
+                b(0) * (A(1, 0) * A(2, 2) - A(1, 2) * A(2, 0)) +
+                A(0, 2) * (A(1, 0) * b(2) - b(1) * A(2, 0))) /
+               det;
+        x(2) = (A(0, 0) * (A(1, 1) * b(2) - b(1) * A(2, 1)) -
+                A(0, 1) * (A(1, 0) * b(2) - b(1) * A(2, 0)) +
+                b(0) * (A(1, 0) * A(2, 1) - A(1, 1) * A(2, 0))) /
+               det;
         return x;
     }
 };
-
 
 } // namespace kkt

@@ -357,7 +357,8 @@ public:
 
     nb::object model;
     RichardsonExtrapolator extrapolator_;
-    AdaptiveBarrierManager barrier_manager_;
+    AdaptiveBarrierManager mu_mgr_; // <<< NEW
+    bool mu_mgr_inited_ = false;    // <<< NEW
 
     bool use_richardson_ = true;
     double richardson_tolerance_ = 1e-8;
@@ -372,38 +373,120 @@ public:
         ls_ = std::make_shared<LineSearcher>(cfg_, nb::none(), funnel);
     }
 
-    std::tuple<dvec, double, bool>
-    compute_enhanced_step(const dvec &current_dx, const dvec &x, double alpha,
-                          double kkt_error, int iteration) {
-
-        dvec refined_dx = current_dx;
-        bool converged = false;
-        double error_estimate = std::numeric_limits<double>::infinity();
-
-        if (use_richardson_ && iteration > 0) {
-            // Add current step to history
-            extrapolator_.add_step(x, current_dx, alpha, kkt_error);
-
-            // Perform Richardson extrapolation
-            auto extrapolated =
-                extrapolator_.extrapolate_step(current_dx, alpha);
-
-            if (extrapolated.order_achieved >= 2 &&
-                extrapolated.error_estimate < richardson_tolerance_) {
-                refined_dx = extrapolated.dx_refined;
-                converged = extrapolated.converged;
-                error_estimate = extrapolated.error_estimate;
-
-                std::cout << "Richardson extrapolation applied: order "
-                          << extrapolated.order_achieved
-                          << ", error estimate: " << error_estimate
-                          << std::endl;
+    double colnorms(const std::optional<spmat> &J) {
+        if (!J || J->nonZeros() == 0)
+            return 1.0;
+        dvec col_sums = dvec::Zero(J->cols());
+        for (int k = 0; k < J->outerSize(); ++k) {
+            double sum = 0.0;
+            for (spmat::InnerIterator it(*J, k); it; ++it) {
+                sum += it.value() * it.value();
             }
+            col_sums(k) = std::sqrt(std::max(sum, 1e-16));
         }
-
-        return {refined_dx, error_estimate, converged};
+        return std::max(
+            1.0,
+            col_sums.mean()); // Use mean instead of median (see next error)
     }
 
+    std::optional<dvec> compute_equality_shift(const std::optional<spmat> &JE,
+                                               const std::optional<dvec> &cE) {
+        if (!cE || cE->size() == 0)
+            return std::nullopt;
+        double sigma_E = get_attr_or<double>(cfg_, "ip_sigma_E", 0.1) *
+                         std::max(1.0, colnorms(JE));
+        dvec rE = -sigma_E * (*cE);
+        double max_shift = get_attr_or<double>(cfg_, "ip_max_shift", 1e-2);
+        rE.cwiseMin(max_shift).cwiseMax(-max_shift);
+        return rE;
+    }
+
+    double adaptive_shift_slack_(const dvec &s, const dvec &cI, const dvec &lam,
+                                 int it) const {
+        if (!s.size())
+            return 0.0;
+        double base = get_attr_or<double>(cfg_, "ip_shift_tau", 1e-3);
+        double min_s = s.minCoeff();
+        double max_v = (cI.size() > 0) ? cI.cwiseAbs().maxCoeff() : 0.0;
+        double active_tol = get_attr_or<double>(cfg_, "ip_active_tol", 1e-3);
+        double mu_target = get_attr_or<double>(cfg_, "ip_mu_target", 1e-4);
+        double comp_shift = 0.0;
+        if (cI.size() > 0 && lam.size() == cI.size()) {
+            for (int i = 0; i < cI.size(); ++i) {
+                if (cI[i] >= -active_tol) {
+                    double lam_i = std::max(std::abs(lam[i]), 1e-12);
+                    comp_shift = std::max(
+                        comp_shift, std::max(0.0, mu_target / lam_i - cI[i]));
+                }
+            }
+        }
+        if (min_s < 1e-6 || max_v > 1e2)
+            return std::min(1.0, base * (1.0 + 0.1 * it) + comp_shift);
+        if (min_s > 1e-2 && max_v < 1e-2)
+            return clamp_min(base * (1.0 - 0.05 * it) + comp_shift, 0.0);
+        return base + comp_shift;
+    }
+
+    void init_mu_manager_from_cfg_() { // <<< NEW
+        AdaptiveBarrierConfig acfg;
+
+        // Map strings from cfg_ to enums (with safe defaults)
+        const auto mu_strategy_str =
+            get_attr_or<std::string>(cfg_, "mu_strategy", "adaptive");
+        acfg.mu_strategy = (mu_strategy_str == "monotone")
+                               ? MuStrategy::Monotone
+                               : MuStrategy::Adaptive;
+
+        const auto mu_oracle_str =
+            get_attr_or<std::string>(cfg_, "mu_oracle", "quality-function");
+        acfg.mu_oracle = (mu_oracle_str == "loqo") ? MuOracle::LOQO
+                                                   : MuOracle::QualityFunction;
+
+        // Typical IPOPT-style knobs (honor if present)
+        acfg.mu_init = get_attr_or<double>(cfg_, "mu_init", 1e-1);
+        acfg.mu_min = get_attr_or<double>(cfg_, "mu_min", 1e-14);
+        acfg.mu_max = get_attr_or<double>(cfg_, "mu_max", 1e2);
+        acfg.mu_target = get_attr_or<double>(cfg_, "mu_target", 0.0);
+
+        acfg.sigma_min = get_attr_or<double>(cfg_, "sigma_min", 0.05);
+        acfg.sigma_max = get_attr_or<double>(cfg_, "sigma_max", 0.95);
+        acfg.sigma_pow = get_attr_or<double>(cfg_, "sigma_pow", 3.0);
+
+        // Monotone mode helpers
+        acfg.mu_linear_decrease_factor =
+            get_attr_or<double>(cfg_, "mu_linear_decrease_factor", 0.2);
+        acfg.barrier_tol_factor =
+            get_attr_or<double>(cfg_, "barrier_tol_factor", 0.1);
+
+        // Progress/near-solution (keep your defaults if set)
+        acfg.fast_progress_thr =
+            get_attr_or<double>(cfg_, "fast_progress_thr", 0.35);
+        acfg.stall_thr = get_attr_or<double>(cfg_, "stall_thr", 0.05);
+        acfg.stall_k_max = get_attr_or<int>(cfg_, "stall_k_max", 3);
+        acfg.sigma_shrink_on_stall =
+            get_attr_or<double>(cfg_, "sigma_shrink_on_stall", 0.5);
+        acfg.sigma_boost_on_fast =
+            get_attr_or<double>(cfg_, "sigma_boost_on_fast", 1.2);
+        acfg.near_cap_c = get_attr_or<double>(cfg_, "near_cap_c", 1e-2);
+        acfg.near_cap_enable_thr =
+            get_attr_or<double>(cfg_, "near_cap_enable_thr", 1e-6);
+
+        // Acceptable termination (outer solver uses; exposed for completeness)
+        acfg.acceptable_tol = get_attr_or<double>(cfg_, "acceptable_tol", 1e-6);
+        acfg.acceptable_iter = get_attr_or<int>(cfg_, "acceptable_iter", 15);
+        acfg.acceptable_dual_inf_tol =
+            get_attr_or<double>(cfg_, "acceptable_dual_inf_tol", 1e10);
+        acfg.acceptable_constr_viol_tol =
+            get_attr_or<double>(cfg_, "acceptable_constr_viol_tol", 1e-2);
+        acfg.acceptable_compl_inf_tol =
+            get_attr_or<double>(cfg_, "acceptable_compl_inf_tol", 1e-2);
+        acfg.acceptable_obj_change_tol =
+            get_attr_or<double>(cfg_, "acceptable_obj_change_tol", 1e-20);
+
+        mu_mgr_ = AdaptiveBarrierManager(acfg);
+        mu_mgr_.reset();
+        mu_mgr_inited_ = true;
+    }
     std::tuple<dvec, dvec, dvec, SolverInfo>
     step(const dvec &x, const dvec &lam, const dvec &nu, int it,
          std::optional<IPState> /*ip_state_opt*/ = std::nullopt) {
@@ -413,9 +496,15 @@ public:
 #endif
 
         // -------------------- Init / state --------------------
-        if (!st.initialized) {
+        if (!st.initialized)
             st = state_from_model_(x);
+        if (!mu_mgr_inited_) {
+            init_mu_manager_from_cfg_();
+            const double mu_init = mu_mgr_.config().mu_init;
+            if (st.mu <= 0)
+                st.mu = mu_init;
         }
+
         const int n = static_cast<int>(x.size());
         const int mI = st.mI;
         const int mE = st.mE;
@@ -435,37 +524,142 @@ public:
 
         IP_LAP("init/state");
 
-        // -------------------- Evaluate model --------------------
-        // nb::dict d0 = nb::cast<nb::dict>(model->attr("eval_all")(x,
-        // comps_all));
-        m_->eval_all(x);
+        // -------------------- Small helpers (only de-duped bits)
+        // --------------------
+        struct EvalPack {
+            double f{};
+            dvec g, cI, cE;
+            spmat JI, JE;
+            double theta{};
+        };
+
+        auto eval_all_at = [&](const dvec &X, int n_, int mI_,
+                               int mE_) -> EvalPack {
+            m_->eval_all(X);
+            EvalPack E;
+            E.f = m_->get_f().value_or(0.0);
+            E.g = m_->get_g().value_or(dvec::Zero(n_));
+            E.cI = (mI_ > 0) ? m_->get_cI().value() : dvec::Zero(mI_);
+            E.cE = (mE_ > 0) ? m_->get_cE().value() : dvec::Zero(mE_);
+            E.JI = (mI_ > 0) ? m_->get_JI().value() : spmat(mI_, n_);
+            E.JE = (mE_ > 0) ? m_->get_JE().value() : spmat(mE_, n_);
+            E.theta = m_->constraint_violation(X);
+            return E;
+        };
+
+        auto build_r_d = [&](const EvalPack &E, const dvec &lmb_in,
+                             const dvec &nu_in, const dvec &zL_in,
+                             const dvec &zU_in) -> dvec {
+            dvec r_d = E.g;
+            if (E.JI.nonZeros())
+                r_d.noalias() += E.JI.transpose() * lmb_in;
+            if (E.JE.nonZeros())
+                r_d.noalias() += E.JE.transpose() * nu_in;
+            r_d -= zL_in;
+            r_d += zU_in;
+            return r_d;
+        };
+
+        auto aggregated_error =
+            [&](const EvalPack &E, const dvec &x_in, const dvec &lam_in,
+                const dvec &nu_in, const dvec &zL_in, const dvec &zU_in,
+                double mu_in, const dvec &s_in, const Bounds &B_in, int n_,
+                int mE_, int mI_, bool use_shifted_, double tau_shift_,
+                double bound_shift_) -> double {
+            dvec r_d = build_r_d(E, lam_in, nu_in, zL_in, zU_in);
+
+            const double s_max = get_attr_or<double>(cfg_, "ip_s_max", 100.0);
+            const int denom_ct = static_cast<int>(s_in.size()) + mE_ + n_;
+            const double sum_mults = lam_in.lpNorm<1>() + nu_in.lpNorm<1>() +
+                                     zL_in.lpNorm<1>() + zU_in.lpNorm<1>();
+            const double s_d =
+                clamp_min(sum_mults / clamp_min(denom_ct, 1), s_max) / s_max;
+            const double s_c =
+                clamp_min((zL_in.lpNorm<1>() + zU_in.lpNorm<1>()) /
+                              clamp_min(n_, 1),
+                          s_max) /
+                s_max;
+
+            const double comp_box =
+                detail::comp_inf_norm(s_in, lam_in, zL_in, zU_in, B_in, mu_in,
+                                      use_shifted_, tau_shift_, bound_shift_);
+
+            return std::max({safe_inf_norm(r_d) / s_d,
+                             (mE_ > 0) ? safe_inf_norm(E.cE) : 0.0,
+                             (mI_ > 0) ? safe_inf_norm(E.cI) : 0.0,
+                             comp_box / s_c});
+        };
+
+        auto assemble_W = [&](const spmat &H_in, const dvec &Sigma_x,
+                              const std::optional<spmat> &JI_opt,
+                              const dvec &Sigma_s_opt) -> spmat {
+            spmat W = H_in;
+            if (Sigma_x.size())
+                W.diagonal().array() += Sigma_x.array();
+            if (JI_opt && JI_opt->rows() > 0 &&
+                Sigma_s_opt.size() == JI_opt->rows()) {
+                spmat JIc = *JI_opt;
+                W += JIc.transpose() * Sigma_s_opt.asDiagonal() * JIc;
+                W.makeCompressed();
+            }
+            return W;
+        };
+
+        // stabilizing clamp + floor (used pre-manager)
+        auto preguard_mu = [&](double mu_in, double mu_aff, double sigma_pred,
+                               double comp_now, int mI_) -> double {
+            const double mu_min_cfg =
+                get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
+            const double comp_cap_factor =
+                get_attr_or<double>(cfg_, "ip_mu_comp_cap_factor", 10.0);
+            const bool use_mI_scaling =
+                get_attr_or<bool>(cfg_, "ip_mu_comp_cap_scale_by_mI", true);
+            const double hard_mu_upper =
+                get_attr_or<double>(cfg_, "ip_mu_hard_upper", 10.0);
+
+            const double mI_scale = use_mI_scaling ? clamp_min(mI_, 1) : 1.0;
+            const double cap_from_comp =
+                std::min(comp_now * mI_scale, hard_mu_upper);
+            const double floor_from_aff =
+                std::max(mu_min_cfg, sigma_pred * std::max(mu_aff, mu_min_cfg));
+
+            double mu_pre = mu_in;
+            if (comp_now * mI_scale > comp_cap_factor * mu_pre)
+                mu_pre = cap_from_comp;
+            mu_pre = std::max(mu_pre, floor_from_aff);
+            mu_pre = std::clamp(mu_pre, mu_mgr_.config().mu_min,
+                                mu_mgr_.config().mu_max);
+            return std::min(mu_pre, cap_from_comp); // optional post-cap
+        };
+
+        auto call_manager = [&](double mu0, double mu_aff, double err_cur,
+                                double err_prev_, double rp, double rd,
+                                double comp_now, double a_pri, double a_dua,
+                                int it_) -> double {
+            AdaptiveBarrierManager::Inputs in{
+                .mu = std::max(mu0, 1e-16),
+                .mu_aff = std::max(mu_aff, 1e-16),
+                .kkt_norm = std::max(err_cur, 1e-16),
+                .kkt_norm_prev = std::max(err_prev_, 1e-16),
+                .rp_norm = rp,
+                .rd_norm = rd,
+                .comp_mu = std::max(comp_now, 1e-16),
+                .alpha_pri = a_pri,
+                .alpha_dua = a_dua,
+                .step_accepted = true,
+                .iter = it_};
+            return mu_mgr_.update(in).mu_new;
+        };
+
+        // -------------------- Evaluate model at x --------------------
+        EvalPack E = eval_all_at(x, n, mI, mE);
         IP_LAP("eval_all(x)");
 
-        const double f = m_->get_f().value_or(0.0); // FIX 0
-
-        dvec g = m_->get_g().value_or(dvec::Zero(n)); // FIX 1
-
-        // If mI/mE can be zero, build zeros explicitly on that branch.
-        // Don’t mix a variant with an Eigen expression in the same ternary.
-        dvec cI = (mI > 0) ? m_->get_cI().value() : dvec::Zero(mI);
-        dvec cE = (mE > 0) ? m_->get_cE().value() : dvec::Zero(mE);
-        IP_LAP("extract f,g,cI,cE");
-
-        // For Jacobians, do NOT assign to nb::object. Extract as (dense|sparse)
-        // and normalize. If the producer may return either dense or sparse,
-        // accept both:
-        spmat JI = (mI > 0) ? m_->get_JI().value() : spmat(mI, n); // empty OK
-
-        spmat JE = (mE > 0) ? m_->get_JE().value() : spmat(mE, n); // FIX 5
-        IP_LAP("build JI/JE");
-
-        double theta = m_->constraint_violation(x);
-        IP_LAP("constraint_violation(x)");
-
-        // -------------------- Bounds & adaptive shifts --------------------
         Bounds B = get_bounds(x);
+        IP_LAP("bounds(get)");
+
         if (use_shifted && shift_adapt) {
-            tau_shift = adaptive_shift_slack_(s, cI, it);
+            tau_shift = adaptive_shift_slack_(s, E.cI, lam, it);
             st.tau_shift = tau_shift;
         }
         IP_LAP("bounds & shifts (A)");
@@ -477,60 +671,27 @@ public:
             bound_shift = adaptive_shift_bounds_(x, B, it);
         IP_LAP("bounds & shifts (B)");
 
-        // -------------------- Quick convergence check --------------------
         const double tol = get_attr_or<double>(cfg_, "tol", 1e-8);
 
-        auto compute_error_ =
-            [&](const dvec &g_in, const spmat &JI_in, const spmat &JE_in,
-                const dvec &cI_in, const dvec &cE_in, const dvec &x_in,
-                const dvec &lam_in, const dvec &nu_in, const dvec &zL_in,
-                const dvec &zU_in, double mu_in, const dvec &s_in) -> double {
-            dvec r_d = g_in;
-            if (JI_in.nonZeros())
-                r_d.noalias() += JI_in.transpose() * lam_in;
-            if (JE_in.nonZeros())
-                r_d.noalias() += JE_in.transpose() * nu_in;
-            r_d -= zL_in;
-            r_d += zU_in;
-
-            const double s_max = get_attr_or<double>(cfg_, "ip_s_max", 100.0);
-            const int denom_ct = static_cast<int>(s_in.size()) + mE + n;
-            const double sum_mults = lam_in.lpNorm<1>() + nu_in.lpNorm<1>() +
-                                     zL_in.lpNorm<1>() + zU_in.lpNorm<1>();
-            const double s_d =
-                clamp_min(sum_mults / clamp_min(denom_ct, 1), s_max) / s_max;
-            const double s_c =
-                clamp_min((zL_in.lpNorm<1>() + zU_in.lpNorm<1>()) /
-                              clamp_min(n, 1),
-                          s_max) /
-                s_max;
-
-            const double comp_box =
-                detail::comp_inf_norm(s_in, lam_in, zL_in, zU_in, B, mu_in,
-                                      use_shifted, tau_shift, bound_shift);
-
-            return std::max({safe_inf_norm(r_d) / s_d,
-                             (mE > 0) ? safe_inf_norm(cE_in) : 0.0,
-                             (mI > 0) ? safe_inf_norm(cI_in) : 0.0,
-                             comp_box / s_c});
-        };
-
-        const double err_0 =
-            compute_error_(g, JI, JE, cI, cE, x, lmb, nuv, zL, zU, mu, s);
+        // -------------------- Quick convergence check --------------------
+        const double err_prev =
+            aggregated_error(E, x, lmb, nuv, zL, zU, mu, s, B, n, mE, mI,
+                             use_shifted, tau_shift, bound_shift);
         IP_LAP("compute_error_(x)");
 
-        if (err_0 <= tol) {
+        if (err_prev <= tol) {
             SolverInfo info;
             info.mode = "ip";
             info.step_norm = 0.0;
             info.accepted = true;
             info.converged = true;
-            info.f = f;
-            info.theta = theta;
-            info.stat = safe_inf_norm(g);
-            info.ineq =
-                (mI > 0) ? safe_inf_norm((cI.array().max(0.0)).matrix()) : 0.0;
-            info.eq = (mE > 0) ? safe_inf_norm(cE) : 0.0;
+            info.f = E.f;
+            info.theta = E.theta;
+            info.stat = safe_inf_norm(E.g);
+            info.ineq = (mI > 0)
+                            ? safe_inf_norm((E.cI.array().max(0.0)).matrix())
+                            : 0.0;
+            info.eq = (mE > 0) ? safe_inf_norm(E.cE) : 0.0;
             info.comp =
                 detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
             info.ls_iters = 0;
@@ -538,80 +699,59 @@ public:
             info.rho = 0.0;
             info.tr_radius = 0.0;
             info.mu = mu;
-            IP_LAP("early-exit pack");
             return {x, lmb, nuv, info};
         }
 
         // -------------------- Sigmas & Hessian --------------------
         const double eps_abs = get_attr_or<double>(cfg_, "sigma_eps_abs", 1e-8);
-        const double cap = get_attr_or<double>(cfg_, "sigma_cap", 1e8);
+        const double cap_add = get_attr_or<double>(cfg_, "sigma_cap", 1e8);
 
         Sigmas Sg =
-            detail::build_sigmas(zL, zU, B, lmb, s, cI, tau_shift, bound_shift,
-                                 use_shifted, eps_abs, cap);
+            detail::build_sigmas(zL, zU, B, lmb, s, E.cI, tau_shift,
+                                 bound_shift, use_shifted, eps_abs, cap_add);
         IP_LAP("build_sigmas");
 
-        // nb::object lag_obj = model->attr("lag_hessian");
-        // LagHessFn *lag_ptr = nb::cast<LagHessFn *>(lag_obj);
-        // auto H_obj = lag_ptr->hess_eigen(x, lmb, nuv);
-
-        auto H_obj = m_->hess(x, lmb, nuv);
-
-        // spmat H0 = pyconv::to_sparse(H_obj);
-        spmat H0 = H_obj;
+        auto H0 = m_->hess(x, lmb, nuv);
         IP_LAP("get Hessian");
-
         auto [H, reg_info] = regularizer_->regularize(H0, it);
         H.makeCompressed();
         IP_LAP("regularize(H)");
 
-        auto assemble_W = [&](const spmat &H_in, const dvec &Sigma_x,
-                              const std::optional<spmat> &JI_opt,
-                              const dvec &Sigma_s_opt) -> spmat {
-            spmat W = H_in;
-            if (Sigma_x.size())
-                W.diagonal().array() += Sigma_x.array();
-            if (JI_opt && JI_opt->rows() > 0 &&
-                Sigma_s_opt.size() == JI_opt->rows()) {
-                spmat JIc = *JI_opt;
-                JIc.makeCompressed();
-                W += JIc.transpose() * Sigma_s_opt.asDiagonal() * JIc;
-                W.makeCompressed();
-            }
-            return W;
-        };
-        std::optional<spmat> JI_opt =
-            (mI > 0 && JI.nonZeros()) ? std::optional<spmat>(JI) : std::nullopt;
-        spmat W = assemble_W(H, Sg.Sigma_x, JI_opt, Sg.Sigma_s);
+        spmat W =
+            assemble_W(H, Sg.Sigma_x,
+                       (mI > 0 && E.JI.nonZeros()) ? std::optional<spmat>(E.JI)
+                                                   : std::nullopt,
+                       Sg.Sigma_s);
         IP_LAP("assemble W");
 
         // -------------------- Residuals --------------------
-        dvec r_d = g;
-        if (mI > 0 && JI.nonZeros())
-            r_d.noalias() += JI.transpose() * lmb;
-        if (mE > 0 && JE.nonZeros())
-            r_d.noalias() += JE.transpose() * nuv;
-        r_d -= zL;
-        r_d += zU;
-
-        dvec r_pE = (mE > 0) ? cE : dvec();
-        dvec r_pI = (mI > 0) ? (cI + s) : dvec();
+        dvec r_d = build_r_d(E, lmb, nuv, zL, zU);
+        dvec r_pE = (mE > 0) ? E.cE : dvec();
+        dvec r_pI = (mI > 0) ? (E.cI + s) : dvec();
         IP_LAP("build residuals");
 
+        std::optional<dvec> r_pE_shifted = r_pE;
+        if (mE > 0) {
+            auto rE = compute_equality_shift(
+                E.JE.nonZeros() ? std::optional<spmat>(E.JE) : std::nullopt,
+                r_pE);
+            if (rE)
+                r_pE_shifted = r_pE + *rE;
+        }
+
         // -------------------- Mehrotra + Gondzio --------------------
-        const auto [alpha_aff, mu_aff, sigma, gondzio_step] =
+        const auto [alpha_aff, mu_aff, sigma_pred, gondzio_step] =
             mehrotra_with_gondzio_corrections_(
                 W, r_d,
-                (mE > 0 && JE.nonZeros()) ? std::optional<spmat>(JE)
-                                          : std::nullopt,
-                (mE > 0 && r_pE.size()) ? std::optional<dvec>(r_pE)
-                                        : std::nullopt,
-                (mI > 0 && JI.nonZeros()) ? std::optional<spmat>(JI)
-                                          : std::nullopt,
+                (mE > 0 && E.JE.nonZeros()) ? std::optional<spmat>(E.JE)
+                                            : std::nullopt,
+                r_pE_shifted,
+                (mI > 0 && E.JI.nonZeros()) ? std::optional<spmat>(E.JI)
+                                            : std::nullopt,
                 (mI > 0 && r_pI.size()) ? std::optional<dvec>(r_pI)
                                         : std::nullopt,
                 s, lmb, zL, zU, B, use_shifted, tau_shift, bound_shift, mu,
-                theta, Sg);
+                E.theta, Sg);
         IP_LAP("mehrotra+gondzio");
 
         dvec dx = gondzio_step.dx;
@@ -622,15 +762,23 @@ public:
         dvec dzL = gondzio_step.dzL;
         dvec dzU = gondzio_step.dzU;
 
-        // Barrier update heuristic
-        const double comp_now =
-            detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
-        if (comp_now * clamp_min(mI, 1) > 10.0 * mu)
-            mu = std::min(comp_now * clamp_min(mI, 1), 10.0);
-        mu = clamp_min(sigma * mu_aff,
-                       get_attr_or<double>(cfg_, "ip_mu_min", 1e-12));
+        // -------------------- μ pre-guard + manager (pre-LS)
+        // --------------------
+        {
+            const double comp_now =
+                detail::complementarity(s, lmb, mu, tau_shift, use_shifted);
+            double mu_pre = preguard_mu(mu, mu_aff, sigma_pred, comp_now, mI);
+            const double rp = std::max({(mE > 0) ? safe_inf_norm(E.cE) : 0.0,
+                                        (mI > 0) ? safe_inf_norm(E.cI) : 0.0});
+            const double rd = safe_inf_norm(E.g);
+            mu = call_manager(mu_pre, mu_aff,
+                              /*err_cur*/ err_prev, /*err_prev*/ err_prev, rp,
+                              rd, comp_now,
+                              /*alpha_pri*/ 1.0, /*alpha_dua*/ 1.0, it);
+        }
+        IP_LAP("barrier manager (pre)");
 
-        // Trust region clipping
+        // -------------------- Trust region clipping --------------------
         const double dx_cap = get_attr_or<double>(cfg_, "ip_dx_max", 1e3);
         const double nx = dx.norm();
         if (nx > dx_cap && nx > 0.0) {
@@ -660,14 +808,9 @@ public:
         int ls_iters = 0;
         bool needs_restoration = false;
 
-        // auto [refined_dx, error_est, converged_rich] =
-        //     compute_enhanced_step(dx, x, alpha, safe_inf_norm(g), it);
-        // dx = refined_dx;
-        IP_LAP("richardson refine");
-
         auto ls_res =
             ls_->search(m_, x, dx, (mI ? s : dvec()), (mI ? ds : dvec()), mu,
-                        g.dot(dx), theta, alpha_max);
+                        E.g.dot(dx), E.theta, alpha_max);
         alpha = std::get<0>(ls_res);
         ls_iters = std::get<1>(ls_res);
         needs_restoration = std::get<2>(ls_res);
@@ -678,7 +821,7 @@ public:
             cfg_, "ls_min_alpha",
             get_attr_or<double>(cfg_, "ip_alpha_min", 1e-10));
         if (alpha <= ls_min_alpha && needs_restoration) {
-            dvec dxf = -g;
+            dvec dxf = -E.g;
             const double ng = dxf.norm();
             if (ng > 0)
                 dxf /= ng;
@@ -690,8 +833,7 @@ public:
             info.step_norm = (x_new - x).norm();
             info.accepted = true;
             info.converged = false;
-            double f_new = 0.0; // TODO eval f at x_new?
-            info.f = f_new;
+            info.f = 0.0; // optionally eval f at x_new if needed
             info.theta = m_->constraint_violation(x_new);
             info.stat = 0.0;
             info.ineq = 0.0;
@@ -702,7 +844,6 @@ public:
             info.rho = 0.0;
             info.tr_radius = 0.0;
             info.mu = mu;
-            IP_LAP("restoration accept");
             return {x_new, lmb, nuv, info};
         }
 
@@ -720,80 +861,44 @@ public:
                                           bound_shift, mu, 1e10);
         IP_LAP("apply step & cap");
 
-        m_->eval_all(x_new);
-
-        double f_new = m_->get_f().value_or(0.0);         // FIX 0
-        dvec g_new = m_->get_g().value_or(dvec::Zero(n)); // FIX 1
-
-        dvec cI_new = (mI > 0) ? m_->get_cI().value() : dvec::Zero(mI); // FIX 3
-
-        dvec cE_new = (mE > 0) ? m_->get_cE().value() : dvec::Zero(mE); // FIX 4
-        IP_LAP("extract f,g,cI,cE new");
-
-        spmat JI_new =
-            (mI > 0) ? m_->get_JI().value() : spmat(mI, n); // empty OK
-        spmat JE_new = (mE > 0) ? m_->get_JE().value() : spmat(mE, n); // FIX 5
-        IP_LAP("build JI/JE new");
-
-        double theta_new = m_->constraint_violation(x_new);
+        EvalPack En = eval_all_at(x_new, n, mI, mE);
         IP_LAP("eval_all(x_new)");
 
         // -------------------- KKT residuals (new) --------------------
-        dvec r_d_new = g_new;
-        if (mI > 0 && JI_new.nonZeros())
-            r_d_new.noalias() += JI_new.transpose() * lmb_new;
-        if (mE > 0 && JE_new.nonZeros())
-            r_d_new.noalias() += JE_new.transpose() * nu_new;
-        r_d_new -= zL_new;
-        r_d_new += zU_new;
+        dvec r_d_new = build_r_d(En, lmb_new, nu_new, zL_new, zU_new);
 
         KKT kkt_new;
         kkt_new.stat = safe_inf_norm(r_d_new);
         kkt_new.ineq =
-            (mI > 0) ? safe_inf_norm((cI_new.array().max(0.0)).matrix()) : 0.0;
-        kkt_new.eq = (mE > 0) ? safe_inf_norm(cE_new) : 0.0;
+            (mI > 0) ? safe_inf_norm((En.cI.array().max(0.0)).matrix()) : 0.0;
+        kkt_new.eq = (mE > 0) ? safe_inf_norm(En.cE) : 0.0;
         kkt_new.comp =
             detail::comp_inf_norm(s_new, lmb_new, zL_new, zU_new, Bn, mu,
                                   use_shifted, tau_shift, bound_shift);
+        const double tol_outer = tol;
         const bool converged =
-            (kkt_new.stat <= tol && kkt_new.ineq <= tol && kkt_new.eq <= tol &&
-             kkt_new.comp <= tol && mu <= tol / 10.0);
+            (kkt_new.stat <= tol_outer && kkt_new.ineq <= tol_outer &&
+             kkt_new.eq <= tol_outer && kkt_new.comp <= tol_outer &&
+             mu <= tol_outer / 10.0);
         IP_LAP("KKT new");
 
-        // -------------------- Barrier manager update --------------------
-        auto complementarity =
-            detail::complementarity(s_new, lmb_new, mu, tau_shift, use_shifted);
-        auto feasibility_error = std::max(kkt_new.ineq, kkt_new.eq);
-        bool step_accepted = true;
-        double alpha_step = alpha;
-        auto mu_up = barrier_manager_.update_barrier_parameter(
-            mu, kkt_new.stat, complementarity, feasibility_error, alpha_step,
-            step_accepted, it);
-        mu = mu_up.mu_new;
-        IP_LAP("barrier manager");
+        // -------------------- Aggregated error (new) --------------------
+        const double err_new = aggregated_error(
+            En, x_new, lmb_new, nu_new, zL_new, zU_new, mu, s_new, Bn, n, mE,
+            mI, use_shifted, tau_shift, bound_shift);
+        IP_LAP("compute_error_(x_new)");
 
-        // // s = x_{k+1} - x_k
-        // dvec sx = x_new - x;
-
-        // // y = ∇L_{new} - ∇L_{old}, with ∇L = r_d + zL - zU
-        // dvec gradL_old = r_d;// + zL - zU;
-        // dvec gradL_new = r_d_new;// + zL_new - zU_new;
-        // dvec yL = gradL_new - gradL_old;
-        // // IP_LAP("hessian_update");
-        // try {
-        //     if (step_accepted) {
-        //         model->attr("hessian_update")(nb::cast(sx), nb::cast(yL));
-        //     } else {
-        //         nb::dict kw;
-        //         kw["accepted"] = nb::bool_(false);
-        //         model->attr("hessian_update")(nb::cast(sx), nb::cast(yL),
-        //         **kw);
-        //     }
-        // } catch (const nb::python_error &e) {
-        //     // optional: log and proceed
-        //     // std::cerr << "hessian_update failed: " << e.what() << "\n";
-        // }
-        // IP_LAP("hessian_update");
+        // -------------------- Barrier manager update (post-LS)
+        // --------------------
+        {
+            const double comp_now_new = detail::complementarity(
+                s_new, lmb_new, mu, tau_shift, use_shifted);
+            mu = call_manager(mu, std::max(mu_aff, 1e-16), err_new, err_prev,
+                              std::max(kkt_new.ineq, kkt_new.eq), kkt_new.stat,
+                              comp_now_new,
+                              /*alpha_pri*/ alpha, /*alpha_dua*/ alpha, it);
+        }
+        IP_LAP("barrier manager (post)");
 
         // -------------------- Pack & update state --------------------
         SolverInfo info;
@@ -801,8 +906,8 @@ public:
         info.step_norm = (x_new - x).norm();
         info.accepted = true;
         info.converged = converged;
-        info.f = f_new;
-        info.theta = theta_new;
+        info.f = En.f;
+        info.theta = En.theta;
         info.stat = kkt_new.stat;
         info.ineq = kkt_new.ineq;
         info.eq = kkt_new.eq;
@@ -823,7 +928,6 @@ public:
         st.zU = std::move(zU_new);
         st.mu = mu;
         st.tau_shift = tau_shift;
-        IP_LAP("pack & update state");
 
         return {x_new, st.lam, st.nu, info};
     }
@@ -834,17 +938,6 @@ private:
     std::shared_ptr<kkt::KKTReusable> cached_kkt_solver_{};
     spmat cached_kkt_matrix_;
     bool kkt_factorization_valid_ = false;
-
-    // Faster sparsity reuse check (structure only)
-    bool same_sparsity(const spmat &A, const spmat &B) const {
-        if (A.rows() != B.rows() || A.cols() != B.cols() ||
-            A.nonZeros() != B.nonZeros())
-            return false;
-        return std::equal(A.outerIndexPtr(), A.outerIndexPtr() + A.outerSize(),
-                          B.outerIndexPtr()) &&
-               std::equal(A.innerIndexPtr(), A.innerIndexPtr() + A.nonZeros(),
-                          B.innerIndexPtr());
-    }
 
     bool matrices_equal(const spmat &A, const spmat &B, double tol = 1e-4) {
         if (A.rows() != B.rows() || A.cols() != B.cols())
@@ -887,17 +980,15 @@ private:
                                            cfg_, "ip_alpha_min", 1e-10)));
     }
 
+    // --- State bootstrap ---
     [[nodiscard]] IPState state_from_model_(const dvec &x) {
         IPState s{};
         s.mI = m_->get_mI();
         s.mE = m_->get_mE();
 
-        // eval_all -> dict (use nb::getattr + nb::cast)
         m_->eval_all(x, std::vector<std::string>{"cI", "cE"});
-        std::cout << "Initial eval_all done.\n";
-
         dvec cI = (s.mI > 0) ? m_->get_cI().value() : dvec::Zero(s.mI);
-        std::cout << "Initial cI done.\n";
+
         const double mu0 =
             clamp_min(get_attr_or<double>(cfg_, "ip_mu_init", 1e-2), 1e-12);
         const bool use_shifted =
@@ -909,8 +1000,8 @@ private:
                         : 0.0;
 
         if (s.mI > 0) {
-            s.s = dvec(s.mI);
-            s.lam = dvec(s.mI);
+            s.s.resize(s.mI);
+            s.lam.resize(s.mI);
             for (int i = 0; i < s.mI; ++i) {
                 s.s[i] = clamp_min(-cI[i] + 1e-3, 1.0);
                 const double denom =
@@ -927,8 +1018,7 @@ private:
         Bounds B = get_bounds(x);
         s.zL = dvec::Zero(x.size());
         s.zU = dvec::Zero(x.size());
-
-        for (int i = 0; i < (int)x.size(); ++i) {
+        for (int i = 0; i < x.size(); ++i) {
             if (B.hasL[i])
                 s.zL[i] = clamp_min(
                     mu0 / clamp_min(B.sL[i] + bound_shift, 1e-12), 1e-8);
@@ -941,20 +1031,6 @@ private:
         s.tau_shift = tau_shift;
         s.initialized = true;
         return s;
-    }
-
-    [[nodiscard]] double adaptive_shift_slack_(const dvec &s, const dvec &cI,
-                                               int it) const {
-        if (!s.size())
-            return 0.0;
-        double base = get_attr_or<double>(cfg_, "ip_shift_tau", 1e-3);
-        double min_s = s.minCoeff();
-        double max_v = (cI.size() > 0) ? cI.cwiseAbs().maxCoeff() : 0.0;
-        if (min_s < 1e-6 || max_v > 1e2)
-            return std::min(1.0, base * (1.0 + 0.1 * it));
-        if (min_s > 1e-2 && max_v < 1e-2)
-            return clamp_min(base * (1.0 - 0.05 * it), 0.0);
-        return base;
     }
 
     [[nodiscard]] double adaptive_shift_bounds_(const dvec &x, const Bounds &B,
@@ -982,6 +1058,8 @@ private:
             return clamp_min(b0 * 0.9, 0.0);
         return b0;
     }
+
+    // --- KKT solve (with reuse) ---
     [[nodiscard]] KKTResult solve_KKT_(const spmat &W, const dvec &rhs_x,
                                        const std::optional<spmat> &JE,
                                        const std::optional<dvec> &rpE,
@@ -997,73 +1075,27 @@ private:
         if (mE == 0 && (method_cpp == "hykkt" || method_cpp == "hykkt_cholmod"))
             method_cpp = "ldl";
 
-        // // ---------- New: fast path using HYKKTFlow (handles reuse
-        // internally)
-        // // ----------
-        // if ((method_cpp == "hykkt" || method_cpp == "hykkt_cholmod") &&
-        //     mE > 0) {
-        //         std::cout << "Using HYKKTFlow solver.\n";
-        //     // Create once; reuse across IP iterations (symbolic + AMD cached
-        //     // inside) if (!flow) {
-        //     //     // You can map fields from your ChompConfig to hykkt_cfg_
-        //     //     here if needed hykkt_cfg_.sym_ordering       = "amd";
-        //     //     hykkt_cfg_.schur_dense_cutoff = 0.05;  // m <= 5% of n →
-        //     //     dense Schur hykkt_cfg_.use_prec           = true;  //
-        //     Jacobi
-        //     //     by default hykkt_cfg_.cg_tol             = 1e-8;
-        //     //     hykkt_cfg_.cg_maxit           = 200;
-        //     //     hykkt_cfg_.use_simd           = true;
-
-        //     //     hykkt_flow_ =
-        //     std::make_unique<kkt::HYKKTFlow>(hykkt_cfg_);
-        //     // }
-
-        //     // delta: your IP regularization for W; if you have a value, pass
-        //     it
-        //     // here
-        //     const double delta = 0.0;
-
-        //     // Flow step (reuses ordering + symbolic + CG warm starts)
-        //     auto [dx, dy] = flow->step(
-        //         W,
-        //         *JE, // G
-        //         r1,
-        //         r2.value(), // we know mE>0
-        //         delta,
-        //         std::nullopt // or std::optional<double>(gamma_override)
-        //     );
-
-        //     // If your KKTResult third field must be non-null, you can keep
-        //     // nullptr; the flow already handles reuse internally on
-        //     subsequent
-        //     // calls.
-        //     return {std::move(dx), std::move(dy), /*reusable*/ nullptr};
-        // }
-
-        // ---------- Old path for non-HYKKT methods (unchanged) ----------
         const bool can_reuse = kkt_factorization_valid_ && cached_kkt_solver_ &&
                                matrices_equal(W, cached_kkt_matrix_);
-
         if (can_reuse) {
-            std::cout << "Reusing KKT factorization.\n";
             auto [dx, dy] = cached_kkt_solver_->solve(rhs_x, r2, 1e-8, 200);
             return {std::move(dx), std::move(dy), cached_kkt_solver_};
-        } else {
-            kkt::ChompConfig conf;
-            auto &reg = kkt::default_registry();
-            auto strat = reg.get(method_cpp);
-
-            auto [dx, dy, reusable] = strat->factor_and_solve(
-                W, (mE > 0 ? std::optional<spmat>(*JE) : std::nullopt), r1, r2,
-                conf, std::nullopt, kkt_cache_, 0.0, std::nullopt, true, true);
-
-            cached_kkt_matrix_ = W;
-            cached_kkt_solver_ = reusable;
-            kkt_factorization_valid_ = true;
-            return {std::move(dx), std::move(dy), std::move(reusable)};
         }
+
+        kkt::ChompConfig conf;
+        auto &reg = kkt::default_registry();
+        auto strat = reg.get(method_cpp);
+        auto [dx, dy, reusable] = strat->factor_and_solve(
+            m_, W, (mE > 0 ? std::optional<spmat>(*JE) : std::nullopt), r1, r2,
+            conf, std::nullopt, kkt_cache_, 0.0, std::nullopt, true, true);
+
+        cached_kkt_matrix_ = W;
+        cached_kkt_solver_ = reusable;
+        kkt_factorization_valid_ = true;
+        return {std::move(dx), std::move(dy), std::move(reusable)};
     }
 
+    // --- Mehrotra (affine) ---
     [[nodiscard]] std::tuple<double, double, double> mehrotra_affine_predictor_(
         const spmat &W, const dvec &r_d, const std::optional<spmat> &JE,
         const std::optional<dvec> &r_pE, const std::optional<spmat> &JI,
@@ -1084,13 +1116,16 @@ private:
         const int n = static_cast<int>(zL.size());
 
         dvec ds_aff, dlam_aff;
-        if (mI > 0) {
+        if (mI > 0 && JI) {
             ds_aff = -(r_pI.value() + (*JI) * dx_aff);
             dlam_aff = dvec(mI);
             for (int i = 0; i < mI; ++i) {
                 const double d = use_shifted ? (s[i] + tau_shift) : s[i];
                 dlam_aff[i] = sdiv(-(d * lmb[i]) - lmb[i] * ds_aff[i], d);
             }
+        } else {
+            ds_aff.resize(0);
+            dlam_aff.resize(0);
         }
 
         dvec dzL_aff = dvec::Zero(n), dzU_aff = dvec::Zero(n);
@@ -1109,12 +1144,8 @@ private:
             }
         }
 
-        const double tau_pri = get_attr_or<double>(
-            cfg_, "ip_tau_pri", get_attr_or<double>(cfg_, "ip_tau", 0.995));
-        const double tau_dual = get_attr_or<double>(
-            cfg_, "ip_tau_dual", get_attr_or<double>(cfg_, "ip_tau", 0.995));
+        // step length
         double alpha_aff = 1.0;
-
         if (mI > 0) {
             for (int i = 0; i < mI; ++i)
                 if (ds_aff[i] < 0.0)
@@ -1136,7 +1167,6 @@ private:
             if (B.hasL[i] && dzL_aff[i] < 0.0)
                 alpha_aff = std::min(
                     alpha_aff, -zL[i] / std::min(dzL_aff[i], -consts::EPS_DIV));
-
         for (int i = 0; i < n; ++i) {
             const double mdx = -dx_aff[i];
             if (B.hasU[i] && mdx < 0.0)
@@ -1147,7 +1177,6 @@ private:
             if (B.hasU[i] && dzU_aff[i] < 0.0)
                 alpha_aff = std::min(
                     alpha_aff, -zU[i] / std::min(dzU_aff[i], -consts::EPS_DIV));
-
         alpha_aff = clamp01(alpha_aff);
 
         const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
@@ -1204,48 +1233,12 @@ private:
 
         return {alpha_aff, mu_aff, sigma};
     }
-    [[nodiscard]] double update_mu_(double mu, const dvec &s, const dvec &lam,
-                                    double theta, KKT &kkt, bool accepted,
-                                    double cond_H, double sigma, double mu_aff,
-                                    bool use_shifted, double tau_shift) {
-        IP_TIMER("update_mu_");
-        const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
-        const double kappa = get_attr_or<double>(cfg_, "kappa_mu", 1.5);
-        const double theta_tol = get_attr_or<double>(cfg_, "tol_feas", 1e-6);
-        const double comp_tol = get_attr_or<double>(cfg_, "tol_comp", 1e-6);
-        const double cond_max =
-            get_attr_or<double>(cfg_, "cond_threshold", 1e6);
-        const double comp =
-            detail::complementarity(s, lam, mu, tau_shift, use_shifted);
-        const bool good =
-            (accepted && theta <= theta_tol && comp <= comp_tol &&
-             kkt.stat <= get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
-             (std::isnan(cond_H) || cond_H <= cond_max));
-        const double comp_ratio = comp / clamp_min(mu, 1e-12);
-        const double mu_base = clamp_min(sigma * mu_aff, mu_min);
-
-        // Cosine annealing schedule
-        static int iteration = 0;
-        const double T_max =
-            get_attr_or<double>(cfg_, "ip_max_iterations", 100.0);
-        const double eta = 0.5 * (1.0 + std::cos(M_PI * iteration / T_max));
-        double mu_new;
-        if (good && comp_ratio < 0.1) {
-            mu_new = mu_base *
-                     std::min(0.1, std::pow(mu_aff / clamp_min(mu, 1e-12), 2)) *
-                     eta;
-        } else if (comp_ratio > 10.0 || theta > 10 * theta_tol) {
-            mu_new = std::min(10.0 * mu, mu_base * 1.2) * eta;
-        } else {
-            mu_new = std::min(mu_base, std::pow(mu, kappa)) * eta;
-        }
-        iteration++;
-        return clamp_min(mu_new, mu_min);
-    }
 
     [[nodiscard]] double tr_radius_() const { return 0.0; }
 
     // ---------------- Gondzio configuration & logic ----------------
+
+    // --- Gondzio config/logic ---
     struct GondzioConfig {
         int max_corrections = 2;
         double gamma_a = 0.1, gamma_b = 10.0;
@@ -1253,6 +1246,8 @@ private:
         double tau_min = 0.005;
         bool use_adaptive_gamma = true;
         double progress_threshold = 0.1;
+        double soc_threshold = 0.1; // Threshold for triggering SOC
+        int max_soc_steps = 3;      // Max number of SOC iterations
     } gondzio_config_;
 
     void load_gondzio_defaults_() {
@@ -1272,6 +1267,10 @@ private:
             get_attr_or<bool>(cfg_, "gondzio_adaptive_gamma", true);
         gondzio_config_.progress_threshold =
             get_attr_or<double>(cfg_, "gondzio_progress_threshold", 0.1);
+        gondzio_config_.soc_threshold =
+            get_attr_or<double>(cfg_, "soc_threshold", 0.1);
+        gondzio_config_.max_soc_steps =
+            get_attr_or<int>(cfg_, "max_soc_steps", 3);
     }
 
     struct GondzioStepData {
@@ -1280,13 +1279,101 @@ private:
         double mu_target = 0.0;
         int correction_count = 0;
         bool use_correction = false;
+        int soc_count = 0; // Track SOC iterations
     };
 
-    [[nodiscard]] std::pair<double, double> compute_gondzio_step_lengths(
-        const dvec &s, const dvec &ds, const dvec &lam, const dvec &dlam,
-        const dvec &zL, const dvec &dzL, const dvec &zU, const dvec &dzU,
-        const dvec &dx, const Bounds &B, double tau_pri,
-        double tau_dual) const {
+    // New SOC helper function
+    [[nodiscard]] GondzioStepData soc_correction_(
+        const spmat &W, const std::optional<spmat> &JE,
+        const std::optional<spmat> &JI, const dvec &s, const dvec &lam,
+        const dvec &zL, const dvec &zU, const dvec &dx_aff, const dvec &ds_aff,
+        const dvec &dlam_aff, const dvec &dzL_aff, const dvec &dzU_aff,
+        const Bounds &B, double alpha_aff, double mu_target, bool use_shifted,
+        double tau_shift, double bound_shift, const Sigmas &Sg) {
+        IP_TIMER("soc_correction");
+        const int n = static_cast<int>(dx_aff.size());
+        const int mI = static_cast<int>(s.size());
+        dvec rhs_x = dvec::Zero(n);
+        dvec rhs_s = dvec::Zero(mI);
+        dvec cI_new = dvec::Zero(mI);
+
+        // Compute constraint violations at the affine step
+        if (mI > 0 && JI) {
+            dvec x_aff = dx_aff * alpha_aff;
+            m_->eval_all(x_aff); // Evaluate at affine step point
+            cI_new = (mI > 0) ? m_->get_cI().value() : dvec::Zero(mI);
+            for (int i = 0; i < mI; ++i) {
+                const double s_aff = s[i] + alpha_aff * ds_aff[i];
+                const double lam_aff = lam[i] + alpha_aff * dlam_aff[i];
+                const double s_eff = use_shifted ? (s_aff + tau_shift) : s_aff;
+                rhs_s[i] = mu_target - s_eff * lam_aff - cI_new[i];
+            }
+            if (JI->nonZeros() && Sg.Sigma_s.size() == mI)
+                rhs_x.noalias() +=
+                    JI->transpose() * (Sg.Sigma_s.asDiagonal() * rhs_s);
+        }
+
+        // Bound complementarity corrections
+        for (int i = 0; i < n; ++i) {
+            double bound_corr = 0.0;
+            if (B.hasL[i]) {
+                const double sL_aff = B.sL[i] + alpha_aff * dx_aff[i];
+                const double zL_aff = zL[i] + alpha_aff * dzL_aff[i];
+                const double s_eff =
+                    use_shifted ? (sL_aff + bound_shift) : sL_aff;
+                const double corrL = mu_target - s_eff * zL_aff;
+                bound_corr += corrL / clamp_min(s_eff, consts::EPS_POS);
+            }
+            if (B.hasU[i]) {
+                const double sU_aff = B.sU[i] - alpha_aff * dx_aff[i];
+                const double zU_aff = zU[i] + alpha_aff * dzU_aff[i];
+                const double s_eff =
+                    use_shifted ? (sU_aff + bound_shift) : sU_aff;
+                const double corrU = mu_target - s_eff * zU_aff;
+                bound_corr -= corrU / clamp_min(s_eff, consts::EPS_POS);
+            }
+            rhs_x[i] += bound_corr;
+        }
+
+        // Solve KKT system for SOC step (reuse factorization)
+        auto soc_res = solve_KKT_(
+            W, rhs_x, JE, std::nullopt,
+            get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
+        GondzioStepData soc_step;
+        soc_step.dx = soc_res.dx;
+        soc_step.dnu = (JE && soc_res.dy.size() > 0)
+                           ? soc_res.dy
+                           : dvec::Zero(JE ? JE->rows() : 0);
+        if (mI > 0 && JI) {
+            soc_step.ds = -(cI_new + (*JI) * soc_step.dx);
+            soc_step.dlam = dvec(mI);
+            for (int i = 0; i < mI; ++i) {
+                const double d = use_shifted ? (s[i] + tau_shift) : s[i];
+                soc_step.dlam[i] =
+                    sdiv(mu_target - d * lam[i] - lam[i] * soc_step.ds[i], d);
+            }
+        } else {
+            soc_step.ds.resize(0);
+            soc_step.dlam.resize(0);
+        }
+        std::tie(soc_step.dzL, soc_step.dzU) = detail::dz_bounds_from_dx_vec(
+            soc_step.dx, zL, zU, B, bound_shift, use_shifted, mu_target, true);
+        const double tau_pri = get_attr_or<double>(cfg_, "ip_tau_pri", 0.995);
+        const double tau_dual = get_attr_or<double>(cfg_, "ip_tau_dual", 0.995);
+        std::tie(soc_step.alpha_pri, soc_step.alpha_dual) =
+            gondzio_step_lengths_(s, soc_step.ds, lam, soc_step.dlam, zL,
+                                  soc_step.dzL, zU, soc_step.dzU, soc_step.dx,
+                                  B, tau_pri, tau_dual);
+        soc_step.mu_target = mu_target;
+        soc_step.soc_count = 1;
+        return soc_step;
+    }
+    [[nodiscard]] std::pair<double, double>
+    gondzio_step_lengths_(const dvec &s, const dvec &ds, const dvec &lam,
+                          const dvec &dlam, const dvec &zL, const dvec &dzL,
+                          const dvec &zU, const dvec &dzU, const dvec &dx,
+                          const Bounds &B, double tau_pri,
+                          double tau_dual) const {
 
         double a_pri = 1.0, a_dual = 1.0;
         for (int i = 0; i < s.size(); ++i)
@@ -1319,12 +1406,13 @@ private:
         return {clamp01(tau_pri * a_pri), clamp01(tau_dual * a_dual)};
     }
 
-    [[nodiscard]] double compute_centrality_measure(
-        const dvec &s, const dvec &lam, const dvec &ds, const dvec &dlam,
-        const dvec &zL, const dvec &zU, const dvec &dzL, const dvec &dzU,
-        const dvec &dx, const Bounds &B, double alpha_pri, double alpha_dual,
-        double mu_target, bool use_shifted, double tau_shift,
-        double bound_shift) const {
+    [[nodiscard]] double
+    centrality_measure_(const dvec &s, const dvec &lam, const dvec &ds,
+                        const dvec &dlam, const dvec &zL, const dvec &zU,
+                        const dvec &dzL, const dvec &dzU, const dvec &dx,
+                        const Bounds &B, double alpha_pri, double alpha_dual,
+                        double mu_target, bool use_shifted, double tau_shift,
+                        double bound_shift) const {
 
         double min_ratio = std::numeric_limits<double>::infinity();
         double max_ratio = 0.0;
@@ -1378,15 +1466,14 @@ private:
                                : std::numeric_limits<double>::infinity();
     }
 
-    [[nodiscard]] bool
-    should_apply_gondzio_correction(double centrality_measure, double alpha_max,
-                                    const GondzioConfig &cfg) const {
-        return (centrality_measure > cfg.gamma_b ||
-                centrality_measure < cfg.gamma_a) &&
-               alpha_max >= cfg.tau_min;
+    [[nodiscard]] bool should_apply_gondzio_(double centrality_measure,
+                                             double alpha_max) const {
+        return (centrality_measure > gondzio_config_.gamma_b ||
+                centrality_measure < gondzio_config_.gamma_a) &&
+               alpha_max >= gondzio_config_.tau_min;
     }
 
-    [[nodiscard]] std::pair<dvec, dvec> compute_gondzio_corrector_rhs(
+    [[nodiscard]] std::pair<dvec, dvec> gondzio_corr_rhs_(
         const dvec &s, const dvec &lam, const dvec &ds, const dvec &dlam,
         const dvec &zL, const dvec &zU, const dvec &dzL, const dvec &dzU,
         const dvec &dx, const Bounds &B, const spmat &JI, double alpha_pri,
@@ -1416,12 +1503,11 @@ private:
                     use_shifted ? (s_pred + tau_shift) : s_pred;
                 const double rc =
                     -ds[i] * dlam[i] + beta * mu_target - s_eff * lam_pred;
-                rhs_s[i] = rc; // Σ_s will push Λ^{-1}
+                rhs_s[i] = rc;
             }
-            if (JI.nonZeros() && Sg.Sigma_s.size() == mI) {
+            if (JI.nonZeros() && Sg.Sigma_s.size() == mI)
                 rhs_x.noalias() +=
                     JI.transpose() * (Sg.Sigma_s.asDiagonal() * rhs_s);
-            }
         }
 
         for (int i = 0; i < n; ++i) {
@@ -1448,22 +1534,24 @@ private:
         }
         return {rhs_x, rhs_s};
     }
-    [[nodiscard]] GondzioStepData gondzio_multiple_corrections(
+
+    [[nodiscard]] GondzioStepData gondzio_multi_(
         const spmat &W, const dvec &r_d, const std::optional<spmat> &JE,
         const std::optional<dvec> &r_pE, const std::optional<spmat> &JI,
         const std::optional<dvec> &r_pI, const dvec &s, const dvec &lam,
         const dvec &zL, const dvec &zU, const Bounds &B, double mu_target,
         bool use_shifted, double tau_shift, double bound_shift,
         const Sigmas &Sg, const dvec &base_dx, const dvec &base_dnu) {
-        IP_TIMER("gondzio_multiple_corrections");
+        IP_TIMER("gondzio_multi");
         GondzioStepData R;
         R.dx = base_dx;
         R.dnu = base_dnu;
         R.mu_target = mu_target;
+
         const int mI = static_cast<int>(s.size());
         if (mI > 0 && JI) {
             R.ds = -(r_pI.value() + (*JI) * base_dx);
-            R.dlam = dvec(mI);
+            R.dlam.resize(mI);
             for (int i = 0; i < mI; ++i) {
                 const double d = use_shifted ? (s[i] + tau_shift) : s[i];
                 R.dlam[i] = sdiv(mu_target - d * lam[i] - lam[i] * R.ds[i], d);
@@ -1472,44 +1560,45 @@ private:
             R.ds.resize(0);
             R.dlam.resize(0);
         }
+
         auto [dzL_base, dzU_base] = detail::dz_bounds_from_dx_vec(
             base_dx, zL, zU, B, bound_shift, use_shifted, mu_target, true);
         R.dzL = dzL_base;
         R.dzU = dzU_base;
+
         const double tau_pri = get_attr_or<double>(cfg_, "ip_tau_pri", 0.995);
         const double tau_dual = get_attr_or<double>(cfg_, "ip_tau_dual", 0.995);
         std::tie(R.alpha_pri, R.alpha_dual) =
-            compute_gondzio_step_lengths(s, R.ds, lam, R.dlam, zL, R.dzL, zU,
-                                         R.dzU, R.dx, B, tau_pri, tau_dual);
+            gondzio_step_lengths_(s, R.ds, lam, R.dlam, zL, R.dzL, zU, R.dzU,
+                                  R.dx, B, tau_pri, tau_dual);
 
-        // Adaptive correction count based on centrality
-        int max_corrections = gondzio_config_.max_corrections;
-        static double prev_centrality = std::numeric_limits<double>::infinity();
-        const double centrality = compute_centrality_measure(
+        // adaptive correction count
+        int max_corr = gondzio_config_.max_corrections;
+        static double prev_cent = std::numeric_limits<double>::infinity();
+        const double centrality = centrality_measure_(
             s, lam, R.ds, R.dlam, zL, zU, R.dzL, R.dzU, R.dx, B, R.alpha_pri,
             R.alpha_dual, mu_target, use_shifted, tau_shift, bound_shift);
-        if (centrality > prev_centrality * 0.9 && R.correction_count > 0) {
-            max_corrections = std::max(
-                1, max_corrections -
-                       1); // Reduce corrections if centrality isn't improving
-        }
-        prev_centrality = centrality;
+        if (centrality > prev_cent * 0.9 && R.correction_count > 0)
+            max_corr = std::max(1, max_corr - 1);
+        prev_cent = centrality;
 
-        for (int k = 0; k < max_corrections; ++k) {
+        for (int k = 0; k < max_corr; ++k) {
             const double alpha_max = std::min(R.alpha_pri, R.alpha_dual);
-            if (!should_apply_gondzio_correction(centrality, alpha_max,
-                                                 gondzio_config_))
+            if (!should_apply_gondzio_(centrality, alpha_max))
                 break;
-            auto [rhs_corr_x, rhs_corr_s] = compute_gondzio_corrector_rhs(
+
+            auto [rhs_corr_x, rhs_corr_s] = gondzio_corr_rhs_(
                 s, lam, R.ds, R.dlam, zL, zU, R.dzL, R.dzU, R.dx, B,
                 JI ? *JI : spmat(), R.alpha_pri, R.alpha_dual, mu_target,
                 centrality, use_shifted, tau_shift, bound_shift, Sg);
+
             auto corr_res = solve_KKT_(
                 W, rhs_corr_x, JE, std::nullopt,
                 get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
             R.dx += corr_res.dx;
             if (JE && corr_res.dy.size() > 0)
                 R.dnu += corr_res.dy;
+
             if (mI > 0 && JI) {
                 R.ds = -(r_pI.value() + (*JI) * R.dx);
                 for (int i = 0; i < mI; ++i) {
@@ -1520,15 +1609,17 @@ private:
             }
             std::tie(R.dzL, R.dzU) = detail::dz_bounds_from_dx_vec(
                 R.dx, zL, zU, B, bound_shift, use_shifted, mu_target, true);
-            std::tie(R.alpha_pri, R.alpha_dual) = compute_gondzio_step_lengths(
-                s, R.ds, lam, R.dlam, zL, R.dzL, zU, R.dzU, R.dx, B, tau_pri,
-                tau_dual);
+            std::tie(R.alpha_pri, R.alpha_dual) =
+                gondzio_step_lengths_(s, R.ds, lam, R.dlam, zL, R.dzL, zU,
+                                      R.dzU, R.dx, B, tau_pri, tau_dual);
+
             R.correction_count++;
             R.use_correction = true;
         }
         return R;
     }
 
+    // Updated mehrotra_with_gondzio_corrections_ with SOC
     [[nodiscard]] std::tuple<double, double, double, GondzioStepData>
     mehrotra_with_gondzio_corrections_(
         const spmat &W, const dvec &r_d, const std::optional<spmat> &JE,
@@ -1537,19 +1628,14 @@ private:
         const dvec &zL, const dvec &zU, const Bounds &B, bool use_shifted,
         double tau_shift, double bound_shift, double mu, double theta,
         const Sigmas &Sg) {
-
         auto [alpha_aff, mu_aff, sigma] = mehrotra_affine_predictor_(
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, use_shifted,
             tau_shift, bound_shift, mu, theta);
-
         const double mu_min = get_attr_or<double>(cfg_, "ip_mu_min", 1e-12);
         const double mu_target = clamp_min(sigma * mu_aff, mu_min);
-
-        // Basic corrector RHS for Mehrotra
         dvec rhs_x = -r_d;
         const int mI = static_cast<int>(s.size());
         const int n = static_cast<int>(zL.size());
-
         if (mI > 0 && JI && Sg.Sigma_s.size()) {
             dvec rc_s(mI);
             for (int i = 0; i < mI; ++i) {
@@ -1558,11 +1644,11 @@ private:
             }
             dvec temp(mI);
             for (int i = 0; i < mI; ++i) {
-                const double lam_safe =
+                const double li =
                     (std::abs(lam[i]) < consts::EPS_POS)
                         ? ((lam[i] >= 0) ? consts::EPS_POS : -consts::EPS_POS)
                         : lam[i];
-                temp[i] = rc_s[i] / lam_safe;
+                temp[i] = rc_s[i] / li;
             }
             rhs_x.noalias() +=
                 (*JI).transpose() * (Sg.Sigma_s.asDiagonal() * temp);
@@ -1581,15 +1667,70 @@ private:
                               consts::EPS_POS);
                 rhs_x[i] -= (mu_target - denom * zU[i]) / denom;
             }
-
         auto base_res = solve_KKT_(
             W, rhs_x, JE, r_pE,
             get_attr_or<std::string>(cfg_, "ip_kkt_method", "hykkt"));
-
-        GondzioStepData gondzio_result = gondzio_multiple_corrections(
+        GondzioStepData gondzio_result = gondzio_multi_(
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, mu_target,
             use_shifted, tau_shift, bound_shift, Sg, base_res.dx, base_res.dy);
 
+        // Add SOC if alpha_aff is low
+        if (alpha_aff < gondzio_config_.soc_threshold) {
+            dvec ds_aff(mI), dlam_aff(mI), dzL_aff(n), dzU_aff(n);
+            if (mI > 0 && JI) {
+                ds_aff = -(r_pI.value() + (*JI) * gondzio_result.dx);
+                for (int i = 0; i < mI; ++i) {
+                    const double d = use_shifted ? (s[i] + tau_shift) : s[i];
+                    dlam_aff[i] = sdiv(-(d * lam[i]) - lam[i] * ds_aff[i], d);
+                }
+            }
+            for (int i = 0; i < n; ++i) {
+                if (B.hasL[i]) {
+                    const double d = (use_shifted && bound_shift > 0.0)
+                                         ? (B.sL[i] + bound_shift)
+                                         : B.sL[i];
+                    dzL_aff[i] =
+                        sdiv(-(d * zL[i]) - zL[i] * gondzio_result.dx[i], d);
+                }
+                if (B.hasU[i]) {
+                    const double d = (use_shifted && bound_shift > 0.0)
+                                         ? (B.sU[i] + bound_shift)
+                                         : B.sU[i];
+                    dzU_aff[i] =
+                        sdiv(-(d * zU[i]) + zU[i] * gondzio_result.dx[i], d);
+                }
+            }
+            GondzioStepData best_soc = gondzio_result;
+            double best_alpha =
+                std::min(gondzio_result.alpha_pri, gondzio_result.alpha_dual);
+            for (int soc_k = 0; soc_k < gondzio_config_.max_soc_steps;
+                 ++soc_k) {
+                GondzioStepData soc = soc_correction_(
+                    W, JE, JI, s, lam, zL, zU, gondzio_result.dx, ds_aff,
+                    dlam_aff, dzL_aff, dzU_aff, B, alpha_aff, mu_target,
+                    use_shifted, tau_shift, bound_shift, Sg);
+                double soc_alpha = std::min(soc.alpha_pri, soc.alpha_dual);
+                if (soc_alpha >
+                    best_alpha *
+                        1.1) { // Accept if improves step length by at least 10%
+                    best_soc = soc;
+                    best_alpha = soc_alpha;
+                    gondzio_result.dx += soc.dx;
+                    gondzio_result.dnu += soc.dnu;
+                    gondzio_result.ds += soc.ds;
+                    gondzio_result.dlam += soc.dlam;
+                    gondzio_result.dzL += soc.dzL;
+                    gondzio_result.dzU += soc.dzU;
+                    gondzio_result.alpha_pri = soc.alpha_pri;
+                    gondzio_result.alpha_dual = soc.alpha_dual;
+                    gondzio_result.soc_count++;
+                } else {
+                    break; // Stop if no improvement
+                }
+            }
+        }
+
         return {alpha_aff, mu_aff, sigma, gondzio_result};
     }
+
 };

@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <variant>
 
+#include "model.h"
 using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
@@ -62,7 +63,7 @@ struct ChompConfig {
     double schur_dense_cutoff = 0.25;
     std::string prec_type = "ssor"; // "jacobi" | "ssor" | "none"
     double ssor_omega = 1.0;
-    std::string sym_ordering = "false"; // "amd" | "none"
+    std::string sym_ordering = "amd_custom"; // "amd" | "none"
     bool use_simd = true;
     int block_size = 256;
     bool adaptive_gamma = false;
@@ -78,6 +79,15 @@ struct ChompConfig {
     // Second CG budget for the δ₂-shifted solve (first try uses cg_maxit)
     int    cg_maxit2        = 2 * 200; // e.g., if cg_maxit==200, set cg_maxit2==400
 
+    // define amd_dense_cutoff
+    double amd_dense_cutoff = 0.1;     // switch to dense AMD for n < m / cutoff
+    bool amd_dense_cutoff_has_value = false; // whether user set amd_dense_cutoff
+    bool use_hvp = false;
+    std::optional<double> hvp_smw_threshold = 1e-3;        // Threshold for using SMW vs iterative
+    std::optional<double> hvp_iterative_tol = 1e-10;      // Tolerance for HVP iterative solver
+    std::optional<int> hvp_iterative_maxiter = std::nullopt; // Max iterations for HVP solver (auto if nullopt)
+    
+
 };
 
 struct KKTReusable {
@@ -92,7 +102,7 @@ struct KKTReusable {
 struct KKTStrategy {
     virtual ~KKTStrategy() = default;
     virtual std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>>
-    factor_and_solve(const spmat &W, const std::optional<spmat> &G,
+    factor_and_solve(ModelC* model_in, const spmat &W, const std::optional<spmat> &G,
                      const dvec &r1, const std::optional<dvec> &r2,
                      const ChompConfig &cfg, std::optional<double> regularizer,
                      std::unordered_map<std::string, dvec> &cache,

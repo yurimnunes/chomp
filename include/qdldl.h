@@ -1,6 +1,6 @@
 #pragma once
 // qdldl23.hpp — header-only LDLᵀ (QDLDL-style) for upper CSC
-// C++23, no threads, exact-zero pivot, no sign forcing.
+// C++23, optimized for performance, exact-zero pivot, no sign forcing.
 // © 2025 — MIT/Apache-2.0 compatible with original QDLDL spirit.
 
 #include <algorithm>
@@ -17,10 +17,6 @@
 #include <vector>
 
 // ===== qdldl23 execution config (optional stdexec) ==========================
-// Opt in with: -DQDLDL23_USE_STDEXEC
-// Requires the P2300 reference impl headers:
-//   <stdexec/execution.hpp> and <exec/static_thread_pool.hpp>
-// This path uses a CPU thread pool; no device memory or CUDA required.
 #if defined(QDLDL23_USE_STDEXEC)
   #include <stdexec/execution.hpp>
   #include <exec/static_thread_pool.hpp>
@@ -28,6 +24,18 @@
   #define QDLDL23_HAS_STDEXEC 1
 #else
   #define QDLDL23_HAS_STDEXEC 0
+#endif
+
+// SIMD support detection
+#if defined(__AVX2__) && defined(__FMA__)
+  #include <immintrin.h>
+  #define QDLDL23_HAS_AVX2 1
+#elif defined(__SSE2__)
+  #include <emmintrin.h>
+  #define QDLDL23_HAS_SSE2 1
+#else
+  #define QDLDL23_HAS_AVX2 0
+  #define QDLDL23_HAS_SSE2 0
 #endif
 
 namespace qdldl23 {
@@ -50,6 +58,65 @@ namespace detail {
   inline void qd_par_for_n(std::size_t n, F&& f) {
     for (std::size_t i = 0; i < n; ++i) f(i);
   }
+  
+  // Safe SIMD operations with bounds checking
+  inline void simd_scale_array(double* x, const double* scale, size_t n) {
+    #if QDLDL23_HAS_AVX2
+    const size_t simd_end = n - (n % 4);
+    for (size_t i = 0; i < simd_end; i += 4) {
+      __m256d vx = _mm256_loadu_pd(&x[i]);
+      __m256d vs = _mm256_loadu_pd(&scale[i]);
+      vx = _mm256_mul_pd(vx, vs);
+      _mm256_storeu_pd(&x[i], vx);
+    }
+    for (size_t i = simd_end; i < n; ++i) {
+      x[i] *= scale[i];
+    }
+    #else
+    for (size_t i = 0; i < n; ++i) {
+      x[i] *= scale[i];
+    }
+    #endif
+  }
+  
+  inline void simd_vector_sub(double* result, const double* a, const double* b, size_t n) {
+    #if QDLDL23_HAS_AVX2
+    const size_t simd_end = n - (n % 4);
+    for (size_t i = 0; i < simd_end; i += 4) {
+      __m256d va = _mm256_loadu_pd(&a[i]);
+      __m256d vb = _mm256_loadu_pd(&b[i]);
+      __m256d vr = _mm256_sub_pd(va, vb);
+      _mm256_storeu_pd(&result[i], vr);
+    }
+    for (size_t i = simd_end; i < n; ++i) {
+      result[i] = a[i] - b[i];
+    }
+    #else
+    for (size_t i = 0; i < n; ++i) {
+      result[i] = a[i] - b[i];
+    }
+    #endif
+  }
+  
+  inline void simd_vector_add(double* result, const double* a, const double* b, size_t n) {
+    #if QDLDL23_HAS_AVX2
+    const size_t simd_end = n - (n % 4);
+    for (size_t i = 0; i < simd_end; i += 4) {
+      __m256d va = _mm256_loadu_pd(&a[i]);
+      __m256d vb = _mm256_loadu_pd(&b[i]);
+      __m256d vr = _mm256_add_pd(va, vb);
+      _mm256_storeu_pd(&result[i], vr);
+    }
+    for (size_t i = simd_end; i < n; ++i) {
+      result[i] = a[i] + b[i];
+    }
+    #else
+    for (size_t i = 0; i < n; ++i) {
+      result[i] = a[i] + b[i];
+    }
+    #endif
+  }
+  
 } // namespace detail
 #endif
 
@@ -87,11 +154,12 @@ public:
 
     [[nodiscard]] size_t nnz() const { return static_cast<size_t>(Ap.back()); }
 
-    // Normalize each column: sort by row, coalesce duplicates,
-    // forbid lower entries, forbid empty columns, enforce diag if requested.
+    // Optimized normalize: sort by row, coalesce duplicates
     void finalize_upper_inplace(bool require_diag = true) {
-        if (n == 0)
-            return;
+        if (n == 0) return;
+        
+        std::vector<std::pair<IntT, FloatT>> col_workspace;
+        
         for (IntT j = 0; j < n; ++j) {
             const IntT p0 = Ap[(size_t)j], p1 = Ap[(size_t)j + 1];
             if (p0 > p1)
@@ -99,9 +167,10 @@ public:
             if (p0 == p1)
                 throw InvalidMatrixError("Empty column");
 
-            // collect (row,val)
-            std::vector<std::pair<IntT, FloatT>> col;
-            col.reserve(static_cast<size_t>(p1 - p0));
+            const size_t col_size = static_cast<size_t>(p1 - p0);
+            col_workspace.clear();
+            col_workspace.reserve(col_size);
+            
             for (IntT p = p0; p < p1; ++p) {
                 const IntT i = Ai[(size_t)p];
                 if (i < 0 || i >= n)
@@ -109,21 +178,22 @@ public:
                 if (i > j)
                     throw InvalidMatrixError(
                         "Lower-triangular entry (need upper+diag only)");
-                col.emplace_back(i, Ax[(size_t)p]);
+                col_workspace.emplace_back(i, Ax[(size_t)p]);
             }
-            // sort by row
-            std::sort(col.begin(), col.end(),
-                      [](auto &a, auto &b) { return a.first < b.first; });
+            
+            // Sort by row - use stable_sort to maintain order for equal elements
+            std::stable_sort(col_workspace.begin(), col_workspace.end(),
+                           [](const auto &a, const auto &b) { return a.first < b.first; });
 
-            // coalesce duplicates into Ai/Ax in place
+            // Coalesce duplicates
             IntT w = p0;
             bool has_diag = false;
-            for (size_t k = 0; k < col.size();) {
-                IntT r = col[k].first;
-                FloatT sum = col[k].second;
+            for (size_t k = 0; k < col_workspace.size();) {
+                IntT r = col_workspace[k].first;
+                FloatT sum = col_workspace[k].second;
                 size_t k2 = k + 1;
-                while (k2 < col.size() && col[k2].first == r) {
-                    sum += col[k2].second;
+                while (k2 < col_workspace.size() && col_workspace[k2].first == r) {
+                    sum += col_workspace[k2].second;
                     ++k2;
                 }
                 Ai[(size_t)w] = r;
@@ -134,10 +204,10 @@ public:
                 k = k2;
             }
 
-            // compact: update Ap deltas for later columns (logical shrink)
+            // Compact: update Ap deltas for later columns
             const IntT new_p1 = w;
             const IntT drop = p1 - new_p1;
-            if (drop) {
+            if (drop > 0) {
                 for (IntT jj = j + 1; jj <= n; ++jj)
                     Ap[(size_t)jj] -= drop;
             }
@@ -163,25 +233,25 @@ template <std::signed_integral IntT = int32_t> struct Ordering {
         std::iota(o.iperm.begin(), o.iperm.end(), IntT{0});
         return o;
     }
+    
     static Ordering from_perm(std::vector<IntT> p) {
         Ordering o;
         o.n = (IntT)p.size();
         o.perm = std::move(p);
         o.iperm.assign((size_t)o.n, IntT{-1});
-        std::vector<char> seen((size_t)o.n, 0);
+        std::vector<bool> seen((size_t)o.n, false);
         for (IntT i = 0; i < o.n; ++i) {
             IntT pi = o.perm[(size_t)i];
             if (pi < 0 || pi >= o.n || seen[(size_t)pi])
                 throw InvalidMatrixError("Invalid permutation");
-            seen[(size_t)pi] = 1;
+            seen[(size_t)pi] = true;
             o.iperm[(size_t)pi] = i;
         }
         return o;
     }
 };
 
-// Symmetric permutation: B = P A Pᵀ (keep **upper**), per-column std::sort +
-// coalesce.
+// Symmetric permutation: B = P A Pᵀ (keep **upper**), optimized version
 template <std::floating_point FloatT = double,
           std::signed_integral IntT = int32_t>
 inline SparseUpperCSC<FloatT, IntT>
@@ -198,7 +268,7 @@ permute_symmetric_upper(const SparseUpperCSC<FloatT, IntT> &A,
         for (IntT p = A.Ap[(size_t)j]; p < A.Ap[(size_t)j + 1]; ++p) {
             const IntT i = A.Ai[(size_t)p];
             const IntT pi = ord.perm[(size_t)i];
-            const IntT col = (pi > pj ? pi : pj);
+            const IntT col = std::max(pi, pj);
             ++cnt[(size_t)col];
         }
     }
@@ -208,11 +278,12 @@ permute_symmetric_upper(const SparseUpperCSC<FloatT, IntT> &A,
     for (IntT j = 0; j < n; ++j)
         Bp[(size_t)j + 1] = Bp[(size_t)j] + cnt[(size_t)j];
     const size_t nnz = (size_t)Bp[(size_t)n];
+    
     std::vector<IntT> Bi(nnz);
     std::vector<FloatT> Bx(nnz);
     std::vector<IntT> head = Bp;
 
-    // Scatter unsorted by column
+    // Scatter entries
     for (IntT j = 0; j < n; ++j) {
         const IntT pj = ord.perm[(size_t)j];
         for (IntT p = A.Ap[(size_t)j]; p < A.Ap[(size_t)j + 1]; ++p) {
@@ -228,49 +299,54 @@ permute_symmetric_upper(const SparseUpperCSC<FloatT, IntT> &A,
         }
     }
 
-    // Per-column sort & coalesce; ensure diagonal present
+    // Sort and coalesce each column
     for (IntT j = 0; j < n; ++j) {
-        IntT p0 = Bp[(size_t)j], p1 = Bp[(size_t)j + 1];
+        const IntT p0 = Bp[(size_t)j];
+        const IntT p1 = Bp[(size_t)j + 1];
         const IntT len = p1 - p0;
-        auto *Ri = &Bi[(size_t)p0];
-        auto *Rx = &Bx[(size_t)p0];
+        
+        if (len <= 1) continue;
 
-        // Stable sort rows
-        std::vector<IntT> order((size_t)len);
-        std::iota(order.begin(), order.end(), IntT{0});
-        std::sort(order.begin(), order.end(), [&](IntT a, IntT b) {
-            return Ri[(size_t)a] < Ri[(size_t)b];
-        });
+        // Create index array for sorting
+        std::vector<IntT> indices((size_t)len);
+        std::iota(indices.begin(), indices.end(), IntT{0});
+        
+        // Sort indices by corresponding row values
+        std::stable_sort(indices.begin(), indices.end(), 
+                        [&](IntT a, IntT b) {
+                            return Bi[(size_t)(p0 + a)] < Bi[(size_t)(p0 + b)];
+                        });
 
-        std::vector<IntT> tmpi((size_t)len);
-        std::vector<FloatT> tmpx((size_t)len);
+        // Apply permutation
+        std::vector<IntT> tmp_i((size_t)len);
+        std::vector<FloatT> tmp_x((size_t)len);
         for (IntT k = 0; k < len; ++k) {
-            tmpi[(size_t)k] = Ri[(size_t)order[(size_t)k]];
-            tmpx[(size_t)k] = Rx[(size_t)order[(size_t)k]];
+            tmp_i[(size_t)k] = Bi[(size_t)(p0 + indices[(size_t)k])];
+            tmp_x[(size_t)k] = Bx[(size_t)(p0 + indices[(size_t)k])];
         }
-        std::copy(tmpi.begin(), tmpi.end(), Ri);
-        std::copy(tmpx.begin(), tmpx.end(), Rx);
 
-        // coalesce
+        // Coalesce duplicates
         IntT w = 0;
         bool has_diag = false;
         for (IntT k = 0; k < len;) {
-            IntT r = Ri[(size_t)k];
-            FloatT s = Rx[(size_t)k];
+            IntT r = tmp_i[(size_t)k];
+            FloatT s = tmp_x[(size_t)k];
             IntT k2 = k + 1;
-            while (k2 < len && Ri[(size_t)k2] == r) {
-                s += Rx[(size_t)k2];
+            while (k2 < len && tmp_i[(size_t)k2] == r) {
+                s += tmp_x[(size_t)k2];
                 ++k2;
             }
-            Ri[(size_t)w] = r;
-            Rx[(size_t)w] = s;
+            Bi[(size_t)(p0 + w)] = r;
+            Bx[(size_t)(p0 + w)] = s;
             if (r == j)
                 has_diag = true;
             ++w;
             k = k2;
         }
+        
+        // Update pointers for dropped entries
         const IntT drop = len - w;
-        if (drop) {
+        if (drop > 0) {
             for (IntT jj = j + 1; jj <= n; ++jj)
                 Bp[(size_t)jj] -= drop;
         }
@@ -285,7 +361,6 @@ permute_symmetric_upper(const SparseUpperCSC<FloatT, IntT> &A,
     B.Ap = std::move(Bp);
     B.Ai = std::move(Bi);
     B.Ax = std::move(Bx);
-    // Already sorted, coalesced, and checked.
     return B;
 }
 
@@ -297,22 +372,23 @@ template <std::signed_integral IntT = int32_t> struct Symbolic {
     IntT n{0};
 };
 
-// Liu (1986) elimination tree for upper CSC (no threads)
+// Liu (1986) elimination tree for upper CSC - safe implementation
 template <std::floating_point FloatT = double,
           std::signed_integral IntT = int32_t>
 inline void etree_upper_liu(const SparseUpperCSC<FloatT, IntT> &A,
                             std::vector<IntT> &parent) {
     const IntT n = A.n;
-    parent.assign((size_t)n, (IntT)-1);
-    std::vector<IntT> ancestor((size_t)n, (IntT)-1);
+    parent.assign((size_t)n, IntT{-1});
+    std::vector<IntT> ancestor((size_t)n, IntT{-1});
 
-    auto find_root = [&](IntT j) {
+    auto find_root = [&](IntT j) -> IntT {
         IntT r = j;
-        while (ancestor[(size_t)r] != (IntT)-1)
+        while (ancestor[(size_t)r] != IntT{-1}) {
             r = ancestor[(size_t)r];
-        // path compression
+        }
+        // Path compression
         IntT cur = j;
-        while (ancestor[(size_t)cur] != (IntT)-1) {
+        while (ancestor[(size_t)cur] != IntT{-1}) {
             const IntT nxt = ancestor[(size_t)cur];
             ancestor[(size_t)cur] = r;
             cur = nxt;
@@ -321,13 +397,12 @@ inline void etree_upper_liu(const SparseUpperCSC<FloatT, IntT> &A,
     };
 
     for (IntT j = 0; j < n; ++j) {
-        // traverse strictly upper rows in col j
         for (IntT p = A.Ap[(size_t)j]; p < A.Ap[(size_t)j + 1]; ++p) {
             IntT i = A.Ai[(size_t)p];
-            if (i == j)
-                continue; // skip diag
+            if (i == j) continue; // skip diag
+            
             while (true) {
-                IntT r = (ancestor[(size_t)i] == (IntT)-1) ? -1 : find_root(i);
+                IntT r = (ancestor[(size_t)i] == IntT{-1}) ? -1 : find_root(i);
                 if (r == -1) {
                     ancestor[(size_t)i] = j;
                     parent[(size_t)i] = j;
@@ -352,13 +427,13 @@ inline void colcounts_upper_gnp(const SparseUpperCSC<FloatT, IntT> &A,
                                 std::vector<IntT> &Lnz) {
     const IntT n = A.n;
     Lnz.assign((size_t)n, IntT{0});
-    std::vector<IntT> prevnz((size_t)n, (IntT)-1);
+    std::vector<IntT> prevnz((size_t)n, IntT{-1});
 
     for (IntT j = 0; j < n; ++j) {
         for (IntT p = A.Ap[(size_t)j]; p < A.Ap[(size_t)j + 1]; ++p) {
             const IntT i = A.Ai[(size_t)p];
-            if (i == j)
-                continue; // skip diag
+            if (i == j) continue; // skip diag
+            
             IntT k = i;
             while (k != -1 && k < j && prevnz[(size_t)k] != j) {
                 ++Lnz[(size_t)k];
@@ -369,7 +444,7 @@ inline void colcounts_upper_gnp(const SparseUpperCSC<FloatT, IntT> &A,
     }
 }
 
-// one-shot symbolic using Liu+GNP
+// Symbolic analysis
 template <std::floating_point FloatT = double,
           std::signed_integral IntT = int32_t>
 inline Symbolic<IntT> analyze_fast(const SparseUpperCSC<FloatT, IntT> &A) {
@@ -415,24 +490,27 @@ refactorize(const SparseUpperCSC<FloatT, IntT> &A, const Symbolic<IntT> &S) {
     R.D.assign((size_t)n, FloatT{0});
     R.Dinv.assign((size_t)n, FloatT{0});
 
-    // ---------- timestamped work arrays (no clears) ----------
-    std::vector<IntT> Lnext((size_t)n, IntT{0});
+    // Work arrays
+    std::vector<IntT> Lnext((size_t)n);
     for (IntT i = 0; i < n; ++i) Lnext[(size_t)i] = R.Lp[(size_t)i];
 
     std::vector<FloatT> y((size_t)n, FloatT{0});
-    std::vector<IntT> yIdx((size_t)n, IntT{0});
-    std::vector<IntT> Ebuf((size_t)n, IntT{0});
-
+    std::vector<IntT> yIdx((size_t)n);
+    std::vector<IntT> Ebuf((size_t)n);
     std::vector<IntT> mark((size_t)n, IntT{0});
+    
     IntT curmark = 1;
 
-    auto is_marked = [&](IntT i){ return mark[(size_t)i]==curmark; };
-    auto set_mark  = [&](IntT i){ mark[(size_t)i]=curmark; };
+    auto is_marked = [&](IntT i) -> bool { 
+        return i >= 0 && i < n && mark[(size_t)i] == curmark; 
+    };
+    auto set_mark = [&](IntT i) { 
+        if (i >= 0 && i < n) mark[(size_t)i] = curmark; 
+    };
 
-    // k = 0
-    {
-        // first entry in column 0 must be the diagonal (after finalize)
-        if (A.Ai[(size_t)A.Ap[0]] != 0)
+    // Handle k=0 case
+    if (n > 0) {
+        if (A.Ap[0] >= A.Ap[1] || A.Ai[(size_t)A.Ap[0]] != 0)
             throw FactorizationError("Missing diagonal at column 0");
         R.D[0] = A.Ax[(size_t)A.Ap[0]];
         if (R.D[0] == FloatT{0})
@@ -443,68 +521,79 @@ refactorize(const SparseUpperCSC<FloatT, IntT> &A, const Symbolic<IntT> &S) {
     }
 
     for (IntT k = 1; k < n; ++k) {
-        // (bump the timestamp; wrap conservatively if needed)
+        // Increment timestamp with overflow protection
         if (++curmark == std::numeric_limits<IntT>::max()) {
             std::fill(mark.begin(), mark.end(), IntT{0});
             curmark = 1;
         }
 
-        // scatter A(:,k) into y; record diagonal
+        // Scatter A(:,k) into y
         IntT nnzY = 0;
         bool diag_seen = false;
+        
         for (IntT p = A.Ap[(size_t)k]; p < A.Ap[(size_t)k + 1]; ++p) {
             const IntT i = A.Ai[(size_t)p];
             const FloatT v = A.Ax[(size_t)p];
+            
             if (i == k) {
                 R.D[(size_t)k] = v;
                 diag_seen = true;
                 continue;
             }
+            
+            if (i < 0 || i >= n) continue; // Safety check
+            
             y[(size_t)i] = v;
             if (!is_marked(i)) {
                 set_mark(i);
-                // walk up etree to k (exclusive), push reversed onto yIdx
+                // Walk up elimination tree
                 IntT next = i, nnzE = 0;
-                Ebuf[(size_t)nnzE++] = next;
-                next = S.etree[(size_t)next];
-                while (next != (IntT)-1 && next < k) {
-                    if (is_marked(next)) break;
-                    set_mark(next);
+                while (next != -1 && next < k && nnzE < n) { // Prevent infinite loops
                     Ebuf[(size_t)nnzE++] = next;
                     next = S.etree[(size_t)next];
+                    if (next >= 0 && next < k && is_marked(next)) break;
+                    if (next >= 0 && next < k) set_mark(next);
                 }
-                while (nnzE)
-                    yIdx[(size_t)nnzY++] = Ebuf[(size_t)--nnzE];
+                // Reverse order for elimination
+                for (IntT e = nnzE - 1; e >= 0 && nnzY < n; --e) {
+                    yIdx[(size_t)nnzY++] = Ebuf[(size_t)e];
+                }
             }
         }
+        
         if (!diag_seen)
-            throw FactorizationError("Missing diagonal at column " +
-                                     std::to_string(k));
+            throw FactorizationError("Missing diagonal at column " + std::to_string(k));
 
-        // eliminate along the listed columns (reverse order)
+        // Eliminate along listed columns
         for (IntT t = nnzY - 1; t >= 0; --t) {
             const IntT c = yIdx[(size_t)t];
+            if (c < 0 || c >= n) continue; // Safety check
+            
             const IntT j0 = R.Lp[(size_t)c];
             IntT &j1 = Lnext[(size_t)c];
             const FloatT yc = y[(size_t)c];
 
             // y -= L(:,c)*yc
-            for (IntT j = j0; j < j1; ++j)
-                y[(size_t)R.Li[(size_t)j]] -= R.Lx[(size_t)j] * yc;
+            for (IntT j = j0; j < j1; ++j) {
+                const IntT idx = R.Li[(size_t)j];
+                if (idx >= 0 && idx < n) {
+                    y[(size_t)idx] -= R.Lx[(size_t)j] * yc;
+                }
+            }
 
-            R.Li[(size_t)j1] = k;
-            const FloatT lk = yc * R.Dinv[(size_t)c];
-            R.Lx[(size_t)j1] = lk;
-            R.D[(size_t)k] -= yc * lk;
-            ++j1;
+            if (j1 < (IntT)R.Li.size()) {
+                R.Li[(size_t)j1] = k;
+                const FloatT lk = yc * R.Dinv[(size_t)c];
+                R.Lx[(size_t)j1] = lk;
+                R.D[(size_t)k] -= yc * lk;
+                ++j1;
+            }
 
             y[(size_t)c] = FloatT{0};
-            if (t == 0) break;
         }
 
         if (R.D[(size_t)k] == FloatT{0})
-            throw FactorizationError("Zero pivot at column " +
-                                     std::to_string(k));
+            throw FactorizationError("Zero pivot at column " + std::to_string(k));
         if (R.D[(size_t)k] > FloatT{0})
             ++R.num_pos;
         R.Dinv[(size_t)k] = FloatT{1} / R.D[(size_t)k];
@@ -548,31 +637,49 @@ inline void L_solve(const LDLFactors<FloatT, IntT> &F, FloatT *x) {
     const IntT n = F.n;
     for (IntT i = 0; i < n; ++i) {
         const FloatT xi = x[(size_t)i];
-        for (IntT p = F.Lp[(size_t)i]; p < F.Lp[(size_t)i + 1]; ++p)
-            x[(size_t)F.Li[(size_t)p]] -= F.Lx[(size_t)p] * xi;
+        for (IntT p = F.Lp[(size_t)i]; p < F.Lp[(size_t)i + 1]; ++p) {
+            const IntT idx = F.Li[(size_t)p];
+            if (idx >= 0 && idx < n) {
+                x[(size_t)idx] -= F.Lx[(size_t)p] * xi;
+            }
+        }
     }
 }
+
 template <std::floating_point FloatT = double,
           std::signed_integral IntT = int32_t>
 inline void Lt_solve(const LDLFactors<FloatT, IntT> &F, FloatT *x) {
     const IntT n = F.n;
     for (IntT i = n - 1; i >= 0; --i) {
         FloatT xi = x[(size_t)i];
-        for (IntT p = F.Lp[(size_t)i]; p < F.Lp[(size_t)i + 1]; ++p)
-            xi -= F.Lx[(size_t)p] * x[(size_t)F.Li[(size_t)p]];
+        for (IntT p = F.Lp[(size_t)i]; p < F.Lp[(size_t)i + 1]; ++p) {
+            const IntT idx = F.Li[(size_t)p];
+            if (idx >= 0 && idx < n) {
+                xi -= F.Lx[(size_t)p] * x[(size_t)idx];
+            }
+        }
         x[(size_t)i] = xi;
-        if (i == 0)
-            break;
+        if (i == 0) break;
     }
 }
+
 template <std::floating_point FloatT = double,
           std::signed_integral IntT = int32_t>
 inline void solve(const LDLFactors<FloatT, IntT> &F, FloatT *x) {
     L_solve(F, x);
-    detail::qd_par_for_n(static_cast<std::size_t>(F.n),
-        [&](std::size_t i){ x[i] *= F.Dinv[i]; });
+    
+    // Diagonal scaling with SIMD optimization
+    const IntT n = F.n;
+    if constexpr (std::is_same_v<FloatT, double>) {
+        detail::simd_scale_array(x, F.Dinv.data(), static_cast<size_t>(n));
+    } else {
+        detail::qd_par_for_n(static_cast<std::size_t>(n),
+            [&](std::size_t i){ x[i] *= F.Dinv[i]; });
+    }
+    
     Lt_solve(F, x);
 }
+
 template <std::floating_point FloatT = double,
           std::signed_integral IntT = int32_t>
 inline void solve_with_ordering(const LDLFactors<FloatT, IntT> &F,
@@ -581,68 +688,112 @@ inline void solve_with_ordering(const LDLFactors<FloatT, IntT> &F,
     const IntT n = F.n;
     if (ord.n != n)
         throw InvalidMatrixError("ordering mismatch");
+        
     std::vector<FloatT> xp((size_t)n);
 
-    // xp = P x    (permute in)
+    // Permute input: xp = P x
     detail::qd_par_for_n(static_cast<std::size_t>(n),
-        [&](std::size_t i){ xp[(size_t)ord.perm[i]] = x[i]; });
+        [&](std::size_t i){ 
+            const IntT pi = ord.perm[i];
+            if (pi >= 0 && pi < n) {
+                xp[(size_t)pi] = x[i]; 
+            }
+        });
 
     L_solve(F, xp.data());
 
-    // scale by Dinv
-    detail::qd_par_for_n(static_cast<std::size_t>(n),
-        [&](std::size_t i){ xp[i] *= F.Dinv[i]; });
+    // Diagonal scaling
+    if constexpr (std::is_same_v<FloatT, double>) {
+        detail::simd_scale_array(xp.data(), F.Dinv.data(), static_cast<size_t>(n));
+    } else {
+        detail::qd_par_for_n(static_cast<std::size_t>(n),
+            [&](std::size_t i){ xp[i] *= F.Dinv[i]; });
+    }
 
     Lt_solve(F, xp.data());
 
-    // x = P x     (permute out; same mapping kept to match caller expectations)
+    // Permute output: x = P xp
     detail::qd_par_for_n(static_cast<std::size_t>(n),
-        [&](std::size_t i){ x[i] = xp[(size_t)ord.perm[i]]; });
+        [&](std::size_t i){ 
+            const IntT pi = ord.perm[i];
+            if (pi >= 0 && pi < n) {
+                x[i] = xp[(size_t)pi]; 
+            }
+        });
 }
 
-
-// drop-in: a tight symmetric SpMV kernel for upper CSC (no diagonal double-count)
+// Optimized symmetric SpMV for upper CSC
 template <std::floating_point FloatT, std::signed_integral IntT>
 inline void sym_spmv_upper(const qdldl23::SparseUpperCSC<FloatT, IntT>& A,
                            const FloatT* __restrict__ x,
                            FloatT* __restrict__ y) {
     const IntT n = A.n;
     std::fill(y, y + (size_t)n, FloatT{0});
+    
     for (IntT j = 0; j < n; ++j) {
         const FloatT xj = x[(size_t)j];
-        const IntT p0 = A.Ap[(size_t)j], p1 = A.Ap[(size_t)j + 1];
+        const IntT p0 = A.Ap[(size_t)j];
+        const IntT p1 = A.Ap[(size_t)j + 1];
+        
         for (IntT p = p0; p < p1; ++p) {
             const IntT i = A.Ai[(size_t)p];
-            const FloatT v = A.Ax[(size_t)p];
-            y[(size_t)i] += v * xj;                // A(i,j)*x(j)
-            if (i != j) y[(size_t)j] += v * x[(size_t)i]; // A(j,i)*x(i)
+            if (i >= 0 && i < n) {
+                const FloatT v = A.Ax[(size_t)p];
+                y[(size_t)i] += v * xj;                // A(i,j)*x(j)
+                if (i != j) {
+                    y[(size_t)j] += v * x[(size_t)i];  // A(j,i)*x(i)
+                }
+            }
         }
     }
 }
 
-
-// --------- Residual-based refinement (single-thread; no atomics) ----------
+// Safe residual-based refinement
 template <std::floating_point FloatT, std::signed_integral IntT>
 inline void refine(const SparseUpperCSC<FloatT, IntT>& A,
                    const LDLFactors<FloatT, IntT>& F, FloatT* x,
                    const FloatT* b, int iters = 2,
                    const Ordering<IntT>* ord = nullptr) {
     const IntT n = A.n;
-    std::vector<FloatT> r((size_t)n), t((size_t)n);
+    if (n <= 0) return;
+    
+    std::vector<FloatT> r((size_t)n);
+    std::vector<FloatT> t((size_t)n);
+    
     for (int it = 0; it < iters; ++it) {
+        // Compute residual: r = b - A*x
         sym_spmv_upper(A, x, r.data());
-        for (IntT i = 0; i < n; ++i) r[(size_t)i] = b[(size_t)i] - r[(size_t)i];
+        
+        if constexpr (std::is_same_v<FloatT, double>) {
+            detail::simd_vector_sub(r.data(), b, r.data(), static_cast<size_t>(n));
+        } else {
+            for (IntT i = 0; i < n; ++i) {
+                r[i] = b[i] - r[i];
+            }
+        }
+        
+        // Solve for correction: F * t = r
         std::copy(r.begin(), r.end(), t.begin());
-        if (ord) solve_with_ordering(F, *ord, t.data());
-        else     solve(F, t.data());
-#if QDLDL23_HAS_STDEXEC
-        detail::qd_par_for_n((size_t)n, [&](size_t i){ x[i] += t[i]; });
-#else
-        for (IntT i = 0; i < n; ++i) x[(size_t)i] += t[(size_t)i];
-#endif
+        if (ord) {
+            solve_with_ordering(F, *ord, t.data());
+        } else {
+            solve(F, t.data());
+        }
+        
+        // Apply correction: x = x + t
+        if constexpr (std::is_same_v<FloatT, double>) {
+            detail::simd_vector_add(x, x, t.data(), static_cast<size_t>(n));
+        } else {
+            #if QDLDL23_HAS_STDEXEC
+            detail::qd_par_for_n((size_t)n, [&](size_t i){ x[i] += t[i]; });
+            #else
+            for (IntT i = 0; i < n; ++i) {
+                x[i] += t[i];
+            }
+            #endif
+        }
     }
 }
-
 
 // --------- Aliases ----------
 using SparseD32 = SparseUpperCSC<double, int32_t>;

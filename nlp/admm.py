@@ -35,13 +35,17 @@ def _nan_guard(*xs: Array) -> bool:
     return False
 
 
-def _robust_median_aggregation(values: List[Array], weights: Optional[Array] = None) -> Array:
+def _robust_median_aggregation(
+    values: List[Array], weights: Optional[Array] = None
+) -> Array:
     """Coordinate-wise median (weights ignored by design)."""
     stacked = np.stack(values, axis=0)
     return np.median(stacked, axis=0)
 
 
-def _trimmed_mean_aggregation(values: List[Array], weights: Optional[Array], trim_ratio: float = 0.1) -> Array:
+def _trimmed_mean_aggregation(
+    values: List[Array], weights: Optional[Array], trim_ratio: float = 0.1
+) -> Array:
     """
     Coordinate-wise unweighted trimmed mean.
     We intentionally ignore 'weights' because per-coordinate sorting reorders sites differently.
@@ -53,7 +57,7 @@ def _trimmed_mean_aggregation(values: List[Array], weights: Optional[Array], tri
         # Fallback to median if trimming would remove too much
         return np.median(stacked, axis=0)
     sorted_vals = np.sort(stacked, axis=0)
-    trimmed = sorted_vals[n_trim:K - n_trim]
+    trimmed = sorted_vals[n_trim : K - n_trim]
     return np.mean(trimmed, axis=0)
 
 
@@ -108,6 +112,7 @@ class _Anderson:
     Stores last m residuals and points. Works on a concatenated vector; we
     re-pack/unpack dict[str->ndarray] by a stable block order (sorted keys).
     """
+
     def __init__(self, m: int = 5, reg: float = 1e-8):
         self.m = int(m)
         self.reg = float(reg)
@@ -118,7 +123,9 @@ class _Anderson:
         self.F.clear()
         self.G.clear()
 
-    def update(self, g_new: Dict[str, Array], f_new: Dict[str, Array]) -> Dict[str, Array]:
+    def update(
+        self, g_new: Dict[str, Array], f_new: Dict[str, Array]
+    ) -> Dict[str, Array]:
         # Pack
         block_names = sorted(g_new)
         g_flat = np.concatenate([g_new[n].ravel() for n in block_names])
@@ -152,7 +159,7 @@ class _Anderson:
         offset = 0
         for n in block_names:
             sz = g_new[n].size
-            out[n] = g_acc[offset:offset + sz].reshape(g_new[n].shape)
+            out[n] = g_acc[offset : offset + sz].reshape(g_new[n].shape)
             offset += sz
         return out
 
@@ -201,8 +208,10 @@ class FederatedConsensusADMM:
         min_improvement: float = 1e-6,
         convergence_window: int = 5,
         # Communication efficiency
-        communication_rounds: int = 1,           # (kept for compatibility; not used internally)
-        compression_ratio: Optional[float] = None,  # fraction of entries to keep in top-k
+        communication_rounds: int = 1,  # (kept for compatibility; not used internally)
+        compression_ratio: Optional[
+            float
+        ] = None,  # fraction of entries to keep in top-k
         # Asynchronous support
         async_tolerance: float = 0.0,  # fraction of workers allowed to be stale
         # Memory and I/O
@@ -210,13 +219,15 @@ class FederatedConsensusADMM:
         checkpoint_path: Optional[str] = None,
         low_memory_mode: bool = False,
         # Callback / logging
-        callback: Optional[Callable[[int, "FederatedConsensusADMM", History], None]] = None,
+        callback: Optional[
+            Callable[[int, "FederatedConsensusADMM", History], None]
+        ] = None,
         random_state: int = 0,
         verbose: bool = False,
         # New: extras (rho clamping, hysteresis; Anderson; relax scheduling)
         rho_min: float = 1e-8,
         rho_max: float = 1e8,
-        rho_hysteresis: int = 2,   # consecutive triggers required to change rho
+        rho_hysteresis: int = 2,  # consecutive triggers required to change rho
         anderson: bool = False,
         anderson_m: int = 5,
         anderson_reg: float = 1e-8,
@@ -233,7 +244,9 @@ class FederatedConsensusADMM:
         # ρ handling (scalar or dict per block)
         if isinstance(rho, dict):
             self._rho_is_dict = True
-            self.rho: Union[float, Dict[str, float]] = {k: float(v) for k, v in rho.items()}
+            self.rho: Union[float, Dict[str, float]] = {
+                k: float(v) for k, v in rho.items()
+            }
         else:
             self._rho_is_dict = False
             self.rho = float(rho)
@@ -281,7 +294,7 @@ class FederatedConsensusADMM:
         self.communication_rounds = int(communication_rounds)
         self.compression_ratio = compression_ratio
         self.async_tolerance = float(async_tolerance)
-        self.async_mode = (self.async_tolerance > 0.0)
+        self.async_mode = self.async_tolerance > 0.0
 
         # Memory / I/O
         self.checkpoint_freq = int(checkpoint_freq)
@@ -303,7 +316,9 @@ class FederatedConsensusADMM:
         self.anderson = bool(anderson)
         self.anderson_m = int(anderson_m)
         self.anderson_reg = float(anderson_reg)
-        self._aa = _Anderson(self.anderson_m, self.anderson_reg) if self.anderson else None
+        self._aa = (
+            _Anderson(self.anderson_m, self.anderson_reg) if self.anderson else None
+        )
 
     def __enter__(self):
         """Context manager entry: create executor if needed."""
@@ -433,7 +448,9 @@ class FederatedConsensusADMM:
         futures = [self._executor.submit(update_site, i) for i in range(K)]
         results: List[Optional[Dict[str, Array]]] = [None] * K
         completed_count = 0
-        min_required = max(1, int(K * (1 - self.async_tolerance))) if self.async_mode else K
+        min_required = (
+            max(1, int(K * (1 - self.async_tolerance))) if self.async_mode else K
+        )
 
         for future in as_completed(futures):
             try:
@@ -477,7 +494,10 @@ class FederatedConsensusADMM:
             if abs(obj_val - self._best_obj) < self.min_improvement:
                 self._patience_counter += 1
                 if self._patience_counter >= self.patience:
-                    return True, f"early stopping: no improvement for {self.patience} iterations"
+                    return (
+                        True,
+                        f"early stopping: no improvement for {self.patience} iterations",
+                    )
             else:
                 self._patience_counter = 0
 
@@ -514,6 +534,7 @@ class FederatedConsensusADMM:
 
         import os
         import pickle
+
         os.makedirs(self.checkpoint_path, exist_ok=True)
         checkpoint_file = f"{self.checkpoint_path}/checkpoint_{iteration}.pkl"
         with open(checkpoint_file, "wb") as f:
@@ -524,11 +545,14 @@ class FederatedConsensusADMM:
     def load_checkpoint(self, checkpoint_file: str) -> int:
         """Load checkpoint from disk and return start iteration."""
         import pickle
+
         with open(checkpoint_file, "rb") as f:
             checkpoint = pickle.load(f)
 
         self.rho = checkpoint["rho"]
-        self._rho_is_dict = bool(checkpoint.get("rho_is_dict", isinstance(self.rho, dict)))
+        self._rho_is_dict = bool(
+            checkpoint.get("rho_is_dict", isinstance(self.rho, dict))
+        )
         self.blocks_ = checkpoint["blocks"]
         self.z_ = checkpoint["z"]
         self.x_local_ = checkpoint["x_local"]
@@ -621,15 +645,25 @@ class FederatedConsensusADMM:
                 print(f"Resumed from checkpoint at iteration {start_iter}")
         else:
             K = len(X_list)
-            assert K == len(y_list), "X_list and y_list must have same length (K sites)."
+            assert K == len(
+                y_list
+            ), "X_list and y_list must have same length (K sites)."
 
             # weights: by sample count (rows) if enabled, else uniform
-            n_i = np.array([getattr(X, "shape", (0,))[0] or 1 for X in X_list], dtype=float)
-            weights = n_i / n_i.sum() if self.use_weights else np.ones(K, dtype=float) / K
+            n_i = np.array(
+                [getattr(X, "shape", (0,))[0] or 1 for X in X_list], dtype=float
+            )
+            weights = (
+                n_i / n_i.sum() if self.use_weights else np.ones(K, dtype=float) / K
+            )
             self.weights_ = weights
 
             # initialize globals/blocks
-            z = self._init_blocks(X_list, y_list) if z0 is None else {k: v.copy() for k, v in z0.items()}
+            z = (
+                self._init_blocks(X_list, y_list)
+                if z0 is None
+                else {k: v.copy() for k, v in z0.items()}
+            )
             self.blocks_ = list(z.keys())
             self.z_ = {name: z[name].copy() for name in self.blocks_}
 
@@ -637,7 +671,9 @@ class FederatedConsensusADMM:
             self.x_local_ = []
             self.u_ = []
             for _ in range(K):
-                self.x_local_.append({name: np.zeros_like(z[name]) for name in self.blocks_})
+                self.x_local_.append(
+                    {name: np.zeros_like(z[name]) for name in self.blocks_}
+                )
                 self.u_.append({name: np.zeros_like(z[name]) for name in self.blocks_})
 
             self.history_ = History(
@@ -701,16 +737,28 @@ class FederatedConsensusADMM:
                     if self.alpha != 1.0:
                         xbar_plus_u = []
                         for i in range(K):
-                            xbar = self.alpha * self.x_local_[i][name] + (1.0 - self.alpha) * z_old[name]
+                            xbar = (
+                                self.alpha * self.x_local_[i][name]
+                                + (1.0 - self.alpha) * z_old[name]
+                            )
                             xbar_plus_u.append(xbar + self.u_[i][name])
                         if self.aggregation_method == "weighted_avg":
-                            avg = sum(self.weights_[i] * xbar_plus_u[i] for i in range(K))
+                            avg = sum(
+                                self.weights_[i] * xbar_plus_u[i] for i in range(K)
+                            )
                         else:
-                            temp_x = [{name: xbar_plus_u[i] - self.u_[i][name]} for i in range(K)]
+                            temp_x = [
+                                {name: xbar_plus_u[i] - self.u_[i][name]}
+                                for i in range(K)
+                            ]
                             temp_u = [{name: self.u_[i][name]} for i in range(K)]
-                            avg = self._aggregate_block(name, temp_x, temp_u, self.weights_)
+                            avg = self._aggregate_block(
+                                name, temp_x, temp_u, self.weights_
+                            )
                     else:
-                        avg = self._aggregate_block(name, self.x_local_, self.u_, self.weights_)
+                        avg = self._aggregate_block(
+                            name, self.x_local_, self.u_, self.weights_
+                        )
 
                     # Optional: communication compression round trip (receive decompressed)
                     if self.compression_ratio is not None:
@@ -722,8 +770,12 @@ class FederatedConsensusADMM:
 
                 # Optional Anderson acceleration on z
                 if self.anderson and self._aa is not None:
-                    z_proposed = {name: aggregated[name].copy() for name in self.blocks_}
-                    residual = {name: z_proposed[name] - z_old[name] for name in self.blocks_}
+                    z_proposed = {
+                        name: aggregated[name].copy() for name in self.blocks_
+                    }
+                    residual = {
+                        name: z_proposed[name] - z_old[name] for name in self.blocks_
+                    }
                     z_acc = self._aa.update(z_proposed, residual)
 
                     # Safeguard: accept only if residual decreased
@@ -748,7 +800,9 @@ class FederatedConsensusADMM:
                 comm_start = time.time()
                 for i in range(K):
                     for name in self.blocks_:
-                        self.u_[i][name] = self.u_[i][name] + (self.x_local_[i][name] - z[name])
+                        self.u_[i][name] = self.u_[i][name] + (
+                            self.x_local_[i][name] - z[name]
+                        )
 
                 # Sync public z_
                 self.z_ = {name: z[name].copy() for name in self.blocks_}
@@ -757,9 +811,11 @@ class FederatedConsensusADMM:
                 hist.timing["communication"].append(comm_time)
 
                 # (4) Diagnostics
-                with np.errstate(over='ignore', under='ignore', invalid='ignore'):
+                with np.errstate(over="ignore", under="ignore", invalid="ignore"):
                     r_sq = s_sq = x_norm_sq = z_norm_sq = sum_u_sq = 0.0
-                    sum_u_block: Dict[str, Array] = {name: np.zeros_like(z[name]) for name in self.blocks_}
+                    sum_u_block: Dict[str, Array] = {
+                        name: np.zeros_like(z[name]) for name in self.blocks_
+                    }
 
                     for i in range(K):
                         for name in self.blocks_:
@@ -771,7 +827,7 @@ class FederatedConsensusADMM:
                     for name in self.blocks_:
                         dz = z[name] - z_old[name]
                         rho_b = self._get_rho_block(name)
-                        s_sq += (rho_b ** 2) * K * _sqnorm(dz)
+                        s_sq += (rho_b**2) * K * _sqnorm(dz)
                         z_norm_sq += _sqnorm(z[name])
                         sum_u_sq += _sqnorm(sum_u_block[name])
 
@@ -782,16 +838,22 @@ class FederatedConsensusADMM:
                     )
                     # For eps_dual we use average rho if dict
                     if self._rho_is_dict:
-                        rho_mean = float(np.mean([self._get_rho_block(n) for n in self.blocks_]))
+                        rho_mean = float(
+                            np.mean([self._get_rho_block(n) for n in self.blocks_])
+                        )
                     else:
                         rho_mean = float(self.rho)
-                    eps_dual = sqrtKD * self.abstol + self.reltol * rho_mean * np.sqrt(sum_u_sq)
+                    eps_dual = sqrtKD * self.abstol + self.reltol * rho_mean * np.sqrt(
+                        sum_u_sq
+                    )
 
                     # Relative residuals (optional)
                     x_ref = max(1.0, np.sqrt(x_norm_sq))
                     z_ref = max(1.0, np.sqrt(z_norm_sq))
                     rel_r = r_norm / x_ref
-                    rel_s = s_norm / (rho_mean * z_ref if rho_mean > 0 else max(1.0, z_ref))
+                    rel_s = s_norm / (
+                        rho_mean * z_ref if rho_mean > 0 else max(1.0, z_ref)
+                    )
 
                     # Objective (subclass)
                     obj_val = self._objective(X_list, y_list, self.x_local_)
@@ -817,7 +879,12 @@ class FederatedConsensusADMM:
                     )
 
                 # (5) Block-wise adaptive rho with hysteresis & clamping
-                if self.adaptive_rho and it > 0 and np.isfinite(r_norm) and np.isfinite(s_norm):
+                if (
+                    self.adaptive_rho
+                    and it > 0
+                    and np.isfinite(r_norm)
+                    and np.isfinite(s_norm)
+                ):
                     # per-block residual norms
                     r_block = {name: 0.0 for name in self.blocks_}
                     s_block = {name: 0.0 for name in self.blocks_}
@@ -827,7 +894,7 @@ class FederatedConsensusADMM:
                     for name in self.blocks_:
                         dz = z[name] - z_old[name]
                         rho_b = self._get_rho_block(name)
-                        s_block[name] = (rho_b ** 2) * K * _sqnorm(dz)
+                        s_block[name] = (rho_b**2) * K * _sqnorm(dz)
 
                     for name in self.blocks_:
                         r_b, s_b = np.sqrt(r_block[name]), np.sqrt(s_block[name])
@@ -836,7 +903,9 @@ class FederatedConsensusADMM:
                             self._hyst_dual = 0
                             if self._hyst_pri >= self.rho_hysteresis:
                                 old = self._get_rho_block(name)
-                                new = np.clip(old * self.rho_tau, self.rho_min, self.rho_max)
+                                new = np.clip(
+                                    old * self.rho_tau, self.rho_min, self.rho_max
+                                )
                                 if new != old:
                                     self._set_rho_block(name, new)
                                     # dual scaling when rho increases: u <- u / tau
@@ -850,7 +919,9 @@ class FederatedConsensusADMM:
                             self._hyst_pri = 0
                             if self._hyst_dual >= self.rho_hysteresis:
                                 old = self._get_rho_block(name)
-                                new = np.clip(old / self.rho_tau, self.rho_min, self.rho_max)
+                                new = np.clip(
+                                    old / self.rho_tau, self.rho_min, self.rho_max
+                                )
                                 if new != old:
                                     self._set_rho_block(name, new)
                                     # dual scaling when rho decreases: u <- u * tau
@@ -872,7 +943,9 @@ class FederatedConsensusADMM:
                     break
 
                 # (7) Convergence checks
-                converged, reason = self._check_convergence(hist, r_norm, s_norm, eps_pri, eps_dual, obj_val)
+                converged, reason = self._check_convergence(
+                    hist, r_norm, s_norm, eps_pri, eps_dual, obj_val
+                )
                 if converged:
                     hist.converged = True
                     hist.iters = it + 1

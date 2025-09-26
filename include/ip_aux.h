@@ -16,406 +16,400 @@
 #include <optional>
 #include <vector>
 #include <numeric>
-
-// Enhanced barrier parameter adaptation
-struct AdaptiveBarrierConfig {
-    // Fiacco-McCormick parameters
-    double fm_reduction_factor = 0.1;   // Standard F-M reduction
-    double fm_aggressive_factor = 0.01; // Aggressive reduction near solution
-
-    // Superlinear reduction parameters
-    double superlinear_threshold = 1e-4; // When to switch to superlinear
-    double superlinear_exponent = 2.0;   // μ_new = μ^exponent
-
-    // Aggressive reduction near solution
-    double kkt_threshold = 1e-6;     // KKT error threshold for aggressive mode
-    double aggressive_factor = 1e-3; // μ = aggressive_factor * ||KKT||²
-
-    // Safety bounds
-    double mu_min = 1e-12;
-    double mu_max = 1e2;
-};
 class RichardsonExtrapolator {
 private:
-    struct StepHistory {
-        dvec x, dx;     // approximation f(h_i)
-        double alpha;   // step size h_i
-        double error_estimate;
-        int iteration;
-    };
-    std::vector<StepHistory> history_;
-    int max_history_ = 3;
+    struct StepHistory { dvec dx; double h; double err; int it; };
+    std::vector<StepHistory> hist_;
+    int max_hist_ = 3;
+    double min_ratio_ = 1.5, max_ratio_ = 4.0; // require roughly geometric spacing
+    double max_amplify_ = 50.0;                // cap (ratio^p - 1)^{-1}
+    double p_lo_ = 0.5, p_hi_ = 8.0;
 
-    static double safe_log(double v) {
-        return std::log(std::max(v, 1e-300));
+    static double safe_log(double v) { return std::log(std::max(v, 1e-300)); }
+
+    static bool strictly_increasing(const std::vector<double>& v) {
+        for (size_t i = 1; i < v.size(); ++i) if (!(v[i] > v[i-1])) return false;
+        return true;
     }
 
-    // Try to estimate p using log-log linear regression of ||f(h_i)-L|| vs h_i,
-    // where L is a provisional limit estimate.
-    static std::optional<double> estimate_p_regression(const std::vector<double>& hs,
-                                                       const std::vector<dvec>& fs,
-                                                       const dvec& L) {
-        const int m = static_cast<int>(hs.size());
+    // Median of pairwise slopes when hs are roughly geometric
+    static std::optional<double> estimate_p_pairwise(const std::vector<double>& h,
+                                                     const std::vector<dvec>& f) {
+        const int m = (int)h.size();
         if (m < 3) return std::nullopt;
-
-        std::vector<double> xs, ys;
-        xs.reserve(m);
-        ys.reserve(m);
-        for (int i = 0; i < m; ++i) {
-            const double err = (fs[i] - L).norm();
-            if (err <= 0.0) continue; // skip degenerate
-            xs.push_back(std::log(hs[i]));
-            ys.push_back(std::log(err));
+        std::vector<double> pvals; pvals.reserve(m-1);
+        for (int i = 1; i < m-1; ++i) {
+            const double num = (f[i]   - f[i-1]).norm();
+            const double den = (f[i+1] - f[i]).norm();
+            if (num <= 0.0 || den <= 0.0) continue;
+            const double r = h[i] / h[i-1];
+            const double r2 = h[i+1] / h[i];
+            if (!(r>1.0 && r2>1.0)) continue;
+            // use adjacent with closest ratios to avoid scale drift
+            const double ruse = 0.5*(r+r2);
+            const double p = std::log(num/den) / safe_log(ruse);
+            if (std::isfinite(p)) pvals.push_back(p);
         }
-        if (xs.size() < 2) return std::nullopt; // need slope
-
-        // Ordinary least squares slope
-        double sx=0, sy=0, sxx=0, sxy=0;
-        for (size_t i = 0; i < xs.size(); ++i) {
-            sx  += xs[i];
-            sy  += ys[i];
-            sxx += xs[i]*xs[i];
-            sxy += xs[i]*ys[i];
-        }
-        const double n = static_cast<double>(xs.size());
-        const double denom = n*sxx - sx*sx;
-        if (std::abs(denom) < 1e-14) return std::nullopt;
-
-        const double slope = (n*sxy - sx*sy) / denom; // ~ p
-        if (!std::isfinite(slope)) return std::nullopt;
-        return slope;
+        if (pvals.empty()) return std::nullopt;
+        std::nth_element(pvals.begin(), pvals.begin()+pvals.size()/2, pvals.end());
+        return pvals[pvals.size()/2];
     }
 
-    // Fallback: estimate p from three consecutive levels without assuming geometric spacing:
-    // delta0/delta1 ≈ (h0^p - h1^p)/(h1^p - h2^p).
-    static std::optional<double> estimate_p_threepoint(double h0, double h1, double h2,
-                                                       double delta0, double delta1) {
-        if (delta0 <= 0.0 || delta1 <= 0.0) return std::nullopt;
-        if (!(h2 < h1 && h1 < h0)) return std::nullopt;
-
-        const double R = delta0 / delta1;
-        auto F = [&](double p) {
-            const double a0 = std::pow(h0, p), a1 = std::pow(h1, p), a2 = std::pow(h2, p);
-            const double num = a0 - a1;
-            const double den = a1 - a2;
-            if (std::abs(den) < 1e-300) return std::numeric_limits<double>::infinity();
-            return num/den - R;
-        };
-
-        // Bisection on p ∈ [p_min, p_max]
-        double p_min = 1e-6, p_max = 12.0;
-        double f_min = F(p_min), f_max = F(p_max);
-        // Expand if needed (rudimentary)
-        for (int k = 0; k < 5 && f_min*f_max > 0; ++k) { p_max *= 2.0; f_max = F(p_max); }
-        if (!std::isfinite(f_min) || !std::isfinite(f_max) || f_min*f_max > 0) return std::nullopt;
-
-        for (int it = 0; it < 80; ++it) {
-            double pm = 0.5*(p_min + p_max);
-            double fm = F(pm);
-            if (!std::isfinite(fm)) { p_min = pm; continue; }
-            if (std::abs(fm) < 1e-12) return pm;
-            if (f_min * fm < 0) {
-                p_max = pm; f_max = fm;
-            } else {
-                p_min = pm; f_min = fm;
-            }
+    static bool ratios_reasonable(const std::vector<double>& h, double rmin, double rmax) {
+        for (size_t i = 1; i < h.size(); ++i) {
+            double r = h[i]/h[i-1];
+            if (!(r >= rmin && r <= rmax)) return false;
         }
-        return 0.5*(p_min + p_max);
+        return true;
     }
 
-    // Build a Richardson/Neville tableau for a given base order p.
-    static void build_tableau(const std::vector<double>& hs,
-                              const std::vector<dvec>& fs,
-                              int& order_achieved,
-                              dvec& best, dvec& prev, bool& have_prev,
-                              double p) {
-        const int m = static_cast<int>(fs.size());
-        std::vector<std::vector<dvec>> R(m, std::vector<dvec>());
-        for (int i = 0; i < m; ++i) { R[i].resize(i+1); R[i][0] = fs[i]; }
+    struct TableauOut { dvec best, prev; bool have_prev; int order; double ampl; };
+    TableauOut build_tableau_guarded(const std::vector<double>& h,
+                                     const std::vector<dvec>& f,
+                                     double p) const {
+        const int m = (int)f.size();
+        std::vector<std::vector<dvec>> R(m);
+        for (int i = 0; i < m; ++i) { R[i].resize(i+1); R[i][0] = f[i]; }
 
+        double worst_ampl = 1.0;
         for (int i = 1; i < m; ++i) {
             for (int j = 1; j <= i; ++j) {
-                double ratio = std::pow(hs[i] / hs[i-j], p);
+                double ratio = std::pow(h[i] / h[i-j], p);
                 double denom = ratio - 1.0;
-                if (std::abs(denom) < 1e-14) {
+                if (!std::isfinite(ratio) || std::abs(denom) < 1e-12) {
                     R[i][j] = R[i][j-1]; // fallback
+                    continue;
+                }
+                double ampl = std::abs(1.0 / denom);
+                if (ampl > max_amplify_) {
+                    // stop escalating this column; copy previous
+                    R[i][j] = R[i][j-1];
                 } else {
                     R[i][j] = R[i][j-1] + (R[i][j-1] - R[i-1][j-1]) / denom;
+                    worst_ampl = std::max(worst_ampl, ampl);
                 }
             }
         }
-        best = R[m-1][m-1];
-        if (m >= 2) { prev = R[m-1][m-2]; have_prev = true; } else { have_prev = false; }
-        order_achieved = m; // eliminated up to m-1 levels of h^p
+        TableauOut out;
+        out.best      = R[m-1][m-1];
+        out.prev      = (m >= 2 ? R[m-1][m-2] : R[m-1][m-1]);
+        out.have_prev = (m >= 2);
+        out.order     = m;
+        out.ampl      = worst_ampl;
+        return out;
     }
 
 public:
     struct ExtrapolatedStep {
-        dvec   dx_refined;       // extrapolated limit ~ f(0)
-        double error_estimate;   // ||last - prev|| as a-posteriori error
+        dvec   dx_refined;
+        double error_estimate;
         bool   converged;
-        int    order_achieved;   // number of levels used
-        double p_used;           // estimated base order
+        int    order_achieved;
+        double p_used;
+        double ampl_factor; // diagnostic
     };
 
-    void add_step(const dvec& x, const dvec& dx, double alpha, double error) {
-        history_.push_back({x, dx, alpha, error, static_cast<int>(history_.size())});
-        if (history_.size() > max_history_) history_.erase(history_.begin());
+    void clear() { hist_.clear(); }
+
+    // Reset history when direction changes or μ changes (caller can decide)
+    void reset() { clear(); }
+
+    // Add a step (direction dx at step size h); ignore incompatible sizes
+    void add_step(const dvec& dx, double h, double err=std::numeric_limits<double>::quiet_NaN()) {
+        if (dx.size() == 0) return;
+        hist_.push_back({dx, h, err, (int)hist_.size()});
+        if ((int)hist_.size() > max_hist_) hist_.erase(hist_.begin());
     }
 
     ExtrapolatedStep extrapolate_step(const dvec& current_dx,
-                                      double current_alpha,
+                                      double current_h,
                                       double tol = 1e-8) {
         ExtrapolatedStep out;
-        out.dx_refined      = current_dx;
-        out.error_estimate  = std::numeric_limits<double>::infinity();
-        out.converged       = false;
-        out.order_achieved  = 1;
-        out.p_used          = 2.0;
+        out.dx_refined     = current_dx;
+        out.error_estimate = std::numeric_limits<double>::infinity();
+        out.converged      = false;
+        out.order_achieved = 1;
+        out.p_used         = 2.0;
+        out.ampl_factor    = 1.0;
 
-        // Gather compatible history
-        std::vector<double> h;
-        std::vector<dvec>   f;
-        h.reserve(history_.size() + 1);
-        f.reserve(history_.size() + 1);
-        for (const auto& s : history_) {
-            if (s.dx.size() == current_dx.size()) { h.push_back(s.alpha); f.push_back(s.dx); }
-        }
-        // Append current
-        h.push_back(current_alpha);
-        f.push_back(current_dx);
+        // Gather & sort by increasing h (smallest last)
+        std::vector<double> h; std::vector<dvec> f;
+        h.reserve(hist_.size()+1); f.reserve(hist_.size()+1);
+        for (auto& s : hist_) if (s.dx.size()==current_dx.size()) { h.push_back(s.h); f.push_back(s.dx); }
+        h.push_back(current_h); f.push_back(current_dx);
 
-        // Need at least two levels to extrapolate
         if (f.size() < 2) return out;
-
-        // Sort by increasing h (largest at front, smallest last)
-        std::vector<size_t> idx(h.size());
-        std::iota(idx.begin(), idx.end(), 0);
+        std::vector<size_t> idx(h.size()); std::iota(idx.begin(), idx.end(), 0);
         std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b){ return h[a] < h[b]; });
+        std::vector<double> hs; std::vector<dvec> fs; hs.reserve(h.size()); fs.reserve(f.size());
+        for (auto k : idx) { hs.push_back(h[k]); fs.push_back(f[k]); }
 
-        std::vector<double> hs; hs.reserve(h.size());
-        std::vector<dvec>   fs; fs.reserve(f.size());
-        for (size_t k : idx) { hs.push_back(h[k]); fs.push_back(f[k]); }
-
-        const int m = static_cast<int>(fs.size());
-
-        // Pass 1: provisional limit with p=2 (safe default)
-        int ord_tmp = 1; dvec best_tmp = fs.back(), prev_tmp = fs.back(); bool have_prev_tmp=false;
-        build_tableau(hs, fs, ord_tmp, best_tmp, prev_tmp, have_prev_tmp, /*p=*/2.0);
-
-        // Estimate p via regression if possible
-        std::optional<double> p_hat = estimate_p_regression(hs, fs, best_tmp);
-
-        // Fallback: use last three to solve ratio equation if regression fails
-        if (!p_hat && m >= 3) {
-            const int i0 = m-3, i1 = m-2, i2 = m-1; // three smallest h
-            const double d0 = (fs[i1] - fs[i0]).norm();
-            const double d1 = (fs[i2] - fs[i1]).norm();
-            p_hat = estimate_p_threepoint(hs[i0], hs[i1], hs[i2], d0, d1);
+        // Require monotone and roughly geometric spacing to proceed
+        if (!strictly_increasing(hs) || !ratios_reasonable(hs, min_ratio_, max_ratio_)) {
+            return out; // fall back to unrefined
         }
 
-        // Final clamp / default
-        double p_use = p_hat.value_or(2.0);
+        // Estimate p: pairwise median first, then clamp
+        double p_use = estimate_p_pairwise(hs, fs).value_or(2.0);
         if (!std::isfinite(p_use)) p_use = 2.0;
-        p_use = std::clamp(p_use, 0.5, 12.0);
+        p_use = std::clamp(p_use, p_lo_, p_hi_);
         out.p_used = p_use;
 
-        // Pass 2: final tableau with p_use
-        int order_final = 1; dvec best = fs.back(), prev = fs.back(); bool have_prev=false;
-        build_tableau(hs, fs, order_final, best, prev, have_prev, p_use);
+        // Build guarded tableau
+        auto tab = build_tableau_guarded(hs, fs, p_use);
+        out.dx_refined     = tab.best;
+        out.order_achieved = tab.order;
+        out.ampl_factor    = tab.ampl;
 
-        out.dx_refined      = best;
-        out.order_achieved  = order_final;
-        out.error_estimate  = have_prev ? (best - prev).norm() : (best - fs.back()).norm();
-        out.converged       = (out.error_estimate < tol);
+        // Error estimate: prefer scaled form if last ratio is clean
+        double err = (tab.have_prev ? (tab.best - tab.prev).norm()
+                                    : (tab.best - fs.back()).norm());
+        double last_ratio_p = std::pow(hs.back()/hs[hs.size()-2], p_use);
+        if (std::isfinite(last_ratio_p) && std::abs(last_ratio_p-1.0) > 1e-6)
+            err = err / std::abs(last_ratio_p - 1.0);
+        out.error_estimate = err;
+        out.converged = (err < tol);
         return out;
     }
-
-    void clear() { history_.clear(); }
 };
 
-// Enhanced adaptive barrier parameter manager
+
+
+// --------------------------- Public knobs (IPOPT-style) -----------------------
+enum class MuStrategy { Adaptive, Monotone };   // "mu_strategy"
+enum class MuOracle  { QualityFunction, LOQO }; // "mu_oracle"
+
+struct AdaptiveBarrierConfig {
+    // Strategy selection (IPOPT-compatible surface)
+    MuStrategy mu_strategy         = MuStrategy::Adaptive;        // adaptive | monotone
+    MuOracle  mu_oracle            = MuOracle::QualityFunction;   // quality-function | loqo
+
+    // μ bounds and targets
+    double mu_init                 = 1e-1;   // initial μ (for solver to use externally)
+    double mu_min                  = 1e-14;
+    double mu_max                  = 1e+2;
+    double mu_target               = 0.0;    // optional lower target in early/mid iterations (0=disabled)
+
+    // Centering (σ) bounds and exponent
+    double sigma_min               = 0.05;
+    double sigma_max               = 0.95;
+    double sigma_pow               = 3.0;    // p in σ_base = (μ_aff/μ)^p, classic 2..3
+
+    // Quality-function extras (kept minimal and robust)
+    double qf_centrality_weight    = 0.0;    // 0 disables penalty term (placeholder kept off)
+
+    // Monotone strategy controls
+    double mu_linear_decrease_factor = 0.2;  // τ in μ := max(μ_min, τ * μ) each iter
+
+    // Subproblem tolerance scaling for monotone mode (caller uses this)
+    double barrier_tol_factor      = 0.1;    // suggest inner tol ≈ μ * factor
+
+    // Progress & stabilization heuristics
+    double fast_progress_thr       = 0.35;   // relative drop in KKT to call "fast"
+    double stall_thr               = 0.05;   // relative drop below this ⇒ stall candidate
+    int    stall_k_max             = 3;      // consecutive stalls before damping σ
+    double sigma_shrink_on_stall   = 0.5;    // damp σ when stalling
+    double sigma_boost_on_fast     = 1.2;    // slightly more aggressive when fast
+
+    // Near-solution safeguard: μ ≤ c * ||KKT||^2
+    double near_cap_c              = 1e-2;
+    double near_cap_enable_thr     = 1e-6;
+
+    // History
+    int    max_hist                = 10;
+
+    // Acceptable termination knobs (outer solver should use these)
+    double acceptable_tol             = 1e-6;
+    int    acceptable_iter            = 15;
+    double acceptable_dual_inf_tol    = 1e+10;
+    double acceptable_constr_viol_tol = 1e-2;
+    double acceptable_compl_inf_tol   = 1e-2;
+    double acceptable_obj_change_tol  = 1e-20;
+
+    // ---------------- Anti-loop / oscillation safeguards ----------------
+    int    osc_window              = 4;      // sliding window to detect μ/KKT oscillation
+    double osc_rel_mu_tol          = 1e-3;   // |μ_i - μ_{i-1}| / max(μ_i,1) <= tol
+    double osc_rel_kkt_tol         = 1e-3;   // |KKT_i - KKT_{i-1}| / max(KKT_i,1) <= tol
+    double emergency_tau           = 0.2;    // when oscillating: force μ_new <= τ*μ (monotone fallback)
+    double min_shrink_on_stall     = 0.2;    // ensure at least this shrink when stalled (if not oscillating)
+    int    freeze_max_consecutive  = 1;      // never freeze more than this many consecutive times
+};
+
+// --------------------------- Manager interface --------------------------------
 class AdaptiveBarrierManager {
-private:
-    AdaptiveBarrierConfig config_;
-    double prev_mu_ = 1e-2;
-    double prev_kkt_error_ = std::numeric_limits<double>::infinity();
-    int stagnation_count_ = 0;
-    bool near_solution_ = false;
-
-    // History for trend analysis
-    std::vector<double> mu_history_;
-    std::vector<double> kkt_history_;
-    int max_history_ = 10;
-
 public:
-    AdaptiveBarrierManager(const AdaptiveBarrierConfig &config = {})
-        : config_(config) {}
+    struct Inputs {
+        double mu;          // current μ
+        double mu_aff;      // affine μ from predictor: (x_aff^T s_aff)/m
 
-    struct BarrierUpdate {
-        double mu_new;
-        std::string strategy_used;
-        bool is_aggressive;
-        double reduction_factor;
+        // Residuals (post-corrector, accepted trial):
+        double kkt_norm;        // current full KKT norm (aggregated if desired)
+        double kkt_norm_prev;   // previous full KKT norm
+        double rp_norm;         // primal residual norm (diagnostics)
+        double rd_norm;         // dual residual norm   (diagnostics)
+        double comp_mu;         // current complementarity x^T s / m
+
+        // Step info
+        double alpha_pri;       // accepted primal step length
+        double alpha_dua;       // accepted dual step length (can = alpha_pri)
+        bool   step_accepted;   // line-search/filter accepted the step
+
+        // Iteration counter (optional)
+        int    iter;
     };
 
-    BarrierUpdate update_barrier_parameter(double current_mu, double kkt_error,
-                                           double complementarity,
-                                           double feasibility_error,
-                                           double alpha_step,
-                                           bool step_accepted, int iteration) {
+    struct Result {
+        double mu_new;          // μ for next iteration
+        double sigma_used;      // centering parameter σ used
+        std::string strategy;   // e.g., "adaptive:quality-function+cap", "monotone", "anti-osc"
+    };
 
-        // Update history
-        mu_history_.push_back(current_mu);
-        kkt_history_.push_back(kkt_error);
-        if (mu_history_.size() > max_history_) {
-            mu_history_.erase(mu_history_.begin());
-            kkt_history_.erase(kkt_history_.begin());
-        }
+    explicit AdaptiveBarrierManager(AdaptiveBarrierConfig cfg = {})
+        : cfg_(cfg) {}
 
-        BarrierUpdate result;
-        result.mu_new = current_mu;
-        result.strategy_used = "fixed";
-        result.is_aggressive = false;
-        result.reduction_factor = 1.0;
+    Result update(const Inputs& in) {
+        push_hist(in.mu, in.kkt_norm);
 
-        // Detect if we're near the solution
-        near_solution_ = (kkt_error < config_.kkt_threshold) &&
-                         (feasibility_error < config_.kkt_threshold) &&
-                         (complementarity < 10 * current_mu);
+        const double mu  = clip(in.mu,     cfg_.mu_min, cfg_.mu_max);
+        const double muA = std::max(in.mu_aff, cfg_.mu_min);
+        const double kkt_prev = std::max(in.kkt_norm_prev, 1e-16);
+        const double kkt_cur  = std::max(in.kkt_norm,       1e-16);
 
-        // Strategy 1: Aggressive reduction when near solution
-        if (near_solution_ && kkt_error > 0) {
-            double mu_aggressive =
-                config_.aggressive_factor * kkt_error * kkt_error;
-            mu_aggressive = std::max(mu_aggressive, config_.mu_min);
+        // Progress metrics
+        const double rel_drop = (kkt_prev - kkt_cur) / kkt_prev; // >0 is good
+        const bool stalled = (rel_drop < cfg_.stall_thr) || !in.step_accepted;
+        const bool fast    = (rel_drop > cfg_.fast_progress_thr) && in.step_accepted;
+        if (stalled) ++stall_count_; else stall_count_ = 0;
 
-            if (mu_aggressive < current_mu) {
-                result.mu_new = mu_aggressive;
-                result.strategy_used = "aggressive_kkt_squared";
-                result.is_aggressive = true;
-                result.reduction_factor = mu_aggressive / current_mu;
-                return result;
-            }
-        }
+        // Base σ selection
+        double sigma = 0.0;
+        std::string strategy;
 
-        // Strategy 2: Superlinear reduction for good progress
-        if (kkt_error < config_.superlinear_threshold && step_accepted) {
-            // Check if we're making consistent progress
-            bool consistent_progress = true;
-            if (kkt_history_.size() >= 3) {
-                for (size_t i = kkt_history_.size() - 2;
-                     i < kkt_history_.size(); ++i) {
-                    if (kkt_history_[i] >= kkt_history_[i - 1]) {
-                        consistent_progress = false;
-                        break;
-                    }
-                }
-            }
-
-            if (consistent_progress) {
-                double mu_superlinear =
-                    std::pow(current_mu, config_.superlinear_exponent);
-                mu_superlinear = std::max(mu_superlinear, config_.mu_min);
-
-                result.mu_new = mu_superlinear;
-                result.strategy_used = "superlinear";
-                result.reduction_factor = mu_superlinear / current_mu;
-                return result;
-            }
-        }
-
-        // Strategy 3: Adaptive Fiacco-McCormick
-        double reduction_factor = config_.fm_reduction_factor;
-
-        // Adjust reduction based on step quality
-        if (alpha_step > 0.9 && step_accepted) {
-            // Good step - be more aggressive
-            reduction_factor = config_.fm_aggressive_factor;
-        } else if (alpha_step < 0.1 || !step_accepted) {
-            // Poor step - be conservative
-            reduction_factor = std::sqrt(config_.fm_reduction_factor);
-        }
-
-        // Adjust based on convergence rate
-        if (kkt_history_.size() >= 2) {
-            double improvement_rate = (prev_kkt_error_ - kkt_error) /
-                                      std::max(prev_kkt_error_, 1e-12);
-
-            if (improvement_rate > 0.5) {
-                // Fast convergence - be more aggressive
-                reduction_factor *= 0.5;
-            } else if (improvement_rate < 0.1) {
-                // Slow convergence - be more conservative
-                reduction_factor *= 2.0;
-                stagnation_count_++;
+        if (cfg_.mu_strategy == MuStrategy::Monotone) {
+            sigma = cfg_.mu_linear_decrease_factor; // implicit centering
+            strategy = "monotone";
+        } else {
+            if (cfg_.mu_oracle == MuOracle::QualityFunction) {
+                sigma = std::pow(muA / mu, cfg_.sigma_pow);
+                if (fast)   sigma *= cfg_.sigma_boost_on_fast;
+                if (stall_count_ >= cfg_.stall_k_max) sigma *= cfg_.sigma_shrink_on_stall;
+                strategy = "adaptive:quality-function";
             } else {
-                stagnation_count_ = 0;
+                const double xi = std::max(in.comp_mu, 1e-16);
+                sigma = std::pow(xi / mu, cfg_.sigma_pow);
+                strategy = "adaptive:loqo";
             }
+            sigma = clip(sigma, cfg_.sigma_min, cfg_.sigma_max);
         }
 
-        // Handle stagnation
-        if (stagnation_count_ > 3) {
-            reduction_factor = std::min(reduction_factor * 0.1, 0.01);
-            stagnation_count_ = 0;
+        double mu_new = clip(sigma * mu, cfg_.mu_min, cfg_.mu_max);
+
+        // Optional μ_target: avoid shrinking below target until near-solution
+        if (cfg_.mu_target > 0.0 && kkt_cur > cfg_.near_cap_enable_thr) {
+            mu_new = std::max(mu_new, cfg_.mu_target);
         }
 
-        double mu_new = current_mu * reduction_factor;
-        mu_new = std::clamp(mu_new, config_.mu_min, config_.mu_max);
+        // Near-solution cap: μ ≤ c ||KKT||²
+        if (kkt_cur < cfg_.near_cap_enable_thr) {
+            const double cap = cfg_.near_cap_c * kkt_cur * kkt_cur;
+            if (mu_new > cap) { mu_new = std::max(cfg_.mu_min, cap); strategy += "+cap"; }
+        }
 
-        result.mu_new = mu_new;
-        result.strategy_used = "adaptive_fiacco_mccormick";
-        result.reduction_factor = reduction_factor;
+        // ---------------- Anti-loop safeguards ----------------
+        bool would_freeze = false;
+        if (stall_count_ >= 2 * cfg_.stall_k_max) {
+            // Instead of always freezing, limit consecutive freezes
+            if (consecutive_freezes_ < cfg_.freeze_max_consecutive) {
+                mu_new = mu;              // freeze once
+                strategy = "frozen_on_stall";
+                ++consecutive_freezes_;
+                would_freeze = true;
+            } else {
+                // Next time: emergency monotone shrink
+                const double mu_em = clip(cfg_.emergency_tau * mu, cfg_.mu_min, cfg_.mu_max);
+                mu_new = std::min(mu_new, mu_em);
+                strategy = "anti-osc:emergency_monotone";
+                consecutive_freezes_ = 0; // reset after emergency action
+            }
+        } else {
+            consecutive_freezes_ = 0; // reset when not in deep stall
+        }
 
-        // Update state
-        prev_mu_ = current_mu;
-        prev_kkt_error_ = kkt_error;
+        // Detect oscillation in a short window (μ ~ constant and KKT ~ constant)
+        if (!would_freeze && is_oscillating_()) {
+            const double mu_em = clip(cfg_.emergency_tau * mu, cfg_.mu_min, cfg_.mu_max);
+            mu_new = std::min(mu_new, mu_em);
+            strategy += (strategy.empty() ? "anti-osc" : "+anti-osc");
+            // also damp σ to align with emergency action
+            sigma = std::min(sigma, cfg_.emergency_tau);
+        }
 
-        return result;
+        // If stalled but not oscillating, enforce a minimum shrink to avoid no-op μ updates
+        if (stalled && mu_new >= 0.98 * mu) { // almost unchanged
+            const double mu_min_shrink = clip(cfg_.min_shrink_on_stall * mu, cfg_.mu_min, cfg_.mu_max);
+            mu_new = std::min(mu_new, mu_min_shrink);
+            strategy += (strategy.empty() ? "stall-min-shrink" : "+stall-min-shrink");
+        }
+
+        prev_mu_ = mu;
+        prev_kkt_ = kkt_cur;
+        last_sigma_used_ = sigma;
+
+        return {mu_new, sigma, strategy.empty() ? "mehrotra" : strategy};
     }
 
-    // Predict optimal μ based on current trajectory
-    double predict_optimal_mu(double current_kkt_error) const {
-        if (near_solution_) {
-            return config_.aggressive_factor * current_kkt_error *
-                   current_kkt_error;
-        }
-
-        // Use trend analysis to predict
-        if (kkt_history_.size() >= 3) {
-            double avg_improvement = 0.0;
-            for (size_t i = 1; i < kkt_history_.size(); ++i) {
-                avg_improvement += kkt_history_[i - 1] - kkt_history_[i];
-            }
-            avg_improvement /= (kkt_history_.size() - 1);
-
-            if (avg_improvement > 0) {
-                // Predict when KKT error will reach threshold
-                double steps_to_threshold =
-                    (current_kkt_error - config_.kkt_threshold) /
-                    avg_improvement;
-
-                if (steps_to_threshold < 5) {
-                    // Switch to aggressive mode soon
-                    return config_.aggressive_factor *
-                           (current_kkt_error -
-                            steps_to_threshold * avg_improvement) *
-                           (current_kkt_error -
-                            steps_to_threshold * avg_improvement);
-                }
-            }
-        }
-
-        return prev_mu_ * config_.fm_reduction_factor;
-    }
-
-    bool is_near_solution() const { return near_solution_; }
-
+    // Reset internal state (e.g., at the start of a solve)
     void reset() {
-        mu_history_.clear();
-        kkt_history_.clear();
-        stagnation_count_ = 0;
-        near_solution_ = false;
-        prev_kkt_error_ = std::numeric_limits<double>::infinity();
+        mu_hist_.clear();
+        kkt_hist_.clear();
+        stall_count_ = 0;
+        prev_mu_ = cfg_.mu_init;
+        prev_kkt_ = std::numeric_limits<double>::infinity();
+        last_sigma_used_ = 1.0;
+        consecutive_freezes_ = 0;
+    }
+
+    // Diagnostics
+    int stall_count() const { return stall_count_; }
+    double last_sigma() const { return last_sigma_used_; }
+    const std::vector<double>& mu_history() const { return mu_hist_; }
+    const std::vector<double>& kkt_history() const { return kkt_hist_; }
+    const AdaptiveBarrierConfig& config() const { return cfg_; }
+    AdaptiveBarrierConfig& config() { return cfg_; }
+
+private:
+    AdaptiveBarrierConfig cfg_;
+    int    stall_count_      = 0;
+    int    consecutive_freezes_ = 0;
+    double prev_mu_          = 1e-2;
+    double prev_kkt_         = std::numeric_limits<double>::infinity();
+    double last_sigma_used_  = 1.0;
+    std::vector<double> mu_hist_, kkt_hist_;
+
+    static double clip(double v, double lo, double hi) {
+        return std::max(lo, std::min(v, hi));
+    }
+    void push_hist(double mu, double kkt) {
+        mu_hist_.push_back(mu);
+        kkt_hist_.push_back(kkt);
+        if ((int)mu_hist_.size() > cfg_.max_hist)  mu_hist_.erase(mu_hist_.begin());
+        if ((int)kkt_hist_.size() > cfg_.max_hist) kkt_hist_.erase(kkt_hist_.begin());
+    }
+
+    bool is_oscillating_() const {
+        const int w = std::min(cfg_.osc_window, (int)mu_hist_.size());
+        if (w < 2 || (int)kkt_hist_.size() < w) return false;
+        // Check last w deltas are small
+        for (int i = (int)mu_hist_.size() - w + 1; i < (int)mu_hist_.size(); ++i) {
+            const double mu_i  = mu_hist_[i];
+            const double mu_im = mu_hist_[i-1];
+            const double k_i   = kkt_hist_[i];
+            const double k_im  = kkt_hist_[i-1];
+            const double rel_mu = std::abs(mu_i - mu_im) / std::max(1.0, std::max(mu_i, mu_im));
+            const double rel_k  = std::abs(k_i  - k_im)  / std::max(1.0, std::max(k_i,  k_im));
+            if (rel_mu > cfg_.osc_rel_mu_tol || rel_k > cfg_.osc_rel_kkt_tol)
+                return false;
+        }
+        return true; // persistent tiny changes ⇒ oscillation
     }
 };
