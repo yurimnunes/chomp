@@ -10,10 +10,6 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
-#ifdef EIGEN_CHOLMOD_SUPPORT
-#include <Eigen/CholmodSupport> // CHOLMOD (SuiteSparse) via Eigen
-#endif
-
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -33,9 +29,9 @@
 #endif
 
 #include "amd.h"
-#include "qdldl.h"
-
+#include "kkt_core_beta.h"
 #include "kkt_helper.h"
+#include "qdldl.h"
 
 namespace kkt {
 
@@ -44,7 +40,6 @@ using dvec = Eigen::VectorXd;
 using dmat = Eigen::MatrixXd;
 using spmat = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 // ------------------------------ HYKKT ---------------------------------
-
 
 class HYKKTStrategy final : public KKTStrategy {
 public:
@@ -93,17 +88,18 @@ public:
 
         for (int tries = 0; tries < 10; ++tries) {
             // Use HVP optimization if enabled and model available
-            auto [solver_fn, is_spd] = cfg.use_hvp && model ?
-                create_hvp_based_solver(W, G, delta1, gamma, cfg) :
-                create_or_refactor_solver_qdldl(build_augmented_system_inplace(W, G, delta1, gamma), cfg);
-                
+            auto [solver_fn, is_spd] = create_or_refactor_solver_qdldl(
+                build_augmented_system_inplace(W, G, delta1, gamma), cfg);
+
             if (solver_fn) {
                 Ks = std::move(solver_fn);
                 used_llt = is_spd;
 
-                // Keep the final matrix for preconditioner (only needed for non-HVP path)
+                // Keep the final matrix for preconditioner (only needed for
+                // non-HVP path)
                 if (!cfg.use_hvp || !model) {
-                    spmat K = build_augmented_system_inplace(W, G, delta1, gamma);
+                    spmat K =
+                        build_augmented_system_inplace(W, G, delta1, gamma);
                     K.makeCompressed();
                     K_final.swap(K);
                 }
@@ -130,13 +126,10 @@ public:
             (m <= std::max(1, int(cfg.schur_dense_cutoff * n)));
 
         if (small_m) {
-            dy = cfg.use_hvp && model ?
-                solve_schur_dense_hvp_optimized(G, Ks, rhs_s, gamma, cfg) :
-                solve_schur_dense_with_delta2(G, Ks, rhs_s, cfg);
+            dy = solve_schur_dense_with_delta2(G, Ks, rhs_s, cfg);
         } else {
-            dy = cfg.use_hvp && model ?
-                solve_schur_iterative_hvp_optimized(G, Ks, rhs_s, gamma, cfg, use_prec) :
-                solve_schur_iterative_with_delta2(G, Ks, rhs_s, K_final, cfg, use_prec);
+            dy = solve_schur_iterative_with_delta2(G, Ks, rhs_s, K_final, cfg,
+                                                   use_prec);
         }
 
         // ---------- Back-substitution ----------
@@ -176,17 +169,8 @@ private:
         bool have_F{false};
     };
 
-    // HVP-specific cache
-    struct HVPCache {
-        int n{-1};
-        double last_delta{-1.0};
-        std::function<dvec(const dvec &)> W_solver;
-        bool have_W_solver{false};
-    };
-
     mutable std::optional<QDLDLCache> qcache_;
     mutable std::optional<SymbolicCache> sym_; // persisted across calls
-    mutable std::optional<HVPCache> hvp_cache_; // HVP solver cache
 
     // ======================= heuristics (yours) ======================
     static double rowsum_inf_norm(const spmat &A) {
@@ -249,251 +233,56 @@ private:
         return K;
     }
 
-    // =============== HVP-Based Solver Creation ===============
-    std::pair<std::function<dvec(const dvec &)>, bool>
-    create_hvp_based_solver(const spmat &W, const spmat &G, double delta1, 
-                            double gamma, const ChompConfig &cfg) const {
-        if (!model) {
-            // Fallback to original method if no model available
-            return create_or_refactor_solver_qdldl(
-                build_augmented_system_inplace(W, G, delta1, gamma), cfg);
-        }
-        
-        const int n = W.rows();
-        
-        // Check if we need to rebuild W solver cache
-        if (!hvp_cache_ || hvp_cache_->n != n || 
-            std::abs(hvp_cache_->last_delta - delta1) > 1e-12 || !hvp_cache_->have_W_solver) {
-            
-            hvp_cache_.emplace();
-            hvp_cache_->n = n;
-            hvp_cache_->last_delta = delta1;
-            
-            // Factor the base system W + δI (much sparser than full K)
-            spmat W_delta = W;
-            W_delta.makeCompressed();
-            for (int i = 0; i < n; ++i) {
-                W_delta.coeffRef(i, i) += delta1;
+    struct Work {
+        dvec v, Kv, Gv, Gtv, z, p, rhs, tmpn;
+        void ensure(int n, int m) {
+            if (v.size() != n) {
+                v.resize(n);
+                Kv.resize(n);
+                z.resize(n);
+                p.resize(n);
+                tmpn.resize(n);
             }
-            W_delta.makeCompressed();
-            
-            // Use optimized QDLDL for W + δI
-            auto [W_solver, _] = create_or_refactor_solver_qdldl(W_delta, cfg);
-            if (!W_solver) {
-                // Fallback if W + δI factorization fails
-                return create_or_refactor_solver_qdldl(
-                    build_augmented_system_inplace(W, G, delta1, gamma), cfg);
+            if (Gv.size() != m) {
+                Gv.resize(m);
+                Gtv.resize(m);
             }
-            
-            hvp_cache_->W_solver = std::move(W_solver);
-            hvp_cache_->have_W_solver = true;
+            if (rhs.size() != n)
+                rhs.resize(n);
         }
-        
-        // Create matrix-free K^(-1) solver using cached W solver
-        auto Ks = [this, W = W, G = G, delta1, gamma, cfg](const dvec &b) -> dvec {
-            return solve_augmented_iterative(hvp_cache_->W_solver, W, G, b, delta1, gamma, cfg);
-        };
-        
-        return {Ks, false};
-    }
-// K = Wop + δ1 I + γ GᵀG
-dvec solve_augmented_iterative(
-    const std::function<dvec(const dvec &)> &W_solver, // ≈ (W+δ1 I)^{-1} preconditioner
-    const spmat &W_unused,                              // no longer used here
-    const spmat &G, const dvec &b,
-    double delta1, double gamma, const ChompConfig &cfg) const
-{
-    (void)W_unused; // avoid unused warning
-
-    // 1) Get compiled W operator (this applies full W: H + diag(Sx) + JIᵀ diag(Ss) JI (+ optional sigma))
-    auto Wop = model->getCompiledWOp();   // <-- ensure API name matches your ModelC
-
-    auto apply_K = [&](const dvec &v, dvec &Kv) {
-        Kv.resize(v.size());
-        // Kv = Wop * v
-        Wop.perform_op(v, Kv);
-        // + δ1 * v
-        Kv.noalias() += delta1 * v;
-        // + γ * Gᵀ(G v)
-        dvec Gv = G * v;
-        Kv.noalias() += gamma * (G.transpose() * Gv);
     };
+    mutable Work wk_;
 
-    // 2) PCG with M^{-1} ≈ (W+δ1 I)^{-1}
-    const double tol   = cfg.hvp_iterative_tol.value_or(1e-10);
-    const int    itmax = cfg.hvp_iterative_maxiter.value_or(std::max(20, std::min(80, (int)b.size()/8)));
+    // --------- New: stronger diagonal Schur preconditioner ----------
+    // Probe diag(K^{-1}) only on columns that actually appear in G
+    static dvec
+    schur_diagKinv_probe(const spmat &G,
+                         const std::function<dvec(const dvec &)> &Kinv, int n) {
+        std::vector<char> mark((size_t)n, 0);
+        for (int j = 0; j < G.outerSize(); ++j)
+            for (spmat::InnerIterator it(G, j); it; ++it)
+                mark[(size_t)it.col()] = 1;
 
-    dvec x = W_solver(b);                 // warm start
-    dvec Kx(b.size()); apply_K(x, Kx);
-    dvec r = b - Kx;
-
-    const double bnorm = std::max(1e-30, b.norm());
-    dvec z = W_solver(r);
-    dvec p = z;
-    double rz_old = r.dot(z);
-
-    for (int k = 0; k < itmax; ++k) {
-        if (r.norm() <= tol * bnorm) break;
-        dvec Kp(b.size()); apply_K(p, Kp);
-        double denom = std::max(1e-30, p.dot(Kp));
-        double alpha = rz_old / denom;
-
-        x.noalias() += alpha * p;
-        r.noalias() -= alpha * Kp;
-
-        dvec z_new = W_solver(r);
-        double rz_new = r.dot(z_new);
-        double beta   = rz_new / std::max(1e-30, rz_old);
-        p = z_new + beta * p;
-        z.swap(z_new);
-        rz_old = rz_new;
-    }
-    return x;
-}
-
-
-    // =============== Sherman-Morrison-Woodbury Direct Formula ===============
-    dvec solve_via_smw_formula(const std::function<dvec(const dvec &)> &W_solver,
-                              const spmat &G, const dvec &b, double gamma) const {
-        // For K = W + δI + γ*G^T*G, use SMW:
-        // K^(-1) = W^(-1) - γ * W^(-1) * G^T * (I + γ*G*W^(-1)*G^T)^(-1) * G * W^(-1)
-        
-        if (gamma < 1e-12) {
-            return W_solver(b);  // No regularization needed
+        dvec dinv = dvec::Zero(n);
+        // parallelize if you wish
+        for (int j = 0; j < n; ++j) {
+            if (!mark[(size_t)j])
+                continue;
+            dvec ej = dvec::Zero(n);
+            ej[j] = 1.0;
+            dvec Kj = Kinv(ej);
+            dinv[j] = std::max(Kj[j], 1e-16);
         }
-        
+        return dinv;
+    }
+    // diag(S) from diag(K^{-1}): S ≈ G·diag(K^{-1})·Gᵀ  (take diagonal only)
+    static dvec schur_diag_from_diagKinv(const spmat &G, const dvec &diagKinv) {
         const int m = G.rows();
-        const spmat Gt = G.transpose();
-        
-        // Step 1: w = W^(-1) * b
-        dvec w = W_solver(b);
-        
-        // Step 2: Solve W * Z = G^T (Z is n x m)
-        dmat Z(G.cols(), m);
-        dvec temp(G.cols());
-        
-        for (int j = 0; j < m; ++j) {
-            temp.setZero();
-            for (spmat::InnerIterator it(Gt, j); it; ++it) {
-                temp[it.row()] = it.value();
-            }
-            Z.col(j) = W_solver(temp);
-        }
-        
-        // Step 3: Form S = I + γ * G * Z  (m x m matrix)
-        dmat S = dmat::Identity(m, m) + gamma * (G * Z);
-        
-        // Step 4: Solve S * y = G * w
-        dvec Gw = G * w;
-        Eigen::LDLT<dmat> ldlt(S);
-        if (ldlt.info() != Eigen::Success) {
-            throw std::runtime_error("SMW: Failed to factor correction matrix");
-        }
-        dvec y = ldlt.solve(Gw);
-        
-        // Step 5: x = w - γ * Z * y
-        return w - gamma * (Z * y);
-    }
-
-    // =============== Optimized Dense Schur with HVP ===============
-    dvec solve_schur_dense_hvp_optimized(
-        const spmat &G, const std::function<dvec(const dvec &)> &Ks,
-        const dvec &rhs_s, double gamma, const ChompConfig &cfg) const {
-        
-        const int n = G.cols(), m = G.rows();
-        
-        // Build Schur complement matrix more efficiently
-        dmat Z(n, m);
-        dvec temp(n);
-        
-        // Solve K * Z = G^T by columns (using the matrix-free Ks)
-        const spmat Gt = G.transpose();
-        for (int j = 0; j < m; ++j) {
-            temp.setZero();
-            for (spmat::InnerIterator it(Gt, j); it; ++it) {
-                temp[it.row()] = it.value();
-            }
-            Z.col(j) = Ks(temp);
-        }
-        
-        // Form Schur complement S = G * Z
-        dmat S = (G * Z).selfadjointView<Eigen::Lower>();
-        
-        // Solve with δ₂ regularization if needed
-        double delta2 = 0.0;
-        for (int tries = 0; tries < 5; ++tries) {
-            if (delta2 > 0.0) {
-                S.diagonal().array() += delta2;
-            }
-            
-            Eigen::LLT<dmat> llt(S.selfadjointView<Eigen::Lower>());
-            if (llt.info() == Eigen::Success) {
-                return llt.solve(rhs_s);
-            }
-            
-            delta2 = (delta2 == 0.0) ? std::max(1e-12, cfg.schur_delta2_min)
-                                     : std::min(cfg.schur_delta2_max, 10.0 * delta2);
-        }
-        
-        throw std::runtime_error("HVP-optimized dense Schur failed with δ₂");
-    }
-
-    // =============== Optimized Iterative Schur with HVP ===============
-    dvec solve_schur_iterative_hvp_optimized(
-        const spmat &G, const std::function<dvec(const dvec &)> &Ks,
-        const dvec &rhs_s, double gamma, const ChompConfig &cfg, bool use_prec) const {
-        
-        const int m = G.rows();
-        
-        // Matrix-free Schur operator: S y = G * K^(-1) * G^T * y
-        LinOp S_op{m, [&](const dvec &y, dvec &out) {
-            dvec Gty = G.transpose() * y;
-            dvec temp = Ks(Gty);
-            out = G * temp;
-        }};
-        
-        std::optional<dvec> precond;
-        
-        if (use_prec && cfg.prec_type == "jacobi") {
-            // Improved preconditioner using diagonal approximation
-            dvec diag_approx(m);
-            for (int i = 0; i < m; ++i) {
-                dvec ei = dvec::Zero(G.cols());
-                for (spmat::InnerIterator it(G, i); it; ++it) {
-                    ei[it.col()] = it.value();
-                }
-                dvec Ki_ei = Ks(ei);
-                diag_approx[i] = ei.dot(Ki_ei);
-            }
-            
-            for (int i = 0; i < m; ++i) {
-                diag_approx[i] = 1.0 / std::max(diag_approx[i], 1e-12);
-            }
-            precond = std::move(diag_approx);
-        }
-        
-        // Solve with CG
-        auto [y, info] = cg(S_op, rhs_s, precond, cfg.cg_tol, cfg.cg_maxit,
-                           std::nullopt, std::nullopt, cfg.use_simd);
-        
-        if (info.converged) return y;
-        
-        // Fallback with δ₂ shift
-        double delta2 = std::max(1e-12, cfg.schur_delta2_min);
-        LinOp S_shifted{m, [&](const dvec &v, dvec &out) {
-            dvec Gtv = G.transpose() * v;
-            dvec temp = Ks(Gtv);
-            out = G * temp + delta2 * v;
-        }};
-        
-        std::tie(y, info) = cg(S_shifted, rhs_s, precond, cfg.cg_tol, cfg.cg_maxit2,
-                              std::nullopt, std::nullopt, cfg.use_simd);
-        
-        if (!info.converged) {
-            throw std::runtime_error("HVP-optimized iterative Schur failed");
-        }
-        
-        return y;
+        dvec diagS = dvec::Zero(m);
+        for (int j = 0; j < G.outerSize(); ++j)
+            for (spmat::InnerIterator it(G, j); it; ++it)
+                diagS[it.row()] += (it.value() * it.value()) * diagKinv[j];
+        return diagS;
     }
 
     // =============== Helper Functions ===============
@@ -501,7 +290,7 @@ dvec solve_augmented_iterative(
         // Use SMW for small constraint matrices or small gamma
         const int m = G.rows();
         const int n = G.cols();
-        
+
         // Heuristic: use SMW if constraint matrix is relatively small
         // or if gamma is small enough that γ*G^T*G is not dominant
         return (m < n / 4) || (gamma < 1e-3) || (G.nonZeros() < n);
@@ -596,23 +385,27 @@ dvec solve_augmented_iterative(
         // Convert to upper CSC for qdldl
         SparseD32 A = eigen_to_upper_csc(K);
 
-        // ---------- Ordering: your AMD (preferred), Eigen AMD, or identity ----------
+        // ---------- Ordering: your AMD (preferred), Eigen AMD, or identity
+        // ----------
         if (!qcache_->have_ord) {
             if (use_my_amd) {
                 qcache_->ord = qdldl_order_from_my_amd(
                     K,
                     /*symmetrize_union=*/true,
                     /*dense_cutoff=*/
-                    (cfg.amd_dense_cutoff_has_value ? cfg.amd_dense_cutoff : -1));
+                    (cfg.amd_dense_cutoff_has_value ? cfg.amd_dense_cutoff
+                                                    : -1));
             } else if (use_eigen_amd) {
                 Eigen::AMDOrdering<int> amd;
-                Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> P(n);
+                Eigen::PermutationMatrix<Eigen::Dynamic, Eigen::Dynamic, int> P(
+                    n);
                 P.setIdentity(n);
                 amd(K, P);
                 std::vector<int32_t> perm_old2new((size_t)n);
                 for (int i = 0; i < n; ++i)
                     perm_old2new[(size_t)P.indices()[i]] = i;
-                qcache_->ord = Ordering<int32_t>::from_perm(std::move(perm_old2new));
+                qcache_->ord =
+                    Ordering<int32_t>::from_perm(std::move(perm_old2new));
             } else {
                 qcache_->ord = Ordering<int32_t>::identity((int32_t)n);
             }
@@ -751,7 +544,7 @@ dvec solve_augmented_iterative(
     static spmat build_S_hat(const spmat &G, const dvec &d) {
         const int m = G.rows();
         const int n = G.cols();
-        
+
         // Create diagonal matrix from d
         spmat D(n, n);
         D.reserve(n);
@@ -759,7 +552,7 @@ dvec solve_augmented_iterative(
             D.insert(i, i) = d[i];
         }
         D.makeCompressed();
-        
+
         // Compute S_hat = G * D * G^T
         spmat Gt = G.transpose();
         return (G * D * Gt).pruned();
@@ -776,18 +569,18 @@ dvec solve_augmented_iterative(
             double gamma;
             ChompConfig cfg;
             ModelC *model_ptr;
-            
+
             Reuse(spmat Gin, std::function<dvec(const dvec &)> Ksin, double g,
                   ChompConfig c, ModelC *m)
                 : G(std::move(Gin)), Ks(std::move(Ksin)), gamma(g),
                   cfg(std::move(c)), model_ptr(m) {}
-                  
+
             std::pair<dvec, dvec> solve(const dvec &r1n,
                                         const std::optional<dvec> &r2n,
                                         double tol, int maxit) override {
                 if (!r2n)
                     throw std::invalid_argument("HYKKT::Reuse needs r2");
-                    
+
                 const dvec s = r1n + gamma * (G.transpose() * (*r2n));
                 const dvec rhs_s = G * Ks(s) - (*r2n);
 
@@ -799,9 +592,10 @@ dvec solve_augmented_iterative(
                            [&](const dvec &y, dvec &out) {
                                out = G * Ks(G.transpose() * y);
                            }};
-                           
-                auto [dy, info] = cg(S_op, rhs_s, std::nullopt, reuse_tol, reuse_maxit,
-                                     std::nullopt, std::nullopt, cfg.use_simd);
+
+                auto [dy, info] =
+                    cg(S_op, rhs_s, std::nullopt, reuse_tol, reuse_maxit,
+                       std::nullopt, std::nullopt, cfg.use_simd);
                 if (info.converged) {
                     const dvec dx = Ks(s - G.transpose() * dy);
                     return {dx, dy};
@@ -809,8 +603,9 @@ dvec solve_augmented_iterative(
 
                 // First fallback: try with even more relaxed tolerance
                 reuse_tol = std::max(reuse_tol * 10, 1e-6);
-                std::tie(dy, info) = cg(S_op, rhs_s, std::nullopt, reuse_tol, reuse_maxit * 2,
-                                       std::nullopt, std::nullopt, cfg.use_simd);
+                std::tie(dy, info) =
+                    cg(S_op, rhs_s, std::nullopt, reuse_tol, reuse_maxit * 2,
+                       std::nullopt, std::nullopt, cfg.use_simd);
                 if (info.converged) {
                     const dvec dx = Ks(s - G.transpose() * dy);
                     return {dx, dy};
@@ -834,16 +629,16 @@ dvec solve_augmented_iterative(
                     d2 *= 100.0; // Increase regularization more aggressively
                     reuse_tol *= 10.0; // Further relax tolerance
                 }
-                
+
                 // Final fallback: try direct dense solve if problem is small
                 const int m = G.rows();
-                if (m <= 500) {  // Only for reasonably small problems
+                if (m <= 500) { // Only for reasonably small problems
                     try {
                         // Build Schur complement explicitly
                         const spmat Gt = G.transpose();
                         dmat Z(G.cols(), m);
                         dvec temp(G.cols());
-                        
+
                         for (int j = 0; j < m; ++j) {
                             temp.setZero();
                             for (spmat::InnerIterator it(Gt, j); it; ++it) {
@@ -851,10 +646,11 @@ dvec solve_augmented_iterative(
                             }
                             Z.col(j) = Ks(temp);
                         }
-                        
+
                         dmat S = (G * Z).selfadjointView<Eigen::Lower>();
-                        S.diagonal().array() += std::max(d2, 1e-8); // Add regularization
-                        
+                        S.diagonal().array() +=
+                            std::max(d2, 1e-8); // Add regularization
+
                         Eigen::LDLT<dmat> ldlt(S);
                         if (ldlt.info() == Eigen::Success) {
                             dy = ldlt.solve(rhs_s);
@@ -866,245 +662,13 @@ dvec solve_augmented_iterative(
                     }
                 }
 
-                throw std::runtime_error("HYKKT::Reuse failed after all fallback attempts. "
-                                        "Try increasing tolerances or disabling HVP optimization.");
+                throw std::runtime_error(
+                    "HYKKT::Reuse failed after all fallback attempts. "
+                    "Try increasing tolerances or disabling HVP optimization.");
             }
         };
         return std::make_shared<Reuse>(G, Ks, gamma, cfg, model);
     }
-};
-
-// ----------------------- HYKKT via CHOLMOD (SuiteSparse) --------------
-class HYKKTCholmodStrategy final : public KKTStrategy {
-public:
-    HYKKTCholmodStrategy() { name = "hykkt_cholmod"; }
-
-    std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>>
-    factor_and_solve(ModelC* model_in, const spmat &W, const std::optional<spmat> &Gopt,
-                     const dvec &r1, const std::optional<dvec> &r2opt,
-                     const ChompConfig &cfg,
-                     std::optional<double> /*regularizer*/,
-                     std::unordered_map<std::string, dvec> &cache, double delta,
-                     std::optional<double> gamma_user,
-                     bool assemble_schur_if_m_small, bool use_prec) override {
-        std::cout << "Using HYKKTCholmodStrategy" << std::endl;
-#ifndef EIGEN_CHOLMOD_SUPPORT
-        (void)W;
-        (void)Gopt;
-        (void)r1;
-        (void)r2opt;
-        (void)cfg;
-        (void)cache;
-        (void)delta;
-        (void)gamma_user;
-        (void)assemble_schur_if_m_small;
-        (void)use_prec;
-        throw std::runtime_error(
-            "HYKKT CHOLMOD requested but Eigen was built without CHOLMOD "
-            "support. Rebuild with EIGEN_CHOLMOD_SUPPORT and link CHOLMOD.");
-#else
-        if (!Gopt || !r2opt)
-            throw std::invalid_argument(
-                "HYKKT (cholmod) requires equality constraints");
-
-        const auto &G = *Gopt;
-        const auto &r2 = *r2opt;
-        const int n = W.rows(), m = G.rows();
-
-        // gamma selection (mirrors HYKKTStrategy)
-        double gamma;
-        if (gamma_user) {
-            gamma = *gamma_user;
-        } else if (cfg.adaptive_gamma) {
-            const std::string cache_key =
-                "gamma_" + std::to_string(n) + "_" + std::to_string(m);
-            if (auto it = cache.find(cache_key); it != cache.end()) {
-                gamma = it->second[0];
-            } else {
-                gamma = compute_adaptive_gamma(W, G, delta);
-                cache[cache_key] = dvec::Constant(1, gamma);
-            }
-        } else {
-            gamma = compute_gamma_heuristic(W, G, delta);
-        }
-
-        // augmented SPD block
-        spmat K = build_augmented_system(W, G, delta, gamma);
-
-        // factor K with CHOLMOD (prefer supernodal LLT; fall back to LDLT)
-        auto solver_pair = create_solver_cholmod(K, cfg);
-        auto &solveK = solver_pair.first;
-
-        // Schur solve (dense or iterative as in HYKKTStrategy)
-        auto [dx, dy] =
-            solve_schur_system(G, K, r1, r2, gamma, solveK, cfg,
-                               assemble_schur_if_m_small, use_prec, n, m);
-
-        auto reusable = create_reusable_solver(G, solveK, gamma, cfg);
-        return std::make_tuple(dx, dy, reusable);
-#endif
-    }
-
-private:
-#ifdef EIGEN_CHOLMOD_SUPPORT
-    static double compute_gamma_heuristic(const spmat &W, const spmat &G,
-                                          double delta) {
-        const double W_norm = rowsum_inf_norm(W) + delta;
-        const double G_norm = rowsum_inf_norm(G);
-        return std::max(1.0, W_norm / std::max(1.0, G_norm * G_norm));
-    }
-    static double compute_adaptive_gamma(const spmat &W, const spmat &G,
-                                         double delta) {
-        const double W_norm = rowsum_inf_norm(W) + delta;
-        const double G_norm = rowsum_inf_norm(G);
-        const double cond_est = estimate_condition_number(W, delta);
-        double base_gamma =
-            std::max(1.0, W_norm / std::max(1.0, G_norm * G_norm));
-        if (cond_est > 1e12)
-            base_gamma *= 10.0;
-        else if (cond_est < 1e6)
-            base_gamma *= 0.1;
-        return base_gamma;
-    }
-    static spmat build_augmented_system(const spmat &W, const spmat &G,
-                                        double delta, double gamma) {
-        spmat K = W;
-        if (delta != 0.0) {
-            spmat I(W.rows(), W.rows());
-            I.setIdentity();
-            K = (K + delta * I).pruned();
-        }
-        if (gamma != 0.0) {
-            K = (K + gamma * (G.transpose() * G).pruned()).pruned();
-        }
-        K.makeCompressed();
-        return K;
-    }
-
-    std::pair<std::function<dvec(const dvec &)>, bool>
-    create_solver_cholmod(const spmat &K, const ChompConfig &cfg) const {
-        const int n = K.rows();
-
-        // Allow user to force identity ordering; otherwise let CHOLMOD choose
-        const bool force_identity = (cfg.sym_ordering == "none");
-        spmat Kp = K;
-        Kp.makeCompressed();
-        if (force_identity) {
-            // nothing to do; CHOLMOD will still analyze but with natural
-            // ordering
-        }
-
-        // Try supernodal LLT
-        auto llt = std::make_shared<Eigen::CholmodSupernodalLLT<spmat>>();
-        llt->compute(Kp);
-        if (llt->info() == Eigen::Success) {
-            auto solver = [llt](const dvec &b) -> dvec {
-                return llt->solve(b);
-            };
-            return {solver, true};
-        }
-
-        // Try simplicial LLT
-        auto llt2 = std::make_shared<Eigen::CholmodSimplicialLLT<spmat>>();
-        llt2->compute(Kp);
-        if (llt2->info() == Eigen::Success) {
-            auto solver = [llt2](const dvec &b) -> dvec {
-                return llt2->solve(b);
-            };
-            return {solver, true};
-        }
-
-        // Fall back to simplicial LDLT
-        auto ldlt = std::make_shared<Eigen::CholmodSimplicialLDLT<spmat>>();
-        ldlt->compute(Kp);
-        if (ldlt->info() != Eigen::Success)
-            throw std::runtime_error(
-                "HYKKT (cholmod): K factorization failed (LLT/LDLT)");
-
-        auto solver = [ldlt](const dvec &b) -> dvec { return ldlt->solve(b); };
-        return {solver, false};
-    }
-
-    std::pair<dvec, dvec>
-    solve_schur_system(const spmat &G, const spmat &K, const dvec &r1,
-                       const dvec &r2, double gamma,
-                       const std::function<dvec(const dvec &)> &solveK,
-                       const ChompConfig &cfg, bool assemble_schur_if_m_small,
-                       bool use_prec, int n, int m) const {
-
-        const dvec svec = r1 + gamma * (G.transpose() * r2);
-        const dvec rhs_s = G * solveK(svec) - r2;
-
-        dvec dy;
-        const bool small_m =
-            assemble_schur_if_m_small &&
-            (m <= std::max(1, int(cfg.schur_dense_cutoff * n)));
-
-        if (small_m) {
-            dmat Z(n, m);
-            for (int j = 0; j < m; ++j)
-                Z.col(j) = solveK(G.transpose().col(j));
-            const dmat S = G * Z;
-            dy = Eigen::LLT<dmat>(S).solve(rhs_s);
-        } else {
-            LinOp S_op{m, [&](const dvec &y, dvec &out) {
-                           out = G * solveK(G.transpose() * y);
-                       }};
-            std::optional<dvec> JacobiMinv;
-            std::optional<SSORPrecond> ssor;
-
-            if (use_prec) {
-                dvec diagKinv = K.diagonal().cwiseMax(1e-12).cwiseInverse();
-                if (cfg.prec_type == "jacobi") {
-                    JacobiMinv = schur_diag_hat(G, diagKinv).cwiseInverse();
-                } else if (cfg.prec_type == "ssor") {
-                    const spmat S_hat = build_S_hat(G, diagKinv);
-                    ssor.emplace(S_hat, cfg.ssor_omega);
-                }
-            }
-            auto cg_res = cg(S_op, rhs_s, JacobiMinv, cfg.cg_tol, cfg.cg_maxit,
-                             std::nullopt, ssor, cfg.use_simd);
-            dy = std::move(cg_res.first);
-        }
-
-        const dvec dx = solveK(svec - G.transpose() * dy);
-        return {dx, dy};
-    }
-
-    std::shared_ptr<KKTReusable>
-    create_reusable_solver(const spmat &G,
-                           const std::function<dvec(const dvec &)> &solveK,
-                           double gamma, const ChompConfig &cfg) const {
-        struct Reuse final : KKTReusable {
-            spmat G;
-            std::function<dvec(const dvec &)> Ks;
-            double gamma;
-            ChompConfig config;
-            Reuse(spmat G_, std::function<dvec(const dvec &)> Ks_, double g,
-                  ChompConfig cfg)
-                : G(std::move(G_)), Ks(std::move(Ks_)), gamma(g), config(cfg) {}
-            std::pair<dvec, dvec> solve(const dvec &r1n,
-                                        const std::optional<dvec> &r2n,
-                                        double tol, int maxit) override {
-                if (!r2n)
-                    throw std::invalid_argument(
-                        "HYKKT::Reuse (cholmod) needs r2");
-                const dvec svec_n = r1n + gamma * (G.transpose() * (*r2n));
-                const dvec rhs_s_n = G * Ks(svec_n) - (*r2n);
-                LinOp S_op{static_cast<int>(G.rows()),
-                           [&](const dvec &y, dvec &out) {
-                               out = G * Ks(G.transpose() * y);
-                           }};
-                auto cg_res2 = cg(S_op, rhs_s_n, std::nullopt, tol, maxit,
-                                  std::nullopt, std::nullopt, config.use_simd);
-                dvec dy_n = std::move(cg_res2.first);
-                const dvec dx_n = Ks(svec_n - G.transpose() * dy_n);
-                return {dx_n, dy_n};
-            }
-        };
-        return std::make_shared<Reuse>(G, solveK, gamma, cfg);
-    }
-#endif // EIGEN_CHOLMOD_SUPPORT
 };
 
 // ------------------------------ LDL (QDLDL) ---------------------------
@@ -1114,14 +678,13 @@ public:
 
     ModelC *model = nullptr; // To access model parameters if needed
 
-    std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>>
-    factor_and_solve(ModelC* model_in, const spmat &W, const std::optional<spmat> &Gopt,
-                     const dvec &r1, const std::optional<dvec> &r2opt,
-                     const ChompConfig &, std::optional<double> /*regularizer*/,
-                     std::unordered_map<std::string, dvec> & /*cache*/,
-                     double delta, std::optional<double> /*gamma*/,
-                     bool /*assemble_schur_if_m_small*/,
-                     bool /*use_prec*/) override {
+    std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>> factor_and_solve(
+        ModelC *model_in, const spmat &W, const std::optional<spmat> &Gopt,
+        const dvec &r1, const std::optional<dvec> &r2opt, const ChompConfig &,
+        std::optional<double> /*regularizer*/,
+        std::unordered_map<std::string, dvec> & /*cache*/, double delta,
+        std::optional<double> /*gamma*/, bool /*assemble_schur_if_m_small*/,
+        bool /*use_prec*/) override {
 
         bool hasE = false;
         spmat K = assemble_KKT(W, delta, Gopt, &hasE);
@@ -1220,10 +783,8 @@ public:
 
     std::call_once(init_flag, []() {
         registry.register_strategy(std::make_shared<HYKKTStrategy>());
-#ifdef EIGEN_CHOLMOD_SUPPORT
-        registry.register_strategy(std::make_shared<HYKKTCholmodStrategy>());
-#endif
         registry.register_strategy(std::make_shared<LDLStrategy>());
+        registry.register_strategy(std::make_shared<IPEnhancedHYKKTStrategy>());
     });
 
     return registry;

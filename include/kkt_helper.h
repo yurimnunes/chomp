@@ -9,9 +9,7 @@
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
 
-#ifdef EIGEN_CHOLMOD_SUPPORT
-#include <Eigen/CholmodSupport> // CHOLMOD (SuiteSparse) via Eigen
-#endif
+#include "qdldl.h"
 
 #include <algorithm>
 #include <cmath>

@@ -385,6 +385,54 @@ public:
     void algebraicSimplification();
 
 private:
+    // --- Add near the top of ADGraph class private state ---
+    struct HVPPrepared {
+        uint64_t val_epoch = 0;
+        uint64_t grad_epoch = 0;
+        int y_id = -1;
+        bool valid = false;
+    };
+    HVPPrepared hvp_prep_;
+
+    void hessianMultiVectorProductReuseScalar(const ADNodePtr &y,
+                                                   const double *V, size_t ldV,
+                                                   double *Y, size_t ldY,
+                                                   size_t k);
+    // --- Add this small helper in ADGraph (private) ---
+    void ensurePreparedForHVP_(const ADNodePtr &y) {
+        if (!y)
+            return;
+        // If scalar caches are not current for this y, redo scalar passes once
+        const bool need_scalar = !hvp_prep_.valid || hvp_prep_.y_id != y->id ||
+                                 hvp_prep_.val_epoch != cur_val_epoch_;
+
+        if (need_scalar) {
+            // Scalar forward to refresh primal caches
+            resetForwardPass();
+            computeForwardPass();
+
+            // Scalar reverse to seed w = ∂y/∂x
+            resetGradients();
+            set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_, 1.0);
+            initiateBackwardPassFused();
+
+            hvp_prep_.y_id = y->id;
+            hvp_prep_.val_epoch = cur_val_epoch_;
+            hvp_prep_.grad_epoch = cur_grad_epoch_;
+            hvp_prep_.valid = true;
+        } else {
+            // If only gradient epoch drifted (unlikely in this flow), reseed
+            // adjoints
+            if (hvp_prep_.grad_epoch != cur_grad_epoch_) {
+                resetGradients();
+                set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_,
+                                1.0);
+                initiateBackwardPassFused();
+                hvp_prep_.grad_epoch = cur_grad_epoch_;
+            }
+        }
+    }
+
     // Simplification helpers
     ADNodePtr createConstantNode(double value);
     ADNodePtr applyAlgebraicRule(const ADNodePtr &node);
@@ -398,7 +446,6 @@ private:
     // Simplification cache/flags
     mutable bool simplification_needed_ = false;
     size_t last_simplification_size_ = 0;
-
 
     // Quantize doubles for constant key stability (same helper you had)
     static inline double qfp(double x, double s = 1e12) {

@@ -1049,7 +1049,6 @@ public:
         trips.reserve(
             std::min<size_t>(n * 16, n * n)); // rough guess; grows if needed
 
-        
         for (size_t base = 0; base < n; base += L) {
             const size_t k = std::min(L, n - base);
 
@@ -1139,22 +1138,21 @@ public:
 class CompiledWOp {
 public:
     using Vec = Eigen::VectorXd;
-    using Sp  = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
+    using Sp = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 
-        CompiledWOp() = default;
+    CompiledWOp() = default;
 
-    // JI and Sigma_s are optional; if present, sizes must match: JI.rows() == Sigma_s.size()
-    explicit CompiledWOp(std::shared_ptr<LagHessFn> L,
-                         Eigen::VectorXd Sigma_x,                          // size n OR empty (size 0)
-                         std::optional<Sp> JI     = std::nullopt,          // mI x n
-                         std::optional<Eigen::VectorXd> Sigma_s = std::nullopt, // size mI
-                         double sigma_isotropic = 0.0)
-        : L_(std::move(L)),
-          sigma_(sigma_isotropic),
-          Sigma_x_(std::move(Sigma_x)),
-          JI_(std::move(JI)),
-          Sigma_s_(std::move(Sigma_s))
-    {
+    // JI and Sigma_s are optional; if present, sizes must match: JI.rows() ==
+    // Sigma_s.size()
+    explicit CompiledWOp(
+        std::shared_ptr<LagHessFn> L,
+        Eigen::VectorXd Sigma_x,             // size n OR empty (size 0)
+        std::optional<Sp> JI = std::nullopt, // mI x n
+        std::optional<Eigen::VectorXd> Sigma_s = std::nullopt, // size mI
+        double sigma_isotropic = 0.0)
+        : L_(std::move(L)), sigma_(sigma_isotropic),
+          Sigma_x_(std::move(Sigma_x)), JI_(std::move(JI)),
+          Sigma_s_(std::move(Sigma_s)) {
         L_->build_permutations_once_();
         const std::size_t n = L_->x_nodes.size();
 
@@ -1168,11 +1166,15 @@ public:
         // Validate & prep inequality part (optional)
         if (JI_.has_value() || Sigma_s_.has_value()) {
             if (!JI_.has_value() || !Sigma_s_.has_value())
-                throw std::invalid_argument("CompiledWOp: JI and Sigma_s must be provided together or both omitted.");
+                throw std::invalid_argument(
+                    "CompiledWOp: JI and Sigma_s must be provided together or "
+                    "both omitted.");
             if (static_cast<std::size_t>(JI_->cols()) != n)
-                throw std::invalid_argument("CompiledWOp: JI.cols() must equal n.");
+                throw std::invalid_argument(
+                    "CompiledWOp: JI.cols() must equal n.");
             if (JI_->rows() != Sigma_s_->size())
-                throw std::invalid_argument("CompiledWOp: JI.rows() must equal Sigma_s.size().");
+                throw std::invalid_argument(
+                    "CompiledWOp: JI.rows() must equal Sigma_s.size().");
 
             has_JI_ = true;
             t_.resize(JI_->rows());
@@ -1181,7 +1183,9 @@ public:
         }
     }
 
-    inline Eigen::Index rows() const { return static_cast<Eigen::Index>(L_->x_nodes.size()); }
+    inline Eigen::Index rows() const {
+        return static_cast<Eigen::Index>(L_->x_nodes.size());
+    }
     inline Eigen::Index cols() const { return rows(); }
 
     // ---- runtime tweaks (no realloc on hot path) ----
@@ -1189,24 +1193,35 @@ public:
     inline double sigma() const { return sigma_; }
 
     // Update Sigma_x (size must be n or 0 to disable)
-    inline void update_sigma_x(const Eigen::VectorXd& s) {
-        if (s.size() == 0) { has_Sx_ = false; Sigma_x_.resize(0); return; }
+    inline void update_sigma_x(const Eigen::VectorXd &s) {
+        if (s.size() == 0) {
+            has_Sx_ = false;
+            Sigma_x_.resize(0);
+            return;
+        }
         if (s.size() != rows())
-            throw std::invalid_argument("CompiledWOp::update_sigma_x: size mismatch.");
+            throw std::invalid_argument(
+                "CompiledWOp::update_sigma_x: size mismatch.");
         Sigma_x_ = s;
         has_Sx_ = true;
     }
 
     // Update / (enable|disable) JI and Sigma_s together
-    inline void update_JI_and_sigma_s(const std::optional<Sp>& JI,
-                                      const std::optional<Eigen::VectorXd>& Sigma_s) {
+    inline void
+    update_JI_and_sigma_s(const std::optional<Sp> &JI,
+                          const std::optional<Eigen::VectorXd> &Sigma_s) {
         if (JI.has_value() || Sigma_s.has_value()) {
             if (!JI.has_value() || !Sigma_s.has_value())
-                throw std::invalid_argument("CompiledWOp::update_JI_and_sigma_s: both JI and Sigma_s must be provided.");
+                throw std::invalid_argument(
+                    "CompiledWOp::update_JI_and_sigma_s: both JI and Sigma_s "
+                    "must be provided.");
             if (JI->cols() != rows())
-                throw std::invalid_argument("CompiledWOp::update_JI_and_sigma_s: JI.cols() must equal n.");
+                throw std::invalid_argument("CompiledWOp::update_JI_and_sigma_"
+                                            "s: JI.cols() must equal n.");
             if (JI->rows() != Sigma_s->size())
-                throw std::invalid_argument("CompiledWOp::update_JI_and_sigma_s: JI.rows() must equal Sigma_s.size().");
+                throw std::invalid_argument(
+                    "CompiledWOp::update_JI_and_sigma_s: JI.rows() must equal "
+                    "Sigma_s.size().");
 
             JI_ = JI;
             Sigma_s_ = Sigma_s;
@@ -1222,19 +1237,23 @@ public:
     }
 
     // If only Sigma_s changes (same shape), fast in-place update
-    inline void update_sigma_s_only(const Eigen::VectorXd& s) {
-        if (!has_JI_) throw std::logic_error("CompiledWOp::update_sigma_s_only: JI/Sigma_s not enabled.");
+    inline void update_sigma_s_only(const Eigen::VectorXd &s) {
+        if (!has_JI_)
+            throw std::logic_error(
+                "CompiledWOp::update_sigma_s_only: JI/Sigma_s not enabled.");
         if (s.size() != Sigma_s_->size())
-            throw std::invalid_argument("CompiledWOp::update_sigma_s_only: size mismatch.");
+            throw std::invalid_argument(
+                "CompiledWOp::update_sigma_s_only: size mismatch.");
         *Sigma_s_ = s;
     }
 
     template <typename DerivedIn, typename DerivedOut>
-    inline void perform_op(const Eigen::MatrixBase<DerivedIn>& x,
-                           Eigen::MatrixBase<DerivedOut>& y) const {
+    inline void perform_op(const Eigen::MatrixBase<DerivedIn> &x,
+                           Eigen::MatrixBase<DerivedOut> &y) const {
         const std::size_t n = static_cast<std::size_t>(x.size());
         if (rows() != static_cast<Eigen::Index>(n))
-            throw std::invalid_argument("CompiledWOp::perform_op: vector size mismatch.");
+            throw std::invalid_argument(
+                "CompiledWOp::perform_op: vector size mismatch.");
 
         // 1) x (x-order) -> Vcol_ (graph-order)
         for (std::size_t i = 0; i < n; ++i) {
@@ -1257,45 +1276,115 @@ public:
 
         // 4) y = Hx (+ sigma * x)
         Eigen::Map<Vec> ymap(y.derived().data(), y.size());
-        ymap = Eigen::Map<const Vec>(y_x_.data(), static_cast<Eigen::Index>(y_x_.size()));
-        if (sigma_ != 0.0) ymap.noalias() += sigma_ * x.derived();
+        ymap = Eigen::Map<const Vec>(y_x_.data(),
+                                     static_cast<Eigen::Index>(y_x_.size()));
+        if (sigma_ != 0.0)
+            ymap.noalias() += sigma_ * x.derived();
 
         // 5) + diag(Sigma_x) * x
         if (has_Sx_) {
-ymap.noalias() += Sigma_x_.cwiseProduct(x.derived());
+            ymap.noalias() += Sigma_x_.cwiseProduct(x.derived());
         }
 
         // 6) + JIᵀ [ diag(Sigma_s) (JI x) ]
         if (has_JI_) {
-            t_.noalias() = (*JI_) * x.derived();     // mI
-            t_.array()   *= Sigma_s_->array();       // diag(Sigma_s) (JI x)
+            t_.noalias() = (*JI_) * x.derived(); // mI
+            t_.array() *= Sigma_s_->array();     // diag(Sigma_s) (JI x)
             ymap.noalias() += JI_->transpose() * t_;
         }
     }
 
-    inline Vec operator*(const Vec& x) const {
+    inline Vec operator*(const Vec &x) const {
         Vec y(rows());
         perform_op(x, y);
         return y;
     }
 
+    // In CompiledWOp (public):
+    template <typename MatIn, typename MatOut>
+    inline void perform_op_multi(const MatIn &X, MatOut &Y) const {
+        const std::size_t n = static_cast<std::size_t>(X.rows());
+        const std::size_t k = static_cast<std::size_t>(X.cols());
+        if (rows() != static_cast<Eigen::Index>(n))
+            throw std::invalid_argument(
+                "CompiledWOp::perform_op_multi: size mismatch.");
+
+        // 1) x-order -> graph-order (k lanes)
+        //    Vcol_: contiguous [n x k], column-major by our choice of ldV = n
+        Vmulti_.resize(n * k);
+        Ymulti_.resize(n * k);
+
+        // If you can precompute permutation vectors as ints, this loop is fast.
+        for (std::size_t c = 0; c < k; ++c) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::size_t gi = static_cast<std::size_t>(L_->x2g_[i]);
+                Vmulti_[gi + c * n] = X(static_cast<Eigen::Index>(i),
+                                        static_cast<Eigen::Index>(c));
+            }
+        }
+
+        // 2) H * Vmulti_ (k lanes in one forward+reverse pass)
+        {
+            nb::gil_scoped_release nogil;
+            L_->g->hessianMultiVectorProduct(L_->L_root, Vmulti_.data(),
+                                             /*ldV=*/n, Ymulti_.data(),
+                                             /*ldY=*/n, k);
+        }
+
+        // 3) graph-order -> x-order, write into Y (x-order)
+        for (std::size_t c = 0; c < k; ++c) {
+            for (std::size_t gi = 0; gi < n; ++gi) {
+                const std::size_t xi = static_cast<std::size_t>(L_->g2x_[gi]);
+                Y(static_cast<Eigen::Index>(xi), static_cast<Eigen::Index>(c)) =
+                    Ymulti_[gi + c * n];
+            }
+        }
+
+        // 4) y += sigma * X
+        if (sigma_ != 0.0) {
+            Y.noalias() += sigma_ * X;
+        }
+
+        // 5) y += diag(Sigma_x) * X
+        if (has_Sx_) {
+            // Eigen broadcasts over columns; zero-alloc if Expr
+            Y.noalias() += Sigma_x_.asDiagonal() * X;
+        }
+
+        // 6) y += JIᵀ [ diag(Sigma_s) (JI X) ]
+        if (has_JI_) {
+            // Sparse-dense batched multiply: (mI x n) * (n x k)
+            tMulti_.resize(JI_->rows(), static_cast<Eigen::Index>(k)); // mI x k
+            tMulti_.noalias() = (*JI_) * X;
+            // scale rows by Sigma_s elementwise
+            tMulti_ = tMulti_.array().colwise() * Sigma_s_->array();
+            Y.noalias() += JI_->transpose() * tMulti_;
+        }
+    }
+
 private:
     std::shared_ptr<LagHessFn> L_;
-    double        sigma_ = 0.0;                 // optional isotropic shift fused into HVP
-    Eigen::VectorXd Sigma_x_;                   // owned, size n or 0
+    double sigma_ = 0.0;      // optional isotropic shift fused into HVP
+    Eigen::VectorXd Sigma_x_; // owned, size n or 0
 
     // Optional inequality block (owned)
-    std::optional<Sp>              JI_;
+    std::optional<Sp> JI_;
     std::optional<Eigen::VectorXd> Sigma_s_;
 
     bool has_Sx_ = false;
     bool has_JI_ = false;
 
+    // private:
+    mutable std::vector<double> Vmulti_, Ymulti_; // size n*k when used
+    mutable Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
+                          Eigen::ColMajor>
+        tMulti_;
+
     // Scratch (fixed allocations)
     mutable std::vector<double> Vcol_; // graph-order input
     mutable std::vector<double> Ycol_; // graph-order output
     mutable std::vector<double> y_x_;  // x-order output
-    mutable Eigen::VectorXd     t_;    // mI scratch for JI path
+    mutable Eigen::VectorXd t_;        // mI scratch for JI path
 };
 
 // ---------- Caches ----------

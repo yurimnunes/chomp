@@ -9,8 +9,6 @@
 #include <utility>
 #include <vector>
 
-namespace trcpp {
-
 struct FilterConfig {
     double filter_theta_min = 1e-4;
     double filter_gamma_theta = 0.1;
@@ -217,5 +215,3 @@ private:
     std::optional<double> initial_theta_;
     std::optional<double> initial_f_;
 };
-
-} // namespace trcpp

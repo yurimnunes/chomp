@@ -711,62 +711,122 @@ std::vector<double> ADGraph::getGradientVector(const ADNodePtr &expr) {
 
 // ------------------------- Multi-RHS HVP (lanes)
 // -----------------------------
+// void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
+//                                         size_t ldV, double *Y, size_t ldY,
+//                                         size_t k) {
+//     if (!y || k == 0)
+//         return;
+//     if (cache_.dirty)
+//         rebuildCache_();
+//     initializeNodeVariables();
+//     const size_t n = nodeVariables.size();
+//     if (n == 0)
+//         return;
+
+//     set_num_lanes(k);
+//     ensureLaneBuffers_();
+
+//     // 1) zero lanes and load V into variable rows
+//     std::fill(lanes_.dot.begin(), lanes_.dot.end(), 0.0);
+//     std::fill(lanes_.gdot.begin(), lanes_.gdot.end(), 0.0);
+//     for (const auto &kv : nodeVariables) {
+//         const auto &var = kv.second;
+//         if (!var)
+//             continue;
+//         const int ord = var->order;
+//         if (ord < 0)
+//             continue;
+//         const size_t vbase = lanes_.base(var->id);
+//         for (size_t l = 0; l < k; ++l)
+//             lanes_.dot[vbase + l] = V[size_t(ord) * ldV + l];
+//     }
+
+//     // 2) fused scalar forward + lane forward
+//     resetForwardPass();
+//     computeForwardPassAndDotLanesTogether();
+
+//     // 3) scalar reverse to get w = ∂y/∂x
+//     resetGradients();
+//     set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_, 1.0);
+//     initiateBackwardPassFused();
+
+//     // 4) lane reverse using w and per-lane dots
+//     resetGradDotAll();
+//     initiateBackwardPassFusedLanes();
+
+//     // 5) gather Y
+//     for (const auto &kv : nodeVariables) {
+//         const auto &var = kv.second;
+//         if (!var)
+//             continue;
+//         const int ord = var->order;
+//         if (ord < 0)
+//             continue;
+//         const size_t gbase = lanes_.base(var->id);
+//         for (size_t l = 0; l < k; ++l)
+//             Y[size_t(ord) * ldY + l] = lanes_.gdot[gbase + l];
+//     }
+// }
+
+// --- (Optional) refit your existing method to call the reuse path safely ---
 void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
                                         size_t ldV, double *Y, size_t ldY,
                                         size_t k) {
-    if (!y || k == 0)
-        return;
-    if (cache_.dirty)
-        rebuildCache_();
+    // Keep the original behavior for first call,
+    // then all subsequent calls can use the reuseScalar API.
+    hessianMultiVectorProductReuseScalar(y, V, ldV, Y, ldY, k);
+}
+
+
+// --- New public convenience that reuses scalar state across calls ---
+void ADGraph::hessianMultiVectorProductReuseScalar(const ADNodePtr &y,
+                                                   const double *V, size_t ldV,
+                                                   double *Y, size_t ldY,
+                                                   size_t k) {
+    if (!y || k == 0) return;
+    if (cache_.dirty) rebuildCache_();
     initializeNodeVariables();
     const size_t n = nodeVariables.size();
-    if (n == 0)
-        return;
+    if (n == 0) return;
 
+    // 0) Ensure scalar forward/reverse are current for (x, y)
+    ensurePreparedForHVP_(y);
+
+    // 1) lanes: size/zero + load V into variable rows
     set_num_lanes(k);
     ensureLaneBuffers_();
-
-    // 1) zero lanes and load V into variable rows
-    std::fill(lanes_.dot.begin(), lanes_.dot.end(), 0.0);
+    std::fill(lanes_.dot.begin(),  lanes_.dot.end(),  0.0);
     std::fill(lanes_.gdot.begin(), lanes_.gdot.end(), 0.0);
+
     for (const auto &kv : nodeVariables) {
         const auto &var = kv.second;
-        if (!var)
-            continue;
+        if (!var) continue;
         const int ord = var->order;
-        if (ord < 0)
-            continue;
+        if (ord < 0) continue;
         const size_t vbase = lanes_.base(var->id);
         for (size_t l = 0; l < k; ++l)
             lanes_.dot[vbase + l] = V[size_t(ord) * ldV + l];
     }
 
-    // 2) fused scalar forward + lane forward
-    resetForwardPass();
-    computeForwardPassAndDotLanesTogether();
+    // 2) dot-only forward using cached primal values (no scalar forward)
+    computeForwardPassWithDotLanes();
 
-    // 3) scalar reverse to get w = ∂y/∂x
-    resetGradients();
-    set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_, 1.0);
-    initiateBackwardPassFused();
-
-    // 4) lane reverse using w and per-lane dots
+    // 3) lane reverse (uses already-computed scalar adjoints)
     resetGradDotAll();
     initiateBackwardPassFusedLanes();
 
-    // 5) gather Y
+    // 4) gather Y
     for (const auto &kv : nodeVariables) {
         const auto &var = kv.second;
-        if (!var)
-            continue;
+        if (!var) continue;
         const int ord = var->order;
-        if (ord < 0)
-            continue;
+        if (ord < 0) continue;
         const size_t gbase = lanes_.base(var->id);
         for (size_t l = 0; l < k; ++l)
             Y[size_t(ord) * ldY + l] = lanes_.gdot[gbase + l];
     }
 }
+
 
 std::vector<double>
 ADGraph::hessianVectorProduct(const ADNodePtr &outputNode,

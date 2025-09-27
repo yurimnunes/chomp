@@ -138,4 +138,12 @@ struct SolverInfo {
     bool shifted_barrier{false}; // whether the barrier was shifted
     double tau_shift{0.0};       // amount of barrier shift
     double bound_shift{0.0};     // amount of bound shift
+
+    double penalty_rho{0.0};   // cubic penalty ρ parameter
+    double penalty_sigma{0.0}; // cubic penalty σ parameter
+    double step_quality_ratio{0.0}; // ratio of actual to predicted reduction in cubic penalty
+    bool was_clipped{false};       // whether the step was clipped by the trust region
+    int clip_streak{0};           // consecutive clipped steps
+    int good_streak{0};           // consecutive good steps
+    double theta_reduction{0.0};  // relative reduction in constraint violation
 };

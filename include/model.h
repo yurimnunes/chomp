@@ -459,6 +459,27 @@ public:
     std::shared_ptr<LagHessFn> f_hess_;
     std::vector<std::shared_ptr<GradFn>> cI_compiled_, cE_compiled_;
 
+    dvec Sigma_x;
+    dvec Sigma_s;
+    double mu;
+    double theta;
+    int it = 0;
+
+    void set_params(const std::optional<dvec> &Sigma_x_in,
+                    const std::optional<dvec> &Sigma_s_in,
+                    const double mu_in,
+                    const double theta_in, int it_in) {
+        Sigma_x = Sigma_x_in ? Sigma_x_in.value() : dvec();
+        Sigma_s = Sigma_s_in ? Sigma_s_in.value() : dvec();
+        mu = mu_in;
+        theta = theta_in;
+        it = it_in;
+    }
+
+    auto get_parms() {
+        return std::make_tuple(Sigma_x, Sigma_s, mu, theta, it);
+    }
+
     int get_mI() const { return mI_; }
     int get_mE() const { return mE_; }
     int get_n() const { return n_; }
@@ -542,7 +563,9 @@ public:
                 e->H = f_hess_->hess_sparse(x, lam, nu);
             return *e->H;
         }
-
+        std::cout
+            << "Warning: using L-BFGS Hessian approximation; ensure "
+               "lbfgs_update(...) is called per accepted step.\n";
         // LBFGS path: DO NOT update here; just materialize from current memory.
         // Any (s,y) updates should be driven externally via lbfgs_update(...)
         return lbfgs_.build_sparse_matrix(n_, lbfgs_.densify_threshold);

@@ -64,6 +64,12 @@ public:
         dopt = new dopt::DOptStabilizer(dopt_cfg);
     }
 
+    // --- termination bookkeeping ---
+    double prev_f_{std::numeric_limits<double>::quiet_NaN()};
+    double prev_theta_{std::numeric_limits<double>::quiet_NaN()};
+    double prev_kkt_{std::numeric_limits<double>::quiet_NaN()};
+    int stall_count_{0};
+
     std::shared_ptr<regx::Regularizer> regularizer_ =
         std::make_shared<regx::Regularizer>();
 
@@ -119,7 +125,7 @@ public:
             get_attr_or<bool>(cfg_, "qp_aplusb_le0", true);
         // If your TR expects A p ≤ b, set qp_aplusb_le0=false in cfg.
 
-        const double delta_now = tr_.get_delta();
+        double delta_now = tr_.get_delta();
         const double w_theta = std::min(1.0, k_theta * theta0);
         const double w_delta =
             std::min(1.0, k_delta * (delta_now / std::max(1e-16, delta_ref)));
@@ -155,7 +161,7 @@ public:
 
         // ---- 3) Lagrangian Hessian (exact or LBFGS) + regularization ----
         const std::string hmode = get_attr_or<std::string>(
-            cfg_, "hessian_mode", std::string("lbfgs"));
+            cfg_, "hessian_mode", std::string("exact"));
 
         spmat H0;
         if (hmode == "exact") {
@@ -223,33 +229,117 @@ public:
         const double theta1 = model_->constraint_violation(x_trial);
 
         // Bound multipliers (not returned by TR): zeros for KKT
-        dvec zL = dvec::Zero(x.size());
-        dvec zU = dvec::Zero(x.size());
+        const dvec &zL = out.zL;
+        const dvec &zU = out.zU;
+
+        auto [nu_hat, lam_hat, zL_hat, zU_hat] = recover_multipliers_at_trial_(
+            g1, JE1, JI1, cE1, cI1, x_trial, lb, ub,
+            /*act_eps=*/1e-10, /*reg=*/1e-12);
 
         // ---- 7) KKT residuals at trial (unshifted) ----
-        auto kkt = compute_kkt(g1, JE1, JI1, cE1, cI1, x_trial, nu_new, lam_usr,
-                               zL, zU, lb, ub);
+        auto kkt = compute_kkt(g1, JE1, JI1, cE1, cI1, x_trial,
+                               /*nu*/ (nu_hat.size() ? nu_hat : nu_new),
+                               /*lam*/ (lam_hat.size() ? lam_hat : lam_usr),
+                               /*zL*/ zL_hat, /*zU*/ zU_hat, lb, ub);
 
-        // ---- 8) Convergence test ----
-        const double cEn = (model_->get_cE() ? model_->get_cE()->norm() : 0.0);
-        const double cIn =
+
+        // ---- 8) Convergence and acceptance ----
+
+        // Use gradient AT TRIAL for scaling (more meaningful near solution)
+        const double cEn1 = (model_->get_cE() ? model_->get_cE()->norm() : 0.0);
+        const double cIn1 =
             (model_->get_cI()
                  ? model_->get_cI()->cwiseMax(0.0).lpNorm<Eigen::Infinity>()
                  : 0.0);
-        const double g_scale = std::max(1.0, g0.norm() + std::max(cEn, cIn));
+        const double g_scale = std::max(1.0, g1.norm() + std::max(cEn1, cIn1));
 
-        const bool converged =
-            ((kkt.stat / g_scale) <=
-                 get_attr_or<double>(cfg_, "tol_stat", 1e-6) &&
-             (kkt.ineq / g_scale) <=
-                 get_attr_or<double>(cfg_, "tol_feas", 1e-6) &&
-             (kkt.eq / g_scale) <=
-                 get_attr_or<double>(cfg_, "tol_feas", 1e-6) &&
-             ((kkt.comp / g_scale) <=
-                  get_attr_or<double>(cfg_, "tol_comp", 1e-6) ||
-              kkt.ineq <= 1e-10)) ||
-            (std::abs(f1 - f0) <
-             get_attr_or<double>(cfg_, "tol_obj_change", 1e-12));
+        // Your existing KKT (already at trial point) but normalized with
+        // g_scale
+        const double stat_n = kkt.stat / g_scale;
+        const double ineq_n = kkt.ineq / g_scale;
+        const double eq_n = kkt.eq / g_scale;
+        const double comp_n = kkt.comp / g_scale;
+
+        // Configured tolerances
+        const double tol_stat = get_attr_or<double>(cfg_, "tol_stat", 1e-6);
+        const double tol_feas = get_attr_or<double>(cfg_, "tol_feas", 1e-6);
+        const double tol_comp = get_attr_or<double>(cfg_, "tol_comp", 1e-6);
+        const double tol_obj_change =
+            get_attr_or<double>(cfg_, "tol_obj_change", 1e-10);
+
+        const double tol_step_abs =
+            get_attr_or<double>(cfg_, "tol_step_abs", 1e-12);
+        const double tol_step_rel =
+            get_attr_or<double>(cfg_, "tol_step_rel", 1e-9);
+        const double tol_theta_abs =
+            get_attr_or<double>(cfg_, "tol_theta_abs", 1e-10);
+        const double tol_kkt_abs =
+            get_attr_or<double>(cfg_, "tol_kkt_abs", 1e-8);
+        const bool tiny_delta_stop =
+            get_attr_or<bool>(cfg_, "tiny_delta_stop", true);
+        const int max_stall_iters =
+            get_attr_or<int>(cfg_, "max_stall_iters", 5);
+
+        // Candidate convergence by your normalized criteria OR tiny objective
+        // change
+        bool conv_norm = (stat_n <= tol_stat) && (ineq_n <= tol_feas) &&
+                         (eq_n <= tol_feas) &&
+                         ((comp_n <= tol_comp) || (kkt.ineq <= 1e-10));
+
+        bool conv_obj = std::abs(f1 - f0) <= tol_obj_change;
+
+        // Small-step criteria (absolute and relative to current x)
+        const double step_norm = tinfo.step_norm; // ||p||
+        const double xnorm = std::max(1.0, x.norm());
+        const bool small_step =
+            (step_norm <= tol_step_abs) || (step_norm <= tol_step_rel * xnorm);
+
+        // Tiny trust-region safeguard: if Δ is near its minimum and step is
+        // tiny, stop
+        const bool tiny_delta =
+            (tr_.get_delta() <=
+             std::max(1e-12, 10.0 * std::numeric_limits<double>::epsilon()));
+
+        // Absolute floors (helpful when scaling becomes ill-conditioned)
+        const bool abs_floors_ok =
+            (theta1 <= tol_theta_abs) && (kkt.stat <= tol_kkt_abs);
+
+        // Simple stagnation logic (no measurable progress in f, θ, or KKT)
+        const double kkt_norm =
+            std::max({kkt.stat, kkt.eq, kkt.ineq, kkt.comp});
+        auto almost_same = [](double a, double b) {
+            if (!std::isfinite(a) || !std::isfinite(b))
+                return false;
+            double m = std::max(1.0, std::max(std::abs(a), std::abs(b)));
+            return std::abs(a - b) <= 1e-12 * m;
+        };
+
+        if (std::isfinite(prev_f_) && std::isfinite(prev_theta_) &&
+            std::isfinite(prev_kkt_)) {
+            if (almost_same(f1, prev_f_) && almost_same(theta1, prev_theta_) &&
+                almost_same(kkt_norm, prev_kkt_))
+                ++stall_count_;
+            else
+                stall_count_ = 0;
+        }
+        prev_f_ = f1;
+        prev_theta_ = theta1;
+        prev_kkt_ = kkt_norm;
+
+        // Final convergence decision
+        bool converged = conv_norm || conv_obj;
+
+        // Augment with small-step / tiny-Δ / stagnation exits when already
+        // “good enough”
+        if (!converged) {
+            if ((small_step && abs_floors_ok) ||
+                (tiny_delta_stop && tiny_delta && small_step &&
+                 (conv_norm || abs_floors_ok)) ||
+                (stall_count_ >= max_stall_iters &&
+                 (conv_norm || abs_floors_ok))) {
+                converged = true;
+            }
+        }
 
         // ---- 9) LBFGS memory update *only if accepted* ----
         if (hmode == "lbfgs" && tinfo.accepted) {
@@ -257,9 +347,7 @@ public:
         }
 
         // ---- 10) Pack & return ----
-        const double step_norm = tinfo.step_norm;
-        const double rho =
-            std::numeric_limits<double>::quiet_NaN(); // not exposed by TR
+        const double rho = std::numeric_limits<double>::quiet_NaN();
         const bool accepted = tinfo.accepted;
 
         SolverInfo info =
@@ -320,13 +408,21 @@ private:
         ensure_default("tol_feas", 1e-6);
         ensure_default("tol_stat", 1e-6);
         ensure_default("tol_comp", 1e-6);
-        ensure_default("tol_obj_change", 1e-12);
         ensure_default("tr_delta0", 1.0);
         ensure_default("filter_theta_min", 1e-8);
         ensure_default("hessian_mode",
                        std::string("lbfgs")); // "exact" or "lbfgs"
         ensure_default("lbfgs_sparse_threshold", 1e-12);
         ensure_default("soc_violation_ratio", 0.9);
+        ensure_default("tol_obj_change",
+                       1e-10); // was 1e-12; make it less brittle
+        ensure_default("tol_step_abs", 1e-12);  // absolute step threshold
+        ensure_default("tol_step_rel", 1e-9);   // relative step threshold
+        ensure_default("tol_theta_abs", 1e-10); // absolute feasibility floor
+        ensure_default("tol_kkt_abs", 1e-8);    // absolute KKT floor
+        ensure_default("tiny_delta_stop",
+                       true); // stop when Δ is tiny & no progress
+        ensure_default("max_stall_iters", 5); // stall window
     }
 
     template <class T> void ensure_default(const char *name, const T &val) {
@@ -344,8 +440,10 @@ private:
         dvec r = g;
         if (JE && JE->size() > 0)
             r += JE->transpose() * nu;
+
         if (JI && JI->size() > 0 && lam_user.size() > 0)
             r += JI->transpose() * lam_user;
+
         if (zU.size() == r.size())
             r += zU; // +z_U
         if (zL.size() == r.size())
@@ -417,5 +515,126 @@ private:
         d.rho = rho;
         d.tr_radius = tr_delta;
         return d;
+    }
+
+    static std::tuple<dvec, dvec, dvec, dvec> recover_multipliers_at_trial_(
+        const dvec &g1, const std::optional<dmat> &JE1,
+        const std::optional<dmat> &JI1, const std::optional<dvec> &cE1,
+        const std::optional<dvec> &cI1, const dvec &x_trial,
+        const std::optional<dvec> &lb, const std::optional<dvec> &ub,
+        double act_eps = 1e-10, double reg = 1e-12) {
+        const int n = (int)g1.size();
+
+        // Build column blocks for [JE1ᵀ | JIactᵀ | I_L | -I_U]
+        dmat AeqT(n, 0);
+        if (JE1 && JE1->size())
+            AeqT = JE1->transpose();
+
+        // Near-active inequalities at the TRIAL point
+        dmat AiactT(n, 0);
+        std::vector<int> iact;
+        if (JI1 && JI1->size() && cI1 && cI1->size() == JI1->rows()) {
+            for (int i = 0; i < cI1->size(); ++i)
+                if ((*cI1)(i) >= -act_eps)
+                    iact.push_back(i);
+            if (!iact.empty()) {
+                AiactT.resize(n, (int)iact.size());
+                for (int k = 0; k < (int)iact.size(); ++k)
+                    AiactT.col(k) = JI1->row(iact[k]).transpose();
+            }
+        }
+
+        // Active bounds at trial
+        auto near = [&](double a, double b, double tol) {
+            return a <= b + tol;
+        };
+        std::vector<int> idxL, idxU;
+        if (lb && lb->size() == n) {
+            for (int i = 0; i < n; ++i)
+                if (near(x_trial[i], (*lb)[i], act_eps))
+                    idxL.push_back(i);
+        }
+        if (ub && ub->size() == n) {
+            for (int i = 0; i < n; ++i)
+                if (near((*ub)[i], x_trial[i], act_eps))
+                    idxU.push_back(i);
+        }
+        dmat IL(n, (int)idxL.size());
+        IL.setZero();
+        for (int j = 0; j < (int)idxL.size(); ++j)
+            IL(idxL[j], j) = 1.0;
+        dmat IU(n, (int)idxU.size());
+        IU.setZero();
+        for (int j = 0; j < (int)idxU.size(); ++j)
+            IU(idxU[j], j) = 1.0;
+
+        const int mcols =
+            AeqT.cols() + AiactT.cols() + (int)idxL.size() + (int)idxU.size();
+        if (mcols == 0) {
+            return {dvec(0), dvec(0), dvec::Zero(n), dvec::Zero(n)};
+        }
+
+        dmat AT(n, mcols);
+        int ofs = 0;
+        if (AeqT.cols()) {
+            AT.middleCols(ofs, AeqT.cols()) = AeqT;
+            ofs += AeqT.cols();
+        }
+        if (AiactT.cols()) {
+            AT.middleCols(ofs, AiactT.cols()) = AiactT;
+            ofs += AiactT.cols();
+        }
+        if (IL.cols()) {
+            AT.middleCols(ofs, IL.cols()) = IL;
+            ofs += IL.cols();
+        }
+        if (IU.cols()) {
+            AT.middleCols(ofs, IU.cols()) = -IU;
+            ofs += IU.cols();
+        }
+
+        // Solve (ATᵀ AT + reg I) y = -ATᵀ g1
+        dmat N = AT.transpose() * AT;
+        N.diagonal().array() += reg;
+        const dvec rhs = -AT.transpose() * g1;
+        dvec y = N.ldlt().solve(rhs); // fine for small systems
+
+        // Unpack and enforce nonnegativity of inequality/bound duals
+        ofs = 0;
+        dvec nu_hat(AeqT.cols() ? AeqT.cols() : 0);
+        if (AeqT.cols()) {
+            nu_hat = y.segment(ofs, AeqT.cols());
+            ofs += AeqT.cols();
+        }
+
+        dvec lam_hat;
+        if (AiactT.cols()) {
+            lam_hat = y.segment(ofs, AiactT.cols()).cwiseMax(0.0);
+            ofs += AiactT.cols();
+        } else
+            lam_hat = dvec(0);
+
+        dvec zL_hat = dvec::Zero(n), zU_hat = dvec::Zero(n);
+        if (IL.cols()) {
+            dvec yL = y.segment(ofs, IL.cols());
+            ofs += IL.cols();
+            for (int j = 0; j < IL.cols(); ++j)
+                zL_hat[idxL[j]] = std::max(0.0, -yL[j]);
+        }
+        if (IU.cols()) {
+            dvec yU = y.segment(ofs, IU.cols());
+            ofs += IU.cols();
+            for (int j = 0; j < IU.cols(); ++j)
+                zU_hat[idxU[j]] = std::max(0.0, -yU[j]);
+        }
+
+        // Expand λ back to full size if you want (optional)
+        if (JI1 && JI1->size()) {
+            dvec lam_full = dvec::Zero(JI1->rows());
+            for (int k = 0; k < (int)iact.size(); ++k)
+                lam_full[iact[k]] = lam_hat[k];
+            lam_hat = lam_full;
+        }
+        return {nu_hat, lam_hat, zL_hat, zU_hat};
     }
 };
