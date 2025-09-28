@@ -9,7 +9,7 @@
 #include <Eigen/SparseCholesky>
 #include <Eigen/SparseCore>
 #include <Eigen/SparseLU>
-
+#include <deque>
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -672,28 +672,104 @@ private:
 };
 
 // ------------------------------ LDL (QDLDL) ---------------------------
+// ------------------------------ LDL (QDLDL) ---------------------------
 class LDLStrategy final : public KKTStrategy {
 public:
     LDLStrategy() { name = "ldl"; }
 
-    ModelC *model = nullptr; // To access model parameters if needed
+    // Optional knobs (could be pulled from ChompConfig)
+    struct Options {
+        bool use_symbolic_cache = true;
+        bool use_ordering = false;          // set true if you have/compute a perm
+        int  refine_iters = 0;              // 0 = off, 1-2 usually enough
+    } opts;
+
+    // Lightweight cache keyed by sparsity pattern of U (Ap/Ai)
+    struct PatternKey {
+        std::size_t h1{0}, h2{0};
+        bool operator==(const PatternKey& o) const noexcept {
+            return h1 == o.h1 && h2 == o.h2;
+        }
+    };
+    struct PatternKeyHasher {
+        std::size_t operator()(const PatternKey& k) const noexcept {
+            // simple mix
+            return k.h1 ^ (k.h2 + 0x9e3779b97f4a7c15ULL + (k.h1<<6) + (k.h1>>2));
+        }
+    };
+
+    struct CachedSymb {
+        qdldl23::Symb32 S;                 // symbolic (on possibly permuted pattern)
+        std::optional<qdldl23::Ordering<int32_t>> ord;
+        int n{0};
+    };
+
+    // tiny LRU-ish (size <= 4) implemented as an unordered_map + clock
+    std::unordered_map<PatternKey, CachedSymb, PatternKeyHasher> symb_cache_;
+    std::deque<PatternKey> cache_order_; // maintain recency
+    static constexpr size_t kCacheCap = 4;
+
+    ModelC *model = nullptr;
+
+    static PatternKey make_key(const qdldl23::SparseD32& U) {
+        // Hash Ap and first/last few Ai to be cheap yet robust.
+        // For rock-solid uniqueness, hash the whole Ai; adjust as you like.
+        auto mix = [](std::size_t seed, uint64_t v){
+            v ^= v >> 33; v *= 0xff51afd7ed558ccdULL;
+            v ^= v >> 33; v *= 0xc4ceb9fe1a85ec53ULL;
+            v ^= v >> 33; return seed ^ v;
+        };
+        std::size_t hAp = 0;
+        for (int i = 0; i < static_cast<int>(U.Ap.size()); ++i)
+            hAp = mix(hAp, static_cast<uint64_t>(U.Ap[static_cast<size_t>(i)]) + 0x9e37U*i);
+
+        std::size_t hAi = 0;
+        const size_t nnz = U.Ai.size();
+        const int take = 64; // sample
+        for (int i = 0; i < std::min<int>(take, (int)nnz); ++i)
+            hAi = mix(hAi, static_cast<uint64_t>(U.Ai[static_cast<size_t>(i)]) + 0x85ebU*i);
+        for (int i = (int)nnz - 1, k = 0; i >= 0 && k < take; --i, ++k)
+            hAi = mix(hAi, static_cast<uint64_t>(U.Ai[static_cast<size_t>(i)]) + 0xc2b2U*k);
+        return {hAp, hAi};
+    }
+
+    void touch_key_(const PatternKey& k) {
+        // move to back; drop old if > cap
+        auto it = std::find(cache_order_.begin(), cache_order_.end(), k);
+        if (it != cache_order_.end()) cache_order_.erase(it);
+        cache_order_.push_back(k);
+        while (cache_order_.size() > kCacheCap) {
+            auto victim = cache_order_.front(); cache_order_.pop_front();
+            symb_cache_.erase(victim);
+        }
+    }
+
+    // Hook point: provide a symmetric ordering if you have one (AMD, RCM, etc.)
+    // Return std::nullopt for identity.
+    std::optional<qdldl23::Ordering<int32_t>>
+    maybe_build_ordering_(const qdldl23::SparseD32& /*U*/, bool enable) const {
+        if (!enable) return std::nullopt;
+        // Example placeholder: identity
+        // return qdldl23::Ordering<int32_t>::identity((int32_t)/*U.n*/ U.n);
+    }
 
     std::tuple<dvec, dvec, std::shared_ptr<KKTReusable>> factor_and_solve(
         ModelC *model_in, const spmat &W, const std::optional<spmat> &Gopt,
-        const dvec &r1, const std::optional<dvec> &r2opt, const ChompConfig &,
+        const dvec &r1, const std::optional<dvec> &r2opt, const ChompConfig &cfg,
         std::optional<double> /*regularizer*/,
         std::unordered_map<std::string, dvec> & /*cache*/, double delta,
         std::optional<double> /*gamma*/, bool /*assemble_schur_if_m_small*/,
-        bool /*use_prec*/) override {
-
+        bool /*use_prec*/) override
+    {
+        (void)cfg;
         bool hasE = false;
         spmat K = assemble_KKT(W, delta, Gopt, &hasE);
 
         const int n = W.rows();
         const int m = hasE ? Gopt->rows() : 0;
-        const int nsys = hasE ? (n + m) : n;
+        const int N = hasE ? (n + m) : n;
 
-        dvec rhs(nsys);
+        dvec rhs(N);
         if (hasE) {
             if (!r2opt)
                 throw std::runtime_error("LDLStrategy: missing r2");
@@ -703,11 +779,78 @@ public:
             rhs = r1;
         }
 
+        // Convert to strict upper CSC for qdldl23
+        // Prefer to enforce diagonal in K assembly; if not, keep small diag_eps.
         auto U = eigen_to_upper_csc(K, 1e-12);
-        auto F = qdldl23::factorize(U);
 
+        // ---- Symbolic (and optional ordering) reuse path ----
+        qdldl23::LDL32 F;
+        qdldl23::Symb32 S;
+        std::optional<qdldl23::Ordering<int32_t>> ord;
+
+        const PatternKey key = make_key(U);
+        bool used_cached_symbolic = false;
+
+        if (opts.use_symbolic_cache) {
+            auto it = symb_cache_.find(key);
+            if (it != symb_cache_.end()) {
+                // Found cached symbolic (already matches ordering choice)
+                const auto &C = it->second;
+                if (C.n == U.n) {
+                    S = C.S; ord = C.ord;
+                    used_cached_symbolic = true;
+                    touch_key_(key);
+                }
+            }
+        }
+
+        if (!used_cached_symbolic) {
+            // Decide ordering
+            ord = maybe_build_ordering_(U, opts.use_ordering);
+            if (ord) {
+                // Analyze permuted pattern once
+                auto Up = qdldl23::permute_symmetric_upper(U, *ord);
+                S = qdldl23::analyze_fast(Up);
+                // Numeric on permuted A
+                F = qdldl23::refactorize(Up, S);
+            } else {
+                // No ordering
+                S = qdldl23::analyze_fast(U);
+                F = qdldl23::refactorize(U, S);
+            }
+
+            if (opts.use_symbolic_cache) {
+                CachedSymb C; C.S = S; C.ord = ord; C.n = U.n;
+                symb_cache_[key] = C; touch_key_(key);
+            }
+        } else {
+            // Have S (and maybe ord). Just numeric refactorize on the same pattern.
+            if (ord) {
+                auto Up = qdldl23::permute_symmetric_upper(U, *ord);
+                F = qdldl23::refactorize(Up, S);
+            } else {
+                F = qdldl23::refactorize(U, S);
+            }
+        }
+
+        // Solve
         dvec x = rhs;
-        qdldl23::solve(F, x.data());
+        if (ord) {
+            qdldl23::solve_with_ordering(F, *ord, x.data());
+        } else {
+            qdldl23::solve(F, x.data());
+        }
+
+        // if (opts.refine_iters > 0) {
+        //     // Refinement expects the same matrix that was factorized
+        //     if (ord) {
+        //         // Build permuted U for residual (same as used in factorization)
+        //         auto Up = qdldl23::permute_symmetric_upper(U, *ord);
+        //         qdldl23::refine(Up, F, x.data(), rhs.data(), opts.refine_iters, &(*ord));
+        //     } else {
+        //         qdldl23::refine(U, F, x.data(), rhs.data(), opts.refine_iters, nullptr);
+        //     }
+        // }
 
         dvec dx, dy;
         if (hasE) {
@@ -718,20 +861,27 @@ public:
             dy.resize(0);
         }
 
+        // Reusable object: keep U, S, ord, and F for fast multi-RHS solves
         struct Reuse final : KKTReusable {
             qdldl23::SparseD32 U;
-            qdldl23::LDL32 F;
+            qdldl23::Symb32    S;
+            std::optional<qdldl23::Ordering<int32_t>> ord;
+            qdldl23::LDL32     F;
             int n, m;
+            int refine_iters{0};
 
-            Reuse(qdldl23::SparseD32 U_, qdldl23::LDL32 F_, int n_, int m_)
-                : U(std::move(U_)), F(std::move(F_)), n(n_), m(m_) {}
+            Reuse(qdldl23::SparseD32 U_, qdldl23::Symb32 S_,
+                  std::optional<qdldl23::Ordering<int32_t>> ord_,
+                  qdldl23::LDL32 F_, int n_, int m_, int refine_it)
+                : U(std::move(U_)), S(std::move(S_)), ord(std::move(ord_)),
+                  F(std::move(F_)), n(n_), m(m_), refine_iters(refine_it) {}
 
             std::pair<dvec, dvec> solve(const dvec &r1n,
                                         const std::optional<dvec> &r2n,
                                         double /*cg_tol*/,
                                         int /*cg_maxit*/) override {
-                const int nsys = n + m;
-                dvec rhs(nsys);
+                const int N = n + m;
+                dvec rhs(N);
 
                 if (m > 0) {
                     if (!r2n)
@@ -742,7 +892,19 @@ public:
                     rhs = r1n;
                 }
 
-                qdldl23::solve(F, rhs.data());
+                if (ord) {
+                    qdldl23::solve_with_ordering(F, *ord, rhs.data());
+                } else {
+                    qdldl23::solve(F, rhs.data());
+                }
+                // if (refine_iters > 0) {
+                //     if (ord) {
+                //         auto Up = qdldl23::permute_symmetric_upper(U, *ord);
+                //         qdldl23::refine(Up, F, rhs.data(), rhs.data(), refine_iters, &(*ord));
+                //     } else {
+                //         qdldl23::refine(U, F, rhs.data(), rhs.data(), refine_iters, nullptr);
+                //     }
+                // }
 
                 if (m > 0)
                     return {rhs.head(n), rhs.tail(m)};
@@ -750,10 +912,11 @@ public:
             }
         };
 
-        auto res = std::make_shared<Reuse>(std::move(U), std::move(F), n, m);
+        auto res = std::make_shared<Reuse>(qdldl23::SparseD32(U), S, ord, F, n, m, opts.refine_iters);
         return std::make_tuple(dx, dy, res);
     }
 };
+
 
 // ------------------------------ registry ------------------------------
 class KKTSolverRegistry {

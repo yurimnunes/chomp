@@ -45,173 +45,302 @@ namespace nb = nanobind;
 // ---------- Helpers ----------
 namespace detail {
 
-[[nodiscard]] inline Sigmas
+// Assumes: dvec = Eigen::VectorXd; Sigmas has members Sigma_x, Sigma_s as dvec.
+// Bounds fields are contiguous buffers: hasL/hasU as uint8_t (or char), sL/sU
+// as double.
+[[nodiscard]] EIGEN_STRONG_INLINE Sigmas
 build_sigmas(const dvec &zL, const dvec &zU, const Bounds &B, const dvec &lmb,
              const dvec &s, const dvec &cI, double tau_shift,
              double bound_shift, bool use_shifted, double eps_abs, double cap) {
+
     const int n = static_cast<int>(zL.size());
     const int mI = static_cast<int>(s.size());
+
     Sigmas S;
-
-    // Ultra-vectorized Sigma_x computation
     S.Sigma_x = dvec::Zero(n);
-
-    if (n > 0) {
-        const double shift = use_shifted ? bound_shift : 0.0;
-
-        // Convert bounds to Eigen arrays for vectorization
-        dvec hasL_float(n), hasU_float(n), sL_vec(n), sU_vec(n);
-
-        // Single loop to extract all bound data
-        for (int i = 0; i < n; ++i) {
-            hasL_float[i] = B.hasL[i] ? 1.0 : 0.0;
-            hasU_float[i] = B.hasU[i] ? 1.0 : 0.0;
-            sL_vec[i] = B.sL[i];
-            sU_vec[i] = B.sU[i];
-        }
-
-        // Fully vectorized computation
-        dvec dL = (sL_vec.array() + shift).max(eps_abs);
-        dvec dU = (sU_vec.array() + shift).max(eps_abs);
-
-        dvec zL_contrib = hasL_float.cwiseProduct(zL.cwiseQuotient(dL));
-        dvec zU_contrib = hasU_float.cwiseProduct(zU.cwiseQuotient(dU));
-
-        S.Sigma_x = (zL_contrib + zU_contrib).array().max(0.0).min(cap);
-    }
-
-    // Same vectorized Sigma_s as above
     S.Sigma_s = dvec::Zero(mI);
 
+    if (n > 0) {
+        using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+        using Arrb = Eigen::Array<unsigned char, Eigen::Dynamic, 1>;
+        using ArrXb = Eigen::Array<bool, Eigen::Dynamic, 1>;
+
+        const double shift = use_shifted ? bound_shift : 0.0;
+
+        // Map bounds (no copies)
+        const Eigen::Map<const Arrb> hasL_u8(
+            reinterpret_cast<const unsigned char *>(B.hasL.data()), n);
+        const Eigen::Map<const Arrb> hasU_u8(
+            reinterpret_cast<const unsigned char *>(B.hasU.data()), n);
+        const Eigen::Map<const Arrd> sL(B.sL.data(), n);
+        const Eigen::Map<const Arrd> sU(B.sU.data(), n);
+
+        // Boolean masks
+        const ArrXb mL = (hasL_u8 != 0);
+        const ArrXb mU = (hasU_u8 != 0);
+
+        // Denominators (floor at eps_abs)
+        const Arrd dL = (sL + shift).max(eps_abs);
+        const Arrd dU = (sU + shift).max(eps_abs);
+
+        // Contributions (masked)
+        const Arrd zL_a = zL.array();
+        const Arrd zU_a = zU.array();
+
+        const Arrd contribL = mL.select(zL_a / dL, 0.0);
+        const Arrd contribU = mU.select(zU_a / dU, 0.0);
+
+        const Arrd sigma_x = (contribL + contribU).max(0.0).min(cap);
+        S.Sigma_x = sigma_x.matrix();
+    }
+
     if (mI > 0) {
+        using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+
+        const Arrd lmb_a = lmb.array();
+        const Arrd s_a = s.array();
+
+        Arrd denom;
         if (use_shifted) {
-            dvec d = (s.array() + tau_shift).max(eps_abs);
-            S.Sigma_s = (lmb.cwiseQuotient(d)).array().max(0.0).min(cap);
+            denom = (s_a + tau_shift).max(eps_abs);
         } else {
-            dvec sf = cI.cwiseAbs().array().max(1e-8).min(1.0);
-            dvec sv = s.cwiseMax(sf).array().max(eps_abs);
-            S.Sigma_s = (lmb.cwiseQuotient(sv)).array().max(0.0).min(cap);
+            // sf in [1e-8, 1], denom = max(max(s, sf), eps_abs)
+            const Arrd sf = cI.array().abs().max(1e-8).min(1.0);
+            denom = s_a.max(sf).max(eps_abs);
         }
+
+        S.Sigma_s = (lmb_a / denom).max(0.0).min(cap).matrix();
     }
 
     return S;
 }
 
-[[nodiscard]] inline std::pair<dvec, dvec>
+[[nodiscard]] EIGEN_STRONG_INLINE std::pair<dvec, dvec>
 dz_bounds_from_dx_vec(const dvec &dx, const dvec &zL, const dvec &zU,
                       const Bounds &B, double bound_shift, bool use_shifted,
                       double mu, bool use_mu) {
-    const int n = dx.size();
+    const int n = static_cast<int>(dx.size());
     dvec dzL = dvec::Zero(n), dzU = dvec::Zero(n);
-    for (int i = 0; i < n; ++i) {
-        if (B.hasL[i]) {
-            const double d = clamp_min(
-                B.sL[i] + (use_shifted ? bound_shift : 0.0), consts::EPS_DIV);
-            dzL[i] = use_mu ? (mu - d * zL[i] - zL[i] * dx[i]) / d
-                            : -(zL[i] * dx[i]) / d;
-        }
-        if (B.hasU[i]) {
-            const double d = clamp_min(
-                B.sU[i] + (use_shifted ? bound_shift : 0.0), consts::EPS_DIV);
-            dzU[i] = use_mu ? (mu - d * zU[i] + zU[i] * dx[i]) / d
-                            : (zU[i] * dx[i]) / d;
-        }
+    if (n == 0)
+        return {dzL, dzU};
+
+    using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+    using Arrb = Eigen::Array<unsigned char, Eigen::Dynamic, 1>;
+    using ArrXb = Eigen::Array<bool, Eigen::Dynamic, 1>;
+
+    const Arrd dx_a = dx.array();
+    const Arrd zL_a = zL.array();
+    const Arrd zU_a = zU.array();
+    const Arrd sL_a = Eigen::Map<const Arrd>(B.sL.data(), n);
+    const Arrd sU_a = Eigen::Map<const Arrd>(B.sU.data(), n);
+    const ArrXb mL =
+        (Eigen::Map<const Arrb>(
+             reinterpret_cast<const unsigned char *>(B.hasL.data()), n) != 0);
+    const ArrXb mU =
+        (Eigen::Map<const Arrb>(
+             reinterpret_cast<const unsigned char *>(B.hasU.data()), n) != 0);
+
+    const double sh = use_shifted ? bound_shift : 0.0;
+    const Arrd dL = (sL_a + sh).max(consts::EPS_DIV);
+    const Arrd dU = (sU_a + sh).max(consts::EPS_DIV);
+
+    // Stable denominators with correct sign guards for bound step tests
+    const ArrXb neg_dx = (dx_a < 0.0);
+    const ArrXb pos_dx = (dx_a > 0.0);
+
+    if (use_mu) {
+        const Arrd exprL = (mu - dL * zL_a - zL_a * dx_a) / dL;
+        const Arrd exprU = (mu - dU * zU_a + zU_a * dx_a) / dU;
+        dzL.array() = mL.select(exprL, 0.0);
+        dzU.array() = mU.select(exprU, 0.0);
+    } else {
+        const Arrd exprL = -(zL_a * dx_a) / dL;
+        const Arrd exprU = (zU_a * dx_a) / dU;
+        dzL.array() = mL.select(exprL, 0.0);
+        dzU.array() = mU.select(exprU, 0.0);
     }
     return {dzL, dzU};
 }
 
-[[nodiscard]] inline double complementarity(const dvec &s, const dvec &lmb,
-                                            double mu, double tau_shift,
-                                            bool use_shifted) {
+[[nodiscard]] EIGEN_STRONG_INLINE double
+complementarity(const dvec &s, const dvec &lmb, double mu, double tau_shift,
+                bool use_shifted) {
     const int m = static_cast<int>(s.size());
     if (!m)
         return 0.0;
-    double acc = 0.0;
-    if (use_shifted) {
-        for (int i = 0; i < m; ++i)
-            acc += std::abs((s[i] + tau_shift) * lmb[i] - mu);
-    } else {
-        for (int i = 0; i < m; ++i)
-            acc += std::abs(s[i] * lmb[i] - mu);
-    }
-    return acc / clamp_min(m, 1);
+
+    using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+    const Arrd s_a = s.array();
+    const Arrd lam_a = lmb.array();
+    const Arrd se = use_shifted ? (s_a + tau_shift) : s_a;
+    // mean absolute complementarity residual
+    const double acc = (se * lam_a - mu).abs().sum();
+    return acc / static_cast<double>(std::max(m, 1));
 }
 
-[[nodiscard]] inline double alpha_ftb_vec(const dvec &x, const dvec &dx,
-                                          const dvec &s, const dvec &ds,
-                                          const dvec &lmb, const dvec &dlam,
-                                          const Bounds &B, double tau_pri,
-                                          double tau_dual) {
+[[nodiscard]] EIGEN_STRONG_INLINE double
+alpha_ftb_vec(const dvec &x, const dvec &dx, const dvec &s, const dvec &ds,
+              const dvec &lmb, const dvec &dlam, const Bounds &B,
+              double tau_pri, double tau_dual) {
 
-    double a_pri = 1.0, a_dual = 1.0;
+    using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+    using Arrb = Eigen::Array<unsigned char, Eigen::Dynamic, 1>;
+    using ArrXb = Eigen::Array<bool, Eigen::Dynamic, 1>;
 
-    for (int i = 0; i < s.size(); ++i)
-        if (ds[i] < 0.0)
-            a_pri = std::min(a_pri, -s[i] / std::min(ds[i], -consts::EPS_DIV));
-
-    for (int i = 0; i < lmb.size(); ++i)
-        if (dlam[i] < 0.0)
-            a_dual =
-                std::min(a_dual, -lmb[i] / std::min(dlam[i], -consts::EPS_DIV));
-
-    for (int i = 0; i < x.size(); ++i) {
-        if (B.hasL[i] && dx[i] < 0.0)
-            a_pri = std::min(a_pri, -(x[i] - B.lb[i]) /
-                                        std::min(dx[i], -consts::EPS_DIV));
-        if (B.hasU[i] && dx[i] > 0.0)
-            a_pri = std::min(a_pri, (B.ub[i] - x[i]) /
-                                        clamp_min(dx[i], consts::EPS_DIV));
+    // ---------- Inequality slacks (primal) ----------
+    double a_pri_slacks = 1.0;
+    if (s.size() > 0) {
+        const Arrd s_a = s.array();
+        const Arrd ds_a = ds.array();
+        // where ds<0, candidate = -s/ds (with safe denom), else 1.0
+        const Arrd cand = (ds_a < 0.0)
+                              .select(-(s_a) / ds_a.min(-consts::EPS_DIV),
+                                      Arrd::Constant(s.size(), 1.0));
+        a_pri_slacks = cand.minCoeff();
     }
-    return clamp(std::min(tau_pri * a_pri, tau_dual * a_dual), 0.0, 1.0);
+
+    // ---------- Dual (lambda) ----------
+    double a_dual = 1.0;
+    if (lmb.size() > 0) {
+        const Arrd lmb_a = lmb.array();
+        const Arrd dlam_a = dlam.array();
+        const Arrd cand = (dlam_a < 0.0)
+                              .select(-(lmb_a) / dlam_a.min(-consts::EPS_DIV),
+                                      Arrd::Constant(lmb.size(), 1.0));
+        a_dual = cand.minCoeff();
+    }
+
+    // ---------- Variable bound steps (x wrt lb/ub) ----------
+    const int n = static_cast<int>(x.size());
+    double a_pri_bounds = 1.0;
+    if (n > 0) {
+        const Arrd x_a = x.array();
+        const Arrd dx_a = dx.array();
+
+        const Arrd lb = Eigen::Map<const Arrd>(B.lb.data(), n);
+        const Arrd ub = Eigen::Map<const Arrd>(B.ub.data(), n);
+
+        const ArrXb hasL =
+            (Eigen::Map<const Arrb>(
+                 reinterpret_cast<const unsigned char *>(B.hasL.data()), n) !=
+             0);
+        const ArrXb hasU =
+            (Eigen::Map<const Arrb>(
+                 reinterpret_cast<const unsigned char *>(B.hasU.data()), n) !=
+             0);
+
+        const ArrXb mL = hasL && (dx_a < 0.0);
+        const ArrXb mU = hasU && (dx_a > 0.0);
+
+        const Arrd dx_neg = dx_a.min(-consts::EPS_DIV); // <= -eps
+        const Arrd dx_pos = dx_a.max(consts::EPS_DIV);  // >= +eps
+
+        const Arrd infv =
+            Arrd::Constant(n, std::numeric_limits<double>::infinity());
+        Arrd candL = mL.select(-(x_a - lb) / dx_neg, infv);
+        Arrd candU = mU.select((ub - x_a) / dx_pos, infv);
+
+        a_pri_bounds = std::min(candL.minCoeff(), candU.minCoeff());
+        if (!std::isfinite(a_pri_bounds))
+            a_pri_bounds = 1.0;
+    }
+
+    const double a_pri = std::min(a_pri_slacks, a_pri_bounds);
+    const double alpha = std::min(tau_pri * a_pri, tau_dual * a_dual);
+    return clamp(alpha, 0.0, 1.0);
 }
 
-[[nodiscard]] inline double comp_inf_norm(const dvec &s, const dvec &lam,
-                                          const dvec &zL, const dvec &zU,
-                                          const Bounds &B, double mu,
-                                          bool use_shifted, double tau_shift,
-                                          double bound_shift) {
+[[nodiscard]] EIGEN_STRONG_INLINE double
+comp_inf_norm(const dvec &s, const dvec &lam, const dvec &zL, const dvec &zU,
+              const Bounds &B, double mu, bool use_shifted, double tau_shift,
+              double bound_shift) {
+
+    using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+    using Arrb = Eigen::Array<unsigned char, Eigen::Dynamic, 1>;
+    using ArrXb = Eigen::Array<bool, Eigen::Dynamic, 1>;
 
     const int n = static_cast<int>(zL.size());
-    double c_inf = 0.0;
 
-    for (int i = 0; i < n; ++i) {
-        if (B.hasL[i]) {
-            const double sL = B.sL[i] + (use_shifted ? bound_shift : 0.0);
-            c_inf = std::max(c_inf, std::abs(sL * zL[i] - mu));
-        }
-        if (B.hasU[i]) {
-            const double sU = B.sU[i] + (use_shifted ? bound_shift : 0.0);
-            c_inf = std::max(c_inf, std::abs(sU * zU[i] - mu));
-        }
+    double cmax_bounds = 0.0;
+    if (n > 0) {
+        const Arrd zL_a = zL.array();
+        const Arrd zU_a = zU.array();
+        const Arrd sL_a = Eigen::Map<const Arrd>(B.sL.data(), n);
+        const Arrd sU_a = Eigen::Map<const Arrd>(B.sU.data(), n);
+        const ArrXb mL =
+            (Eigen::Map<const Arrb>(
+                 reinterpret_cast<const unsigned char *>(B.hasL.data()), n) !=
+             0);
+        const ArrXb mU =
+            (Eigen::Map<const Arrb>(
+                 reinterpret_cast<const unsigned char *>(B.hasU.data()), n) !=
+             0);
+
+        const double sh = use_shifted ? bound_shift : 0.0;
+        const Arrd sLc = (sL_a + sh).max(consts::EPS_DIV);
+        const Arrd sUc = (sU_a + sh).max(consts::EPS_DIV);
+
+        const Arrd rL = mL.select((sLc * zL_a - mu).abs(), 0.0);
+        const Arrd rU = mU.select((sUc * zU_a - mu).abs(), 0.0);
+        cmax_bounds = std::max(rL.maxCoeff(), rU.maxCoeff());
     }
-    if (s.size()) {
-        for (int i = 0; i < s.size(); ++i) {
-            const double se = s[i] + (use_shifted ? tau_shift : 0.0);
-            c_inf = std::max(c_inf, std::abs(se * lam[i] - mu));
+
+    double cmax_ieq = 0.0;
+    if (s.size() > 0) {
+        using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+        const Arrd s_a = s.array();
+        const Arrd lam_a = lam.array();
+        Arrd se;
+        if (use_shifted) {
+            se = s_a + tau_shift;
+        } else {
+            se = s_a;
         }
+        se = se.max(consts::EPS_DIV);
+
+        cmax_ieq = (se * lam_a - mu).abs().maxCoeff();
     }
-    return c_inf;
+
+    return std::max(cmax_bounds, cmax_ieq);
 }
 
-inline void cap_bound_duals_sigma_box(dvec &zL, dvec &zU, const Bounds &B,
-                                      bool use_shifted, double bound_shift,
-                                      double mu, double ksig = 1e10) {
-    for (int i = 0; i < zL.size(); ++i) {
-        if (B.hasL[i]) {
-            const double sLc = clamp_min(
-                B.sL[i] + (use_shifted ? bound_shift : 0.0), consts::EPS_DIV);
-            const double lo = mu / (ksig * sLc);
-            const double hi = (ksig * mu) / sLc;
-            zL[i] = clamp(zL[i], lo, hi);
-        }
-        if (B.hasU[i]) {
-            const double sUc = clamp_min(
-                B.sU[i] + (use_shifted ? bound_shift : 0.0), consts::EPS_DIV);
-            const double lo = mu / (ksig * sUc);
-            const double hi = (ksig * mu) / sUc;
-            zU[i] = clamp(zU[i], lo, hi);
-        }
-    }
+EIGEN_STRONG_INLINE void
+cap_bound_duals_sigma_box(dvec &zL, dvec &zU, const Bounds &B, bool use_shifted,
+                          double bound_shift, double mu, double ksig = 1e10) {
+    using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+    using Arrb = Eigen::Array<unsigned char, Eigen::Dynamic, 1>;
+    using ArrXb = Eigen::Array<bool, Eigen::Dynamic, 1>;
+
+    const int n = static_cast<int>(zL.size());
+    if (n == 0)
+        return;
+
+    Arrd zL_a = zL.array();
+    Arrd zU_a = zU.array();
+
+    const Arrd sL_a = Eigen::Map<const Arrd>(B.sL.data(), n);
+    const Arrd sU_a = Eigen::Map<const Arrd>(B.sU.data(), n);
+    const ArrXb mL =
+        (Eigen::Map<const Arrb>(
+             reinterpret_cast<const unsigned char *>(B.hasL.data()), n) != 0);
+    const ArrXb mU =
+        (Eigen::Map<const Arrb>(
+             reinterpret_cast<const unsigned char *>(B.hasU.data()), n) != 0);
+
+    const double sh = use_shifted ? bound_shift : 0.0;
+    const Arrd sLc = (sL_a + sh).max(consts::EPS_DIV);
+    const Arrd sUc = (sU_a + sh).max(consts::EPS_DIV);
+
+    const Arrd loL = mu / (ksig * sLc);
+    const Arrd hiL = (ksig * mu) / sLc;
+    const Arrd loU = mu / (ksig * sUc);
+    const Arrd hiU = (ksig * mu) / sUc;
+
+    zL_a = mL.select(zL_a.max(loL).min(hiL), zL_a);
+    zU_a = mU.select(zU_a.max(loU).min(hiU), zU_a);
+
+    zL = zL_a.matrix();
+    zU = zU_a.matrix();
 }
 
 } // namespace detail
@@ -219,27 +348,42 @@ inline void cap_bound_duals_sigma_box(dvec &zL, dvec &zU, const Bounds &B,
 // ---------- Main Interior Point Stepper ----------
 class InteriorPointStepper {
 public:
-    Bounds get_bounds(const dvec &x) {
+    [[nodiscard]] EIGEN_STRONG_INLINE Bounds get_bounds(const dvec &x) {
         const int n = static_cast<int>(x.size());
         Bounds B;
 
-        // lb / ub
+        // Fill lb/ub (use ±INF when missing)
         B.lb = m_->get_lb().value_or(dvec::Constant(n, -consts::INF));
         B.ub = m_->get_ub().value_or(dvec::Constant(n, consts::INF));
 
-        B.hasL.assign(n, 0);
-        B.hasU.assign(n, 0);
+        // Allocate outputs
+        B.hasL.resize(n);
+        B.hasU.resize(n);
         B.sL.resize(n);
         B.sU.resize(n);
 
-        for (int i = 0; i < n; ++i) {
-            const bool hL = std::isfinite(B.lb[i]);
-            const bool hU = std::isfinite(B.ub[i]);
-            B.hasL[i] = static_cast<uint8_t>(hL);
-            B.hasU[i] = static_cast<uint8_t>(hU);
-            B.sL[i] = hL ? clamp_min(x[i] - B.lb[i], consts::EPS_POS) : 1.0;
-            B.sU[i] = hU ? clamp_min(B.ub[i] - x[i], consts::EPS_POS) : 1.0;
-        }
+        using Arrd = Eigen::Array<double, Eigen::Dynamic, 1>;
+        using Arr8 = Eigen::Array<uint8_t, Eigen::Dynamic, 1>;
+        using ArrXb = Eigen::Array<bool, Eigen::Dynamic, 1>;
+
+        const Arrd xA = x.array();
+        const Arrd lbA = B.lb.array();
+        const Arrd ubA = B.ub.array();
+
+        // Finite-bound masks
+        const ArrXb mL = lbA.isFinite();
+        const ArrXb mU = ubA.isFinite();
+
+        // Write hasL/hasU as uint8_t without looping
+        Eigen::Map<Arr8>(B.hasL.data(), n) = mL.cast<uint8_t>();
+        Eigen::Map<Arr8>(B.hasU.data(), n) = mU.cast<uint8_t>();
+
+        // Slacks: if bound exists -> clamp_min(dist, EPS_POS); else -> 1.0
+        Eigen::Map<Arrd>(B.sL.data(), n) =
+            mL.select((xA - lbA).max(consts::EPS_POS), Arrd::Constant(n, 1.0));
+        Eigen::Map<Arrd>(B.sU.data(), n) =
+            mU.select((ubA - xA).max(consts::EPS_POS), Arrd::Constant(n, 1.0));
+
         return B;
     }
 
@@ -540,12 +684,9 @@ public:
 
             if (mI > 0 && E.cI.size() && E.JI.nonZeros()) {
                 dvec JI_dx = E.JI * dx;
-                for (int i = 0; i < E.cI.size(); ++i) {
-                    const double ci_new = E.cI[i] + JI_dx[i];
-                    if (ci_new > 0) { // Only positive violations contribute
-                        theta_pred_linear += ci_new - std::max(0.0, E.cI[i]);
-                    }
-                }
+                theta_pred_linear +=
+                    (E.cI.array() + JI_dx.array()).max(0.0).sum() -
+                    E.cI.array().max(0.0).sum();
             }
 
             // Predicted new constraint violation
@@ -676,8 +817,10 @@ public:
             }
         }
 
-        m_->set_params(Sg.Sigma_x, (mI > 0) ? std::optional<dvec>(Sg.Sigma_s)
-                                                  : std::nullopt, mu, E.theta, it);
+        m_->set_params(Sg.Sigma_x,
+                       (mI > 0) ? std::optional<dvec>(Sg.Sigma_s)
+                                : std::nullopt,
+                       mu, E.theta, it);
         // -------------------- Solve for step --------------------
         auto [alpha_aff, mu_aff, sigma_pred, step] = mg_solver_->solve(
             W, r_d, JE_eff, r_pE,
@@ -1106,6 +1249,7 @@ private:
         const bool can_reuse = kkt_factorization_valid_ && cached_kkt_solver_ &&
                                matrices_equal(W, cached_kkt_matrix_);
         if (can_reuse) {
+            std::cout << "[IP] Reusing KKT factorization.\n";
             auto [dx, dy] = cached_kkt_solver_->solve(rhs_x, r2, 1e-8, 200);
             return {std::move(dx), std::move(dy), cached_kkt_solver_};
         }

@@ -274,6 +274,7 @@ static inline nb::object unary_dispatch(nb::object x, Operator op) {
 }
 
 // ---------- pow helpers ----------
+// ---- integer check (kept) ---------------------------------------------------
 [[gnu::always_inline]]
 static inline bool _is_effectively_int(double p, double &pr_out) noexcept {
     const double pr = std::round(p);
@@ -285,116 +286,99 @@ static inline bool _is_effectively_int(double p, double &pr_out) noexcept {
     return false;
 }
 
+// ---- tiny node helpers ------------------------------------------------------
 [[gnu::always_inline]]
-static inline ADNodePtr mul_node(const ADGraphPtr &g, const ADNodePtr &a,
-                                 const ADNodePtr &b) {
-    auto m = std::make_shared<ADNode>();
-    m->type = Operator::Multiply;
-    m->addInput(a);
-    m->addInput(b);
-    g->addNode(m);
-    return m;
+static inline ADNodePtr make_bin_node(const ADGraphPtr& g,
+                                      Operator op,
+                                      const ADNodePtr& a,
+                                      const ADNodePtr& b) {
+    auto n = std::make_shared<ADNode>();
+    n->type = op;
+    n->addInput(a);
+    n->addInput(b);
+    g->addNode(n);
+    return n;
 }
 
+[[gnu::always_inline]]
+static inline ADNodePtr make_pow_node(const ADGraphPtr& g,
+                                      const ADNodePtr& base,
+                                      const ADNodePtr& exponent) {
+    return make_bin_node(g, Operator::Pow, base, exponent);
+}
+
+// ---- integer power with exponentiation-by-squaring --------------------------
 [[gnu::hot]]
-static inline ADNodePtr pow_pos_node(const ADGraphPtr &g, const ADNodePtr &base,
-                                     long long e) {
-    if (e == 1)
-        return base;
-    if (e == 2)
-        return mul_node(g, base, base);
-    ADNodePtr result = base, cur = base;
-    e >>= 1;
+static inline ADNodePtr powi_node(const ADGraphPtr &g,
+                                  const ADNodePtr &base,
+                                  long long e) {
+    if (e == 0) return make_const_node(g, 1.0);
+    if (e < 0) {
+        if (base->type == Operator::cte && base->value == 0.0)
+            throw std::domain_error("x**p: base == 0 and integer p < 0 is undefined.");
+        // powi(base, -e) then 1 / that
+        auto den = powi_node(g, base, -e);
+        auto num = make_const_node(g, 1.0);
+        return make_bin_node(g, Operator::Divide, num, den);
+    }
+
+    // e > 0
+    // small fast paths
+    if (e == 1) return base;
+    if (e == 2) return make_bin_node(g, Operator::Multiply, base, base);
+
+    // exponentiation by squaring
+    ADNodePtr result = make_const_node(g, 1.0);
+    ADNodePtr cur = base;
     while (e > 0) {
-        cur = mul_node(g, cur, cur);
-        if (e & 1)
-            result = mul_node(g, result, cur);
+        if (e & 1) result = make_bin_node(g, Operator::Multiply, result, cur);
         e >>= 1;
+        if (e)     cur = make_bin_node(g, Operator::Multiply, cur, cur);
     }
     return result;
 }
 
-[[gnu::hot]]
-static inline ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
-                                  long long e) {
-    if (e == 0)
-        return make_const_node(g, 1.0);
-    if (e > 0)
-        return pow_pos_node(g, base, e);
-    if (base->type == Operator::cte && base->value == 0.0)
-        throw std::domain_error(
-            "x**p: base == 0 and integer p < 0 is undefined.");
-    auto den = pow_pos_node(g, base, -e);
-    auto num = make_const_node(g, 1.0);
-    auto div = std::make_shared<ADNode>();
-    div->type = Operator::Divide;
-    div->addInput(num);
-    div->addInput(den);
-    g->addNode(div);
-    return div;
-}
-
+// ---- builders ---------------------------------------------------------------
 [[gnu::hot]]
 static inline std::shared_ptr<Expression> expr_pow_any(nb::object x, double p) {
     ADGraphPtr g;
     std::shared_ptr<Expression> ex;
     if (nb::isinstance<Expression>(x)) {
         ex = nb::cast<std::shared_ptr<Expression>>(x);
-        g = ex->graph ? ex->graph : std::make_shared<ADGraph>();
+        g  = ex->graph ? ex->graph : std::make_shared<ADGraph>();
     } else {
-        g = std::make_shared<ADGraph>();
+        g  = std::make_shared<ADGraph>();
         ex = as_expression(x, g);
     }
-    if (ex->node)
-        g->adoptSubgraph(ex->node);
+    if (ex->node) g->adoptSubgraph(ex->node);
 
     double pr = 0.0;
     if (_is_effectively_int(p, pr)) {
         auto out = std::make_shared<Expression>(g);
-        out->node = powi_node(g, ex->node, (long long)pr);
+        out->node = powi_node(g, ex->node, static_cast<long long>(pr));
         return out;
     }
 
-    if (ex->node && ex->node->type == Operator::cte && ex->node->value <= 0.0)
-        throw std::domain_error("x**p with non-integer p requires base > 0.");
-
-    auto e_log = std::make_shared<Expression>(g);
-    e_log->node->type = Operator::Log;
-    e_log->node->addInput(ex->node);
-    g->addNode(e_log->node);
-
-    auto e_mul = std::make_shared<Expression>(g);
-    e_mul->node->type = Operator::Multiply;
-    e_mul->node->addInput(e_log->node);
-    e_mul->node->addInput(make_const_node(g, p));
-    g->addNode(e_mul->node);
-
-    auto e_exp = std::make_shared<Expression>(g);
-    e_exp->node->type = Operator::Exp;
-    e_exp->node->addInput(e_mul->node);
-    g->addNode(e_exp->node);
-    return e_exp;
+    // non-integer → use single Pow node (handled by OpTraits<Operator::Pow>)
+    auto out = std::make_shared<Expression>(g);
+    out->node = make_pow_node(g, ex->node, make_const_node(g, p));
+    return out;
 }
 
 [[gnu::always_inline]]
 static inline std::shared_ptr<Expression>
 scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
-    if (s <= 0.0)
+    if (s <= 0.0) // keep your public contract
         throw std::domain_error("scalar ** Expression requires base > 0");
+
     ADGraphPtr g = x->graph ? x->graph : std::make_shared<ADGraph>();
-    if (x->node)
-        g->adoptSubgraph(x->node);
-    auto e_mul = std::make_shared<Expression>(g);
-    e_mul->node->type = Operator::Multiply;
-    e_mul->node->addInput(x->node);
-    e_mul->node->addInput(make_const_node(g, std::log(s)));
-    g->addNode(e_mul->node);
-    auto e_exp = std::make_shared<Expression>(g);
-    e_exp->node->type = Operator::Exp;
-    e_exp->node->addInput(e_mul->node);
-    g->addNode(e_exp->node);
-    return e_exp;
+    if (x->node) g->adoptSubgraph(x->node);
+
+    auto out = std::make_shared<Expression>(g);
+    out->node = make_pow_node(g, make_const_node(g, s), x->node);
+    return out;
 }
+
 
 // ---------- max ----------
 [[gnu::hot]]
@@ -448,7 +432,6 @@ static inline Compiled compile_to_graph(nb::object f, size_t arity,
         throw std::invalid_argument("compile: function returned None");
     auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
     out.g->adoptSubgraph(expr->node);
-    // out.g->simplifyExpression();
     out.root = expr->node;
     return out;
 }
@@ -643,6 +626,7 @@ public:
         var_nodes = std::move(C.vars);
         seed.assign(arity, 0.0);
         g->initializeNodeVariables();
+        g->simplifyGraph();
     }
 
     void set_inputs_seq(const nb::object &x) {

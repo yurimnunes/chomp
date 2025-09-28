@@ -65,7 +65,8 @@ public:
 
     // Deep-copy ctor (optional)
     Expression(const Expression &other)
-        : graph(std::make_shared<ADGraph>(*other.graph)), node(other.node),
+        : std::enable_shared_from_this<Expression>(other),
+          graph(std::make_shared<ADGraph>(*other.graph)), node(other.node),
           rootNode(other.rootNode), expVariables(other.expVariables) {}
 
     // -------- calculus APIs --------

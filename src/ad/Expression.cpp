@@ -1,12 +1,14 @@
 // Expression.cpp — faster drop-in (API compatible, no Operator::Neg required)
 #include "../../include/ad/Expression.h"
 #include "../../include/ad/ADGraph.h"
-#include "../../include/ad/Operators.h"   // make_const_node(g, double), enum Operator
+#include "../../include/ad/Operators.h"   // enum Operator
 #include "../../include/ad/Variable.h"
 
 #include <bit>
 #include <cmath>
+#include <cstdint>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 
 // ============================================================================
@@ -15,6 +17,10 @@
 
 namespace {
 
+using ADNodePtr  = std::shared_ptr<ADNode>;
+using ADGraphPtr = std::shared_ptr<ADGraph>;
+using ExpressionPtr = std::shared_ptr<Expression>;
+
 [[gnu::always_inline]] inline bool is_pos1(double v) noexcept {
     return std::bit_cast<std::uint64_t>(v) == std::bit_cast<std::uint64_t>(1.0);
 }
@@ -22,8 +28,9 @@ namespace {
     return std::bit_cast<std::uint64_t>(v) == std::bit_cast<std::uint64_t>(-1.0);
 }
 [[gnu::always_inline]] inline bool is_pos0(double v) noexcept {
-    return (std::bit_cast<std::uint64_t>(v) & ~std::uint64_t(1ULL << 63)) ==
-           std::bit_cast<std::uint64_t>(0.0);
+    // Treat +0 and -0 as zero
+    return (std::bit_cast<std::uint64_t>(v) & ~std::uint64_t(1ULL << 63))
+           == std::bit_cast<std::uint64_t>(0.0);
 }
 
 // Prefer reusing an existing graph; otherwise create a fresh one.
@@ -43,9 +50,9 @@ namespace {
     }
 }
 
-// No cross-graph caching (safe): make constants on the correct graph.
+// Minimal constant-node helper using make_cte from the operators file.
 [[gnu::always_inline]] inline ADNodePtr make_const_node_fast(const ADGraphPtr& g, double v) {
-    return make_const_node(g, v);
+    return make_cte(g, v);
 }
 
 // Node constructors with reserved inputs to avoid reallocs.
@@ -144,9 +151,9 @@ ExpressionPtr Expression::operator-(double s) const {
 ExpressionPtr Expression::operator*(double s) const {
     auto g = graph ? graph : std::make_shared<ADGraph>();
     adopt_if_needed(g, graph, node);
-    if (is_pos1(s)) [[unlikely]] return alias_expr(g, node);          // x*1 → x
+    if (is_pos1(s)) [[unlikely]] return alias_expr(g, node);                     // x*1 → x
     if (is_pos0(s)) [[unlikely]] return alias_expr(g, make_const_node_fast(g, 0.0)); // x*0 → 0
-    if (is_neg1(s)) [[unlikely]] return negate_expr(g, node);         // x*(-1) → -x
+    if (is_neg1(s)) [[unlikely]] return negate_expr(g, node);                    // x*(-1) → -x
     return alias_expr(g, make_node_2in<Operator::Multiply>(g, node, make_const_node_fast(g, s)));
 }
 
@@ -258,11 +265,12 @@ ExpressionPtr pow(const Expression& x, double p) {
     auto g = x.graph ? x.graph : std::make_shared<ADGraph>();
     adopt_if_needed(g, x.graph, x.node);
 
-    if (is_pos1(p))  [[unlikely]] return alias_expr(g, x.node);       // x^1 → x
+    if (is_pos1(p))  [[unlikely]] return alias_expr(g, x.node);                // x^1 → x
     if (is_pos0(p))  [[unlikely]] return alias_expr(g, make_const_node_fast(g, 1.0)); // x^0 → 1
-    if (p == 2.0)    [[unlikely]] return square(x);                   // x^2
-    if (p == -1.0)   [[unlikely]] return reciprocal(x);               // x^-1
+    if (p == 2.0)    [[unlikely]] return square(x);                            // x^2
+    if (p == -1.0)   [[unlikely]] return reciprocal(x);                        // x^-1
 
+    // Generic: x^p = exp(p * log(x))
     auto ln  = make_node_1in<Operator::Log>(g, x.node);
     auto scl = make_node_2in<Operator::Multiply>(g, ln, make_const_node_fast(g, p));
     auto ex  = make_node_1in<Operator::Exp>(g, scl);

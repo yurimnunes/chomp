@@ -16,6 +16,7 @@
 #include <optional>
 #include <vector>
 #include <numeric>
+
 class RichardsonExtrapolator {
 private:
     struct StepHistory { dvec dx; double h; double err; int it; };

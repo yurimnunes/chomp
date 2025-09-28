@@ -175,16 +175,11 @@ public:
         cE_prev_inf_ = 0.0;
         shift_stall_count_ = 0;
     }
-
-    // τ shift for inequality slacks (s)
     double compute_slack_shift(const dvec &s, const dvec &cI, const dvec &lam,
                                int it) {
         if (!s.size())
             return 0.0;
-
-        // Basic sanity (debug)
-        assert(s.size() == cI.size());
-        assert(lam.size() == cI.size());
+        assert(s.size() == cI.size() && lam.size() == cI.size());
 
         const double base = get_attr_or<double>(cfg_, "ip_shift_tau", 1e-3);
         const double beta = get_attr_or<double>(cfg_, "ip_shift_beta", 0.25);
@@ -199,61 +194,53 @@ public:
         const double mu_target =
             get_attr_or<double>(cfg_, "ip_mu_target", 1e-4);
 
-        // Near-active sets
-        std::vector<double> s_act;
-        s_act.reserve(s.size());
-        std::vector<double> lam_act;
-        lam_act.reserve(lam.size());
-
+        // Single pass to compute active set stats
         int near_active_ct = 0;
-        for (int i = 0; i < cI.size(); ++i) {
+        double s_sum = 0.0, lam_sum = 0.0;
+        int sample_count = 0;
+        constexpr int max_samples = 1000; // Limit samples for large vectors
+        const int step = std::max(1, static_cast<int>(s.size()) / max_samples);
+
+        for (int i = 0; i < cI.size(); i += step) {
             if (cI[i] >= -active_tol) {
-                s_act.push_back(std::max(s[i], 1e-12));
-                lam_act.push_back(std::max(std::abs(lam[i]), 1e-12));
+                s_sum += std::max(s[i], 1e-12);
+                lam_sum += std::max(std::abs(lam[i]), 1e-12);
                 ++near_active_ct;
+                ++sample_count;
             }
         }
 
-        const double frac_active = (cI.size() > 0)
-                                       ? (static_cast<double>(near_active_ct) /
-                                          static_cast<double>(cI.size()))
-                                       : 0.0;
-
+        const double frac_active =
+            (cI.size() > 0) ? static_cast<double>(near_active_ct) / cI.size()
+                            : 0.0;
         const double s_p10 =
-            s_act.empty() ? percentile_(s, 0.10)
-                          : percentile_(Eigen::Map<const dvec>(
-                                            s_act.data(), (int)s_act.size()),
-                                        0.10);
-
-        const double lam_med =
-            lam_act.empty()
-                ? percentile_(lam.cwiseAbs(), 0.50)
-                : percentile_(Eigen::Map<const dvec>(lam_act.data(),
-                                                     (int)lam_act.size()),
-                              0.50);
+            sample_count > 0
+                ? s_sum / sample_count
+                : percentile_(s, 0.10); // Fallback to full percentile if needed
+        const double lam_med = sample_count > 0
+                                   ? lam_sum / sample_count
+                                   : percentile_(lam.cwiseAbs(), 0.50);
 
         // Complementarity-driven target τ
         const double tau_from_comp =
             (lam_med > 0.0) ? std::max(0.0, mu_target / lam_med - s_p10) : 0.0;
 
-        // Stall-aware boost (simple heuristic)
+        // Stall-aware boost
         const bool stallish = (s_p10 < 1e-6) && (frac_active > 0.25);
         if (stallish)
             ++shift_stall_count_;
         const double stall_boost =
             stallish ? (k_stall * (1.0 + 0.05 * it)) : 0.0;
 
-        // Compose raw τ and smooth
+        // Compose and smooth τ
         double tau_raw = base + k_mu * std::sqrt(std::max(mu_target, 0.0)) +
                          k_active * frac_active * std::max(0.0, tau_from_comp) +
                          stall_boost;
-
         if (!tau_ema_init_) {
             tau_ema_ = tau_raw;
             tau_ema_init_ = true;
         }
         tau_ema_ = (1.0 - beta) * tau_ema_ + beta * tau_raw;
-
         const double tau_max =
             get_attr_or<double>(cfg_, "ip_shift_tau_max", 1.0);
         const double tau_min =
@@ -261,9 +248,7 @@ public:
         return clamp(tau_ema_, tau_min, tau_max);
     }
 
-    // κ (bound) shift for variable bounds (box)
     double compute_bound_shift(const dvec &x, const Bounds &B, int it) {
-        // If no finite bounds, no shift
         bool any = false;
         for (int i = 0; i < x.size(); ++i) {
             if (B.hasL[i] || B.hasU[i]) {
@@ -276,42 +261,8 @@ public:
 
         const double base = get_attr_or<double>(cfg_, "ip_shift_bounds", 0.0);
         const double beta = get_attr_or<double>(cfg_, "ip_shift_beta", 0.25);
-
-        // Gather bound gaps and near-actives
-        std::vector<double> gaps;
-        gaps.reserve(2 * x.size());
-        int near_active_ct = 0;
         const double near_tol =
             get_attr_or<double>(cfg_, "ip_bound_near_tol", 1e-6);
-
-        for (int i = 0; i < x.size(); ++i) {
-            if (B.hasL[i]) {
-                const double gL = std::max(x[i] - B.lb[i], 0.0);
-                gaps.push_back(gL);
-                if (gL < near_tol)
-                    ++near_active_ct;
-            }
-            if (B.hasU[i]) {
-                const double gU = std::max(B.ub[i] - x[i], 0.0);
-                gaps.push_back(gU);
-                if (gU < near_tol)
-                    ++near_active_ct;
-            }
-        }
-
-        const double frac_near = gaps.empty()
-                                     ? 0.0
-                                     : (static_cast<double>(near_active_ct) /
-                                        static_cast<double>(gaps.size()));
-
-        const dvec gaps_vec =
-            gaps.empty()
-                ? dvec()
-                : Eigen::Map<const dvec>(gaps.data(), (int)gaps.size());
-
-        const double g_p10 = gaps.empty() ? 1.0 : percentile_(gaps_vec, 0.10);
-
-        // μ-scaled nudging
         const double mu_target =
             get_attr_or<double>(cfg_, "ip_mu_target", 1e-4);
         const double k_mu =
@@ -321,10 +272,39 @@ public:
         const double k_gap =
             get_attr_or<double>(cfg_, "ip_shift_bounds_k_gap", 0.50);
 
+        // Single pass for gaps and near-active counts
+        double gap_sum = 0.0;
+        int gap_count = 0, near_active_ct = 0;
+        constexpr int max_samples = 1000;
+        const int step = std::max(1, static_cast<int>(x.size()) / max_samples);
+
+        for (int i = 0; i < x.size(); i += step) {
+            if (B.hasL[i]) {
+                const double gL = std::max(x[i] - B.lb[i], 0.0);
+                gap_sum += gL;
+                ++gap_count;
+                if (gL < near_tol)
+                    ++near_active_ct;
+            }
+            if (B.hasU[i]) {
+                const double gU = std::max(B.ub[i] - x[i], 0.0);
+                gap_sum += gU;
+                ++gap_count;
+                if (gU < near_tol)
+                    ++near_active_ct;
+            }
+        }
+
+        const double frac_near =
+            gap_count > 0 ? static_cast<double>(near_active_ct) / gap_count
+                          : 0.0;
+        const double g_p10 =
+            gap_count > 0 ? gap_sum / gap_count : 1.0; // Approximate percentile
+
+        // μ-scaled nudging
         const double raise =
             k_mu * std::sqrt(std::max(mu_target, 0.0)) + k_frac * frac_near +
             k_gap * std::max(0.0, (1e-3 - std::min(g_p10, 1e-3)));
-
         double kappa_raw =
             (frac_near > 0.15 ? base * (1.0 + 0.05 * it) : base * 0.9) + raise;
 
@@ -333,7 +313,6 @@ public:
             bshift_ema_init_ = true;
         }
         bshift_ema_ = (1.0 - beta) * bshift_ema_ + beta * kappa_raw;
-
         const double kappa_max =
             get_attr_or<double>(cfg_, "ip_shift_bounds_max", 1.0);
         const double kappa_min =
@@ -510,25 +489,30 @@ public:
           const dvec &zL, const dvec &zU, const Bounds &B, bool use_shifted,
           double tau_shift, double bound_shift, double mu, double theta,
           const Sigmas &Sg) {
+        IP_TIMER("solve()");
 
         // Mehrotra affine predictor with corrected bound handling
         auto [alpha_aff, mu_aff, sigma] = compute_affine_predictor_(
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, use_shifted,
             tau_shift, bound_shift, mu, theta);
+        IP_LAP("affine predictor");
 
         // Barrier parameter selection with multiple strategies
         double mu_target = compute_barrier_parameter_(
             mu, mu_aff, sigma, alpha_aff, theta, s, lam, zL, zU, B);
+        IP_LAP("barrier parameter");
 
         // Centering + corrector step
         auto base_step = compute_centering_step_(
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, mu_target,
             use_shifted, tau_shift, bound_shift, Sg);
+        IP_LAP("centering step");
 
         // Gondzio corrections with safeguards
         auto final_step = apply_gondzio_corrections_(
             W, r_d, JE, r_pE, JI, r_pI, s, lam, zL, zU, B, mu_target,
             use_shifted, tau_shift, bound_shift, Sg, base_step);
+        IP_LAP("Gondzio corrections");
 
         // // SOC with constraint violation handling
         // if (alpha_aff < config_.soc_threshold) {
@@ -543,6 +527,7 @@ public:
             [this](const auto &W, const auto &rhs, const auto &JE,
                    const auto &r_pE,
                    auto tag) { return solve_kkt_(W, rhs, JE, r_pE, tag); });
+        IP_LAP("SOC step");
 
         return {alpha_aff, mu_aff, sigma, final_step};
     }
@@ -554,6 +539,8 @@ public:
             solver) {
         solve_kkt_ = std::move(solver);
     }
+
+    std::string solving_method = "ldl";
 
 private:
     nb::object cfg_;
@@ -612,7 +599,7 @@ private:
         const bool haveJE = JE && JE->rows() > 0 && JE->cols() > 0;
         auto res = solve_kkt_(W, -r_d, haveJE ? JE : std::nullopt,
                               (r_pE && r_pE->size() > 0) ? r_pE : std::nullopt,
-                              "hykkt");
+                              solving_method);
 
         dvec dx_aff = std::move(res.dx);
         dx_aff_cache_ = dx_aff; // Cache for later use in mu calculation
@@ -896,7 +883,7 @@ private:
             }
         }
 
-        auto base_res = solve_kkt_(W, rhs_x, JE, r_pE, "hykkt");
+        auto base_res = solve_kkt_(W, rhs_x, JE, r_pE, solving_method);
 
         StepData result;
         result.dx = std::move(base_res.dx);
@@ -1066,7 +1053,7 @@ private:
                 tau_shift, bound_shift, Sg, k);
 
             auto corr_res =
-                solve_kkt_(W, rhs_corr_x, JE, std::nullopt, "hykkt");
+                solve_kkt_(W, rhs_corr_x, JE, std::nullopt, solving_method);
 
             // Safeguard: limit correction magnitude
             double corr_norm = corr_res.dx.norm();
@@ -1114,54 +1101,6 @@ private:
             double new_alpha = std::min(result.alpha_pri, result.alpha_dual);
             if (new_alpha < alpha_max * 0.95)
                 break;
-        }
-
-        return result;
-    }
-
-    // SOC corrections with constraint violation handling
-    StepData apply_soc_corrections_(
-        const spmat &W, const std::optional<spmat> &JE,
-        const std::optional<spmat> &JI, const dvec &s, const dvec &lam,
-        const dvec &zL, const dvec &zU, const StepData &base_step,
-        const Bounds &B, double alpha_aff, double mu_target, bool use_shifted,
-        double tau_shift, double bound_shift, const Sigmas &Sg) {
-
-        StepData result = base_step;
-        StepData best_soc = result;
-        double best_alpha = std::min(result.alpha_pri, result.alpha_dual);
-        double best_merit = compute_soc_merit_(result, s, lam, mu_target);
-
-        for (int soc_k = 0; soc_k < config_.max_soc_steps; ++soc_k) {
-            StepData soc = compute_soc_step_(
-                W, JE, JI, s, lam, zL, zU, result, B, alpha_aff, mu_target,
-                use_shifted, tau_shift, bound_shift, Sg, soc_k);
-
-            double soc_alpha = std::min(soc.alpha_pri, soc.alpha_dual);
-            double soc_merit = compute_soc_merit_(soc, s, lam, mu_target);
-
-            // Accept if improves step length or merit function
-            bool accept_soc =
-                (soc_alpha > best_alpha * 1.05) ||
-                (soc_merit < best_merit * 0.95 && soc_alpha > best_alpha * 0.9);
-
-            if (accept_soc) {
-                best_soc = soc;
-                best_alpha = soc_alpha;
-                best_merit = soc_merit;
-
-                result.dx += soc.dx;
-                result.dnu += soc.dnu;
-                result.ds += soc.ds;
-                result.dlam += soc.dlam;
-                result.dzL += soc.dzL;
-                result.dzU += soc.dzU;
-                result.alpha_pri = soc.alpha_pri;
-                result.alpha_dual = soc.alpha_dual;
-                result.soc_count++;
-            } else {
-                break;
-            }
         }
 
         return result;
@@ -1258,8 +1197,6 @@ private:
 
         return true;
     }
-
-    // Correction RHS computation
     std::pair<dvec, dvec> compute_correction_rhs_(
         const dvec &s, const dvec &lam, const dvec &ds, const dvec &dlam,
         const dvec &zL, const dvec &zU, const dvec &dzL, const dvec &dzU,
@@ -1267,11 +1204,10 @@ private:
         double alpha_dual, double mu_target, double centrality_measure,
         bool use_shifted, double tau_shift, double bound_shift,
         const Sigmas &Sg, int correction_index) const {
-
         const int n = static_cast<int>(dx.size());
         const int mI = static_cast<int>(s.size());
 
-        // Beta computation with correction-dependent scaling
+        // Beta computation
         double beta = 1.0;
         if (centrality_measure > config_.gamma_b) {
             beta = clamp(2.0 * centrality_measure / config_.gamma_b,
@@ -1280,29 +1216,26 @@ private:
             beta = clamp(config_.gamma_a / (2.0 * centrality_measure),
                          config_.beta_min, config_.beta_max);
         }
-
-        // Reduce beta for later corrections
         beta *= std::pow(0.8, correction_index);
 
-        dvec rhs_x = dvec::Zero(n);
-        dvec rhs_s = dvec::Zero(mI);
+        // Initialize result vectors without zero-initialization
+        dvec rhs_x(n);
+        dvec rhs_s(mI);
+        rhs_x.setZero(); // Only if necessary; consider removing if all elements
+                         // are assigned
+        rhs_s.setZero();
 
-        // Slack corrections
+        // Slack corrections (vectorized where possible)
         if (mI > 0) {
-            for (int i = 0; i < mI; ++i) {
-                const double s_pred =
-                    std::max(s[i] + alpha_pri * ds[i], consts::EPS_POS);
-                const double lam_pred =
-                    std::max(lam[i] + alpha_dual * dlam[i], consts::EPS_POS);
-                const double s_eff =
-                    use_shifted ? (s_pred + tau_shift) : s_pred;
-
-                const double nonlinear_term = -ds[i] * dlam[i];
-                const double centering_term =
-                    beta * mu_target - s_eff * lam_pred;
-
-                rhs_s[i] = nonlinear_term + centering_term;
-            }
+            Eigen::VectorXd s_pred = s + alpha_pri * ds;
+            Eigen::VectorXd lam_pred = lam + alpha_dual * dlam;
+            s_pred = s_pred.cwiseMax(consts::EPS_POS);
+            lam_pred = lam_pred.cwiseMax(consts::EPS_POS);
+            Eigen::VectorXd s_eff =
+                use_shifted ? (s_pred.array() + tau_shift).matrix() : s_pred;
+            rhs_s = (-ds.array() * dlam.array() + beta * mu_target -
+                     s_eff.array() * lam_pred.array())
+                        .matrix();
 
             if (JI.nonZeros() && Sg.Sigma_s.size() == mI) {
                 rhs_x.noalias() +=
@@ -1310,175 +1243,37 @@ private:
             }
         }
 
-        // FIXED: Bound corrections with proper slack evolution
+        // Bound corrections
         for (int i = 0; i < n; ++i) {
             double bound_corr = 0.0;
-
             if (i < zL.size() && B.hasL[i]) {
-                // sL evolves as sL + alpha * dx
                 const double sL_pred =
                     std::max(B.sL[i] + alpha_pri * dx[i], consts::EPS_POS);
                 const double zL_pred =
                     std::max(zL[i] + alpha_dual * dzL[i], consts::EPS_POS);
                 const double s_eff =
                     use_shifted ? (sL_pred + bound_shift) : sL_pred;
-
                 const double nonlinear_L = -dx[i] * dzL[i];
                 const double centering_L = beta * mu_target - s_eff * zL_pred;
-                const double corrL = nonlinear_L + centering_L;
-
-                bound_corr += corrL / clamp_min(s_eff, consts::EPS_POS);
+                bound_corr += (nonlinear_L + centering_L) /
+                              clamp_min(s_eff, consts::EPS_POS);
             }
-
             if (i < zU.size() && B.hasU[i]) {
-                // sU evolves as sU - alpha * dx
                 const double sU_pred =
                     std::max(B.sU[i] - alpha_pri * dx[i], consts::EPS_POS);
                 const double zU_pred =
                     std::max(zU[i] + alpha_dual * dzU[i], consts::EPS_POS);
                 const double s_eff =
                     use_shifted ? (sU_pred + bound_shift) : sU_pred;
-
-                const double nonlinear_U =
-                    dx[i] * dzU[i]; // + because dsU = -dx
+                const double nonlinear_U = dx[i] * dzU[i];
                 const double centering_U = beta * mu_target - s_eff * zU_pred;
-                const double corrU = nonlinear_U + centering_U;
-
-                bound_corr -= corrU / clamp_min(s_eff, consts::EPS_POS);
+                bound_corr -= (nonlinear_U + centering_U) /
+                              clamp_min(s_eff, consts::EPS_POS);
             }
-
-            rhs_x[i] += bound_corr;
+            rhs_x[i] = bound_corr;
         }
 
         return {rhs_x, rhs_s};
-    }
-
-    // SOC step computation
-    StepData compute_soc_step_(const spmat &W, const std::optional<spmat> &JE,
-                               const std::optional<spmat> &JI, const dvec &s,
-                               const dvec &lam, const dvec &zL, const dvec &zU,
-                               const StepData &affine_step, const Bounds &B,
-                               double alpha_aff, double mu_target,
-                               bool use_shifted, double tau_shift,
-                               double bound_shift, const Sigmas &Sg,
-                               int soc_index) {
-
-        const int n = static_cast<int>(affine_step.dx.size());
-        const int mI = static_cast<int>(s.size());
-        dvec rhs_x = dvec::Zero(n);
-
-        // Constraint violation prediction
-        dvec cI_violation = dvec::Zero(mI);
-        if (mI > 0 && JI) {
-            for (int i = 0; i < mI; ++i) {
-                const double s_aff = s[i] + alpha_aff * affine_step.ds[i];
-                cI_violation[i] = std::min(s_aff, 0.0);
-            }
-
-            for (int i = 0; i < mI; ++i) {
-                const double s_aff = std::max(
-                    s[i] + alpha_aff * affine_step.ds[i], consts::EPS_POS);
-                const double lam_aff = std::max(
-                    lam[i] + alpha_aff * affine_step.dlam[i], consts::EPS_POS);
-                const double s_eff = use_shifted ? (s_aff + tau_shift) : s_aff;
-
-                double soc_correction = mu_target - s_eff * lam_aff;
-                if (cI_violation[i] < 0) {
-                    soc_correction +=
-                        std::pow(0.9, soc_index) * cI_violation[i];
-                }
-
-                if (JI->nonZeros() && i < Sg.Sigma_s.size()) {
-                    dvec contrib = (*JI).row(i).transpose() *
-                                   (Sg.Sigma_s[i] * soc_correction);
-                    rhs_x += contrib;
-                }
-            }
-        }
-
-        // Bound complementarity corrections
-        for (int i = 0; i < n; ++i) {
-            double bound_corr = 0.0;
-
-            if (B.hasL[i]) {
-                const double sL_aff = std::max(
-                    B.sL[i] + alpha_aff * affine_step.dx[i], consts::EPS_POS);
-                const double zL_aff = std::max(
-                    zL[i] + alpha_aff * affine_step.dzL[i], consts::EPS_POS);
-                const double s_eff =
-                    use_shifted ? (sL_aff + bound_shift) : sL_aff;
-                const double corrL = mu_target - s_eff * zL_aff;
-                bound_corr += corrL / clamp_min(s_eff, consts::EPS_POS);
-            }
-
-            if (B.hasU[i]) {
-                const double sU_aff = std::max(
-                    B.sU[i] - alpha_aff * affine_step.dx[i], consts::EPS_POS);
-                const double zU_aff = std::max(
-                    zU[i] + alpha_aff * affine_step.dzU[i], consts::EPS_POS);
-                const double s_eff =
-                    use_shifted ? (sU_aff + bound_shift) : sU_aff;
-                const double corrU = mu_target - s_eff * zU_aff;
-                bound_corr -= corrU / clamp_min(s_eff, consts::EPS_POS);
-            }
-
-            rhs_x[i] += bound_corr;
-        }
-
-        auto soc_res = solve_kkt_(W, rhs_x, JE, std::nullopt, "hykkt");
-
-        StepData soc_step;
-        soc_step.dx = soc_res.dx;
-        soc_step.dnu = (JE && soc_res.dy.size() > 0)
-                           ? soc_res.dy
-                           : dvec::Zero(JE ? JE->rows() : 0);
-
-        // Complete SOC step computation
-        if (mI > 0 && JI) {
-            soc_step.ds = dvec::Zero(mI);
-            soc_step.dlam.resize(mI);
-            for (int i = 0; i < mI; ++i) {
-                soc_step.ds[i] =
-                    -cI_violation[i] - (*JI).row(i).dot(soc_step.dx);
-                const double d = clamp_min(
-                    use_shifted ? (s[i] + tau_shift) : s[i], consts::EPS_DIV);
-                soc_step.dlam[i] =
-                    (mu_target - d * lam[i] - lam[i] * soc_step.ds[i]) / d;
-            }
-        } else {
-            soc_step.ds.resize(0);
-            soc_step.dlam.resize(0);
-        }
-
-        std::tie(soc_step.dzL, soc_step.dzU) = compute_bound_duals_(
-            soc_step.dx, zL, zU, B, bound_shift, use_shifted, mu_target, true);
-
-        const double tau_pri = get_attr_or<double>(cfg_, "ip_tau_pri", 0.995);
-        const double tau_dual = get_attr_or<double>(cfg_, "ip_tau_dual", 0.995);
-        std::tie(soc_step.alpha_pri, soc_step.alpha_dual) =
-            compute_step_lengths_(s, soc_step.ds, lam, soc_step.dlam, zL,
-                                  soc_step.dzL, zU, soc_step.dzU, soc_step.dx,
-                                  B, tau_pri, tau_dual);
-
-        soc_step.mu_target = mu_target;
-        soc_step.soc_count = 1;
-        return soc_step;
-    }
-
-    // Merit function for SOC evaluation
-    double compute_soc_merit_(const StepData &step, const dvec &s,
-                              const dvec &lam, double mu_target) const {
-        double alpha_merit = 1.0 - std::min(step.alpha_pri, step.alpha_dual);
-
-        double comp_merit = 0.0;
-        for (int i = 0; i < s.size(); ++i) {
-            double s_new = s[i] + step.alpha_pri * step.ds[i];
-            double l_new = lam[i] + step.alpha_dual * step.dlam[i];
-            comp_merit += std::abs(s_new * l_new - mu_target);
-        }
-        comp_merit /= std::max(1.0, static_cast<double>(s.size()));
-
-        return alpha_merit + 0.1 * comp_merit / std::max(mu_target, 1e-12);
     }
 
 public:

@@ -76,143 +76,144 @@ namespace kkt {
 // inserts.
 // ====================== assemble_KKT (row-major right block)
 // ======================
-[[nodiscard]] inline spmat assemble_KKT(spmat W, double delta,
-                                        const std::optional<spmat> &Gopt,
-                                        bool *out_hasE) {
-    const int n = W.rows();
-    if (W.cols() != n)
+[[nodiscard]] inline spmat assemble_KKT(const spmat& W_in,
+                                        double delta,
+                                        const std::optional<spmat>& Gopt,
+                                        bool* out_hasE)
+{
+    using T = Eigen::Triplet<double,int>;
+    if (W_in.rows() != W_in.cols())
         throw std::invalid_argument("assemble_KKT: W not square");
 
-    W.makeCompressed();
+    spmat W = W_in; W.makeCompressed();
 
-    // In-place diagonal regularization
-    if (delta != 0.0) {
-        for (int i = 0; i < n; ++i)
-            W.coeffRef(i, i) += delta;
-        W.makeCompressed();
+    const bool hasE = (Gopt && Gopt->rows() > 0 && Gopt->cols() > 0);
+    if (out_hasE) *out_hasE = hasE;
+
+    const int n = W.rows();
+    int m = 0;
+    if (!hasE) {
+        // Just W + delta I
+        std::vector<T> trips; trips.reserve(W.nonZeros() + n);
+        for (int j = 0; j < W.outerSize(); ++j)
+            for (spmat::InnerIterator it(W, j); it; ++it)
+                trips.emplace_back(it.row(), it.col(), it.value());
+        if (delta != 0.0)
+            for (int i = 0; i < n; ++i) trips.emplace_back(i, i, delta);
+        spmat K(n, n);
+        K.setFromTriplets(trips.begin(), trips.end());
+        K.makeCompressed();
+        return K;
     }
 
-    const bool hasE = Gopt && (Gopt->rows() > 0);
-    if (out_hasE)
-        *out_hasE = hasE;
-    if (!hasE)
-        return W;
-
-    const spmat &G = *Gopt;
-    if (G.cols() != n)
+    const spmat& Gc = *Gopt;
+    if (Gc.cols() != n)
         throw std::invalid_argument("assemble_KKT: G.cols != n");
-    const int m = G.rows();
+    spmat G = Gc; G.makeCompressed();
+    m = G.rows();
     const int N = n + m;
 
-    // Row-major view for fast row iteration on G
-    using spmatR = Eigen::SparseMatrix<double, Eigen::RowMajor, int>;
-    spmatR G_r = G; // copies structure+values into row-major
+    std::vector<T> trips;
+    trips.reserve(W.nonZeros() + (delta != 0.0 ? n : 0) + 2*G.nonZeros());
 
-    Eigen::VectorXi reserve(N);
-    reserve.setZero();
+    // W block
+    for (int j = 0; j < W.outerSize(); ++j)
+        for (spmat::InnerIterator it(W, j); it; ++it)
+            trips.emplace_back(it.row(), it.col(), it.value());
 
-    // Left block (0..n-1): W col nnz + G col nnz
-    for (int j = 0; j < n; ++j) {
-        const int wj = W.outerIndexPtr()[j + 1] - W.outerIndexPtr()[j];
-        int gj = 0;
-        for (spmat::InnerIterator it(G, j); it; ++it)
-            ++gj;
-        reserve[j] = wj + gj;
-    }
-    // Right block (n..n+m-1): G row nnz
-    for (int i = 0; i < G_r.outerSize(); ++i) {
-        int nnz = 0;
-        for (spmatR::InnerIterator it(G_r, i); it; ++it)
-            ++nnz;
-        reserve[n + i] = nnz;
-    }
+    if (delta != 0.0)
+        for (int i = 0; i < n; ++i) trips.emplace_back(i, i, delta);
+
+    // G blocks: top-right (Gᵀ) and bottom-left (G)
+    for (int j = 0; j < G.outerSize(); ++j)
+        for (spmat::InnerIterator it(G, j); it; ++it) {
+            const int i = it.row();     // 0..m-1
+            const int k = it.col();     // 0..n-1
+            const double v = it.value();
+            trips.emplace_back(k, n + i, v);   // top-right Gᵀ
+            trips.emplace_back(n + i, k, v);   // bottom-left G
+        }
 
     spmat K(N, N);
-    K.reserve(reserve);
-
-    // Stream columns 0..n-1
-    for (int j = 0; j < n; ++j) {
-        K.startVec(j);
-        // W block
-        for (spmat::InnerIterator it(W, j); it; ++it)
-            K.insertBack(it.row(), j) = it.value();
-        // G block (bottom-left)
-        for (spmat::InnerIterator it(G, j); it; ++it)
-            K.insertBack(n + it.row(), j) = it.value();
-    }
-
-    // Stream columns n..n+m-1 via row-major G (top-right = G^T)
-    for (int i = 0; i < G_r.outerSize(); ++i) {
-        const int col = n + i;
-        K.startVec(col);
-        for (spmatR::InnerIterator it(G_r, i); it; ++it) {
-            K.insertBack(it.col(), col) = it.value();
-        }
-        // bottom-right is structurally zero
-    }
-
-    K.finalize();
+    K.setFromTriplets(trips.begin(), trips.end());
+    K.makeCompressed();
     return K;
 }
 
 // ------------------------------ QDLDL helpers -------------------------
 [[nodiscard]] inline qdldl23::SparseD32
-eigen_to_upper_csc(const spmat &A, double diag_eps = 0.0) {
+eigen_to_upper_csc(const spmat& A, double diag_eps = 0.0) {
     const int n = A.rows();
     if (A.cols() != n)
-        throw std::invalid_argument(
-            "eigen_to_upper_csc: matrix must be square");
+        throw std::invalid_argument("eigen_to_upper_csc: matrix must be square");
 
-    std::vector<int> rows, cols;
-    std::vector<double> vals;
-    const size_t est_nnz = A.nonZeros() / 2 + n;
-    rows.reserve(est_nnz);
-    cols.reserve(est_nnz);
-    vals.reserve(est_nnz);
+    // We assume caller gave a compressed matrix. If not, make a compressed copy.
+    spmat Ac = A;
+    Ac.makeCompressed();
 
-    std::vector<bool> has_diag(n, false);
+    // Pass 1: count upper-triangular nnz per column, track diagonal presence
+    std::vector<int> Ap(static_cast<size_t>(n) + 1, 0);
+    std::vector<char> has_diag(static_cast<size_t>(n), 0);
 
-    for (int j = 0; j < A.outerSize(); ++j) {
-        for (spmat::InnerIterator it(A, j); it; ++it) {
-            if (it.row() <= j) {
-                rows.push_back(it.row());
-                cols.push_back(j);
-                vals.push_back(it.value());
-                if (it.row() == j)
-                    has_diag[j] = true;
+    for (int j = 0; j < n; ++j) {
+        int cnt = 0;
+        for (spmat::InnerIterator it(Ac, j); it; ++it) {
+            const int i = it.row();
+            if (i <= j) {
+                ++cnt;
+                if (i == j) has_diag[j] = 1;
             }
         }
+        Ap[j + 1] = cnt; // store per-column count for now
     }
 
+    // If we must ensure a diagonal with diag_eps, add one where missing
     if (diag_eps > 0.0) {
-        for (int j = 0; j < n; ++j) {
-            if (!has_diag[j]) {
-                rows.push_back(j);
-                cols.push_back(j);
-                vals.push_back(diag_eps);
-            }
-        }
+        for (int j = 0; j < n; ++j)
+            if (!has_diag[j]) ++Ap[j + 1];
     }
 
-    std::vector<int> Ap(n + 1, 0);
-    for (int c : cols)
-        ++Ap[c + 1];
+    // Prefix sum to get column pointers
     for (int j = 0; j < n; ++j)
         Ap[j + 1] += Ap[j];
 
-    const size_t nnz = Ap[n];
-    std::vector<int> Ai(nnz);
-    std::vector<double> Ax(nnz);
+    const int nnz = Ap[n];
+    std::vector<int>    Ai(static_cast<size_t>(nnz));
+    std::vector<double> Ax(static_cast<size_t>(nnz));
+
+    // Per-column write cursors (start at Ap[j])
     std::vector<int> next = Ap;
 
-    for (size_t k = 0; k < cols.size(); ++k) {
-        const size_t p = next[cols[k]]++;
-        Ai[p] = rows[k];
-        Ax[p] = vals[k];
+    // Pass 2: fill Ai/Ax with upper-triangular entries
+    for (int j = 0; j < n; ++j) {
+        for (spmat::InnerIterator it(Ac, j); it; ++it) {
+            const int i = it.row();
+            if (i <= j) {
+                const int p = next[j]++;
+                Ai[p] = i;
+                Ax[p] = it.value();
+                if (i == j) has_diag[j] = 2; // mark “already written diag”
+            }
+        }
     }
+
+    // Inject missing diagonals (if requested)
+    if (diag_eps > 0.0) {
+        for (int j = 0; j < n; ++j) {
+            if (has_diag[j] == 0) { // no diagonal was present/written
+                const int p = next[j]++;
+                Ai[p] = j;
+                Ax[p] = diag_eps;
+            }
+        }
+    }
+
+    // Sanity (can be #ifdef NDEBUG)
+    // for (int j = 0; j < n; ++j) assert(next[j] == Ap[j+1]);
 
     return qdldl23::SparseD32(n, std::move(Ap), std::move(Ai), std::move(Ax));
 }
+
 
 // ------------------------------ SIMD optimized helpers ----------------
 #if defined(__AVX2__)
