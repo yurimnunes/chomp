@@ -37,6 +37,8 @@ struct TRResult {
     TRInfo info; // diagnostics
     dvec lam;    // inequality multipliers (size mI or 0)
     dvec nu;     // equality multipliers   (size mE or 0)
+    dvec zL;    // lower bound multipliers (size n or 0)
+    dvec zU;    // upper bound multipliers (size n or 0)
 };
 
 enum class TRStatus { SUCCESS, BOUNDARY, NEG_CURV, MAX_ITER };

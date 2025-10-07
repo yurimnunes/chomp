@@ -149,3 +149,147 @@ struct CGResult {
     }
     return {p, TRStatus::MAX_ITER, maxiter};
 }
+
+// [[nodiscard]] GLTRResult gltr_step_(const LinOp &H, const dvec &g, const Metric &M, double delta, double tol, int maxiter) {
+//     GLTRResult res;
+//     int n = g.size();
+//     if (n == 0 || g.norm() <= tol) {
+//         res.p = dvec::Zero(n);
+//         res.iters = 0;
+//         res.status = TRStatus::SUCCESS;
+//         return res;
+//     }
+
+//     bool use_metric = M.valid;
+//     LinOp H_op = H;
+//     dvec g_op = g;
+//     double delta_op = delta;
+
+//     if (use_metric) {
+//         g_op = M.L.triangularView<Eigen::Lower>().solve(g);
+//         LinOp new_H;
+//         new_H.n = n;
+//         new_H.mv = [&M, &H](const dvec &v, dvec &out) {
+//             dvec tmp = M.L.transpose().triangularView<Eigen::Upper>().solve(v);
+//             dvec Htmp;
+//             H_apply(H, tmp, Htmp);
+//             out = M.L.triangularView<Eigen::Lower>().solve(Htmp);
+//         };
+//         H_op = new_H;
+//     }
+
+//     double gnorm = g_op.norm();
+//     std::vector<dvec> V;
+//     dvec v = g_op / gnorm;
+//     V.push_back(v);
+//     dvec w;
+//     H_apply(H_op, v, w);
+//     double a = v.dot(w);
+//     w -= a * v;
+//     double b = w.norm();
+
+//     dmat T(1,1);
+//     T(0,0) = a;
+
+//     double lambda = 0.0;
+//     bool converged = false;
+//     int k = 0;
+//     dvec s = dvec::Zero(n);
+//     bool interior = true;
+
+//     while (k < maxiter && !converged) {
+//         k++;
+
+//         if (b < cfg_.neg_curv_tol) {
+//             res.status = TRStatus::NEG_CURV;
+//             break;
+//         }
+
+//         v = w / b;
+//         V.push_back(v);
+//         H_apply(H_op, v, w);
+//         w -= b * V[k-1];
+//         a = v.dot(w);
+//         w -= a * v;
+//         b = w.norm();
+
+//         // Extend T
+//         dmat T_new(k+1, k+1);
+//         T_new.topLeftCorner(k, k) = T;
+//         T_new(k-1, k) = b;
+//         T_new(k, k-1) = b;
+//         T_new(k, k) = a;
+//         T = std::move(T_new);
+
+//         // Solve reduced TR: min 1/2 h^T T h + gnorm h(0) s.t. ||h|| <= delta_op
+
+//         Eigen::SelfAdjointEigenSolver<dmat> es(T);
+//         double lambda_min = es.eigenvalues().minCoeff();
+//         lambda = std::max(0.0, -lambda_min);
+//         dvec h(k+1);
+//         double phi = 0.0;
+//         int newton_iter = 0;
+//         const int max_newton = 50;
+//         interior = true;
+//         for (newton_iter = 0; newton_iter < max_newton; ++newton_iter) {
+//             dmat Tp = T + lambda * dmat::Identity(k+1, k+1);
+//             Eigen::LDLT<dmat> ldlt(Tp);
+//             if (ldlt.info() != Eigen::Success) {
+//                 lambda += 1e-8;
+//                 continue;
+//             }
+//             dvec e1 = dvec::Zero(k+1);
+//             e1(0) = gnorm;
+//             h = -ldlt.solve(e1);
+//             double hnorm = h.norm();
+//             phi = hnorm - delta_op;
+//             if (lambda == 0.0 && hnorm <= delta_op) {
+//                 interior = true;
+//                 break;
+//             }
+//             if (lambda > 0.0 && std::abs(hnorm - delta_op) <= 1e-6 * delta_op) {
+//                 interior = false;
+//                 break;
+//             }
+//             double dlambda = (hnorm^2) / (h.dot(ldlt.solve(h))) * (hnorm - delta_op) / delta_op;
+//             lambda += dlambda;
+//             lambda = std::max(lambda, -lambda_min + 1e-8);
+//         }
+
+//         if (interior == false && std::abs(phi) > 1e-6 * delta_op) {
+//             h *= delta_op / h.norm();
+//         }
+
+//         // Check residual
+
+//         double last = h(k);
+
+//         double residual = b * std::abs(last);
+
+//         if (residual <= tol * gnorm) {
+//             converged = true;
+//         }
+
+//         // Update s
+
+//         s = dvec::Zero(n);
+//         for (size_t i = 0; i < V.size(); ++i) {
+//             s += h(i) * V[i];
+//         }
+
+//     }
+
+//     if (use_metric) {
+//         res.p = M.L.transpose().triangularView<Eigen::Upper>().solve(s);
+//     } else {
+//         res.p = s;
+//     }
+
+//     res.iters = k;
+
+//     res.status = converged ? TRStatus::SUCCESS : TRStatus::MAX_ITER;
+//     if (b < cfg_.neg_curv_tol) res.status = TRStatus::NEG_CURV;
+//     if (!interior) res.status = TRStatus::BOUNDARY;
+
+//     return res;
+// }

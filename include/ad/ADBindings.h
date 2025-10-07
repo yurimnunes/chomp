@@ -274,6 +274,7 @@ static inline nb::object unary_dispatch(nb::object x, Operator op) {
 }
 
 // ---------- pow helpers ----------
+// ---- integer check (kept) ---------------------------------------------------
 [[gnu::always_inline]]
 static inline bool _is_effectively_int(double p, double &pr_out) noexcept {
     const double pr = std::round(p);
@@ -285,116 +286,99 @@ static inline bool _is_effectively_int(double p, double &pr_out) noexcept {
     return false;
 }
 
+// ---- tiny node helpers ------------------------------------------------------
 [[gnu::always_inline]]
-static inline ADNodePtr mul_node(const ADGraphPtr &g, const ADNodePtr &a,
-                                 const ADNodePtr &b) {
-    auto m = std::make_shared<ADNode>();
-    m->type = Operator::Multiply;
-    m->addInput(a);
-    m->addInput(b);
-    g->addNode(m);
-    return m;
+static inline ADNodePtr make_bin_node(const ADGraphPtr& g,
+                                      Operator op,
+                                      const ADNodePtr& a,
+                                      const ADNodePtr& b) {
+    auto n = std::make_shared<ADNode>();
+    n->type = op;
+    n->addInput(a);
+    n->addInput(b);
+    g->addNode(n);
+    return n;
 }
 
+[[gnu::always_inline]]
+static inline ADNodePtr make_pow_node(const ADGraphPtr& g,
+                                      const ADNodePtr& base,
+                                      const ADNodePtr& exponent) {
+    return make_bin_node(g, Operator::Pow, base, exponent);
+}
+
+// ---- integer power with exponentiation-by-squaring --------------------------
 [[gnu::hot]]
-static inline ADNodePtr pow_pos_node(const ADGraphPtr &g, const ADNodePtr &base,
-                                     long long e) {
-    if (e == 1)
-        return base;
-    if (e == 2)
-        return mul_node(g, base, base);
-    ADNodePtr result = base, cur = base;
-    e >>= 1;
+static inline ADNodePtr powi_node(const ADGraphPtr &g,
+                                  const ADNodePtr &base,
+                                  long long e) {
+    if (e == 0) return make_const_node(g, 1.0);
+    if (e < 0) {
+        if (base->type == Operator::cte && base->value == 0.0)
+            throw std::domain_error("x**p: base == 0 and integer p < 0 is undefined.");
+        // powi(base, -e) then 1 / that
+        auto den = powi_node(g, base, -e);
+        auto num = make_const_node(g, 1.0);
+        return make_bin_node(g, Operator::Divide, num, den);
+    }
+
+    // e > 0
+    // small fast paths
+    if (e == 1) return base;
+    if (e == 2) return make_bin_node(g, Operator::Multiply, base, base);
+
+    // exponentiation by squaring
+    ADNodePtr result = make_const_node(g, 1.0);
+    ADNodePtr cur = base;
     while (e > 0) {
-        cur = mul_node(g, cur, cur);
-        if (e & 1)
-            result = mul_node(g, result, cur);
+        if (e & 1) result = make_bin_node(g, Operator::Multiply, result, cur);
         e >>= 1;
+        if (e)     cur = make_bin_node(g, Operator::Multiply, cur, cur);
     }
     return result;
 }
 
-[[gnu::hot]]
-static inline ADNodePtr powi_node(const ADGraphPtr &g, const ADNodePtr &base,
-                                  long long e) {
-    if (e == 0)
-        return make_const_node(g, 1.0);
-    if (e > 0)
-        return pow_pos_node(g, base, e);
-    if (base->type == Operator::cte && base->value == 0.0)
-        throw std::domain_error(
-            "x**p: base == 0 and integer p < 0 is undefined.");
-    auto den = pow_pos_node(g, base, -e);
-    auto num = make_const_node(g, 1.0);
-    auto div = std::make_shared<ADNode>();
-    div->type = Operator::Divide;
-    div->addInput(num);
-    div->addInput(den);
-    g->addNode(div);
-    return div;
-}
-
+// ---- builders ---------------------------------------------------------------
 [[gnu::hot]]
 static inline std::shared_ptr<Expression> expr_pow_any(nb::object x, double p) {
     ADGraphPtr g;
     std::shared_ptr<Expression> ex;
     if (nb::isinstance<Expression>(x)) {
         ex = nb::cast<std::shared_ptr<Expression>>(x);
-        g = ex->graph ? ex->graph : std::make_shared<ADGraph>();
+        g  = ex->graph ? ex->graph : std::make_shared<ADGraph>();
     } else {
-        g = std::make_shared<ADGraph>();
+        g  = std::make_shared<ADGraph>();
         ex = as_expression(x, g);
     }
-    if (ex->node)
-        g->adoptSubgraph(ex->node);
+    if (ex->node) g->adoptSubgraph(ex->node);
 
     double pr = 0.0;
     if (_is_effectively_int(p, pr)) {
         auto out = std::make_shared<Expression>(g);
-        out->node = powi_node(g, ex->node, (long long)pr);
+        out->node = powi_node(g, ex->node, static_cast<long long>(pr));
         return out;
     }
 
-    if (ex->node && ex->node->type == Operator::cte && ex->node->value <= 0.0)
-        throw std::domain_error("x**p with non-integer p requires base > 0.");
-
-    auto e_log = std::make_shared<Expression>(g);
-    e_log->node->type = Operator::Log;
-    e_log->node->addInput(ex->node);
-    g->addNode(e_log->node);
-
-    auto e_mul = std::make_shared<Expression>(g);
-    e_mul->node->type = Operator::Multiply;
-    e_mul->node->addInput(e_log->node);
-    e_mul->node->addInput(make_const_node(g, p));
-    g->addNode(e_mul->node);
-
-    auto e_exp = std::make_shared<Expression>(g);
-    e_exp->node->type = Operator::Exp;
-    e_exp->node->addInput(e_mul->node);
-    g->addNode(e_exp->node);
-    return e_exp;
+    // non-integer → use single Pow node (handled by OpTraits<Operator::Pow>)
+    auto out = std::make_shared<Expression>(g);
+    out->node = make_pow_node(g, ex->node, make_const_node(g, p));
+    return out;
 }
 
 [[gnu::always_inline]]
 static inline std::shared_ptr<Expression>
 scalar_pow_expr(double s, const std::shared_ptr<Expression> &x) {
-    if (s <= 0.0)
+    if (s <= 0.0) // keep your public contract
         throw std::domain_error("scalar ** Expression requires base > 0");
+
     ADGraphPtr g = x->graph ? x->graph : std::make_shared<ADGraph>();
-    if (x->node)
-        g->adoptSubgraph(x->node);
-    auto e_mul = std::make_shared<Expression>(g);
-    e_mul->node->type = Operator::Multiply;
-    e_mul->node->addInput(x->node);
-    e_mul->node->addInput(make_const_node(g, std::log(s)));
-    g->addNode(e_mul->node);
-    auto e_exp = std::make_shared<Expression>(g);
-    e_exp->node->type = Operator::Exp;
-    e_exp->node->addInput(e_mul->node);
-    g->addNode(e_exp->node);
-    return e_exp;
+    if (x->node) g->adoptSubgraph(x->node);
+
+    auto out = std::make_shared<Expression>(g);
+    out->node = make_pow_node(g, make_const_node(g, s), x->node);
+    return out;
 }
+
 
 // ---------- max ----------
 [[gnu::hot]]
@@ -448,7 +432,6 @@ static inline Compiled compile_to_graph(nb::object f, size_t arity,
         throw std::invalid_argument("compile: function returned None");
     auto expr = nb::cast<std::shared_ptr<Expression>>(ret);
     out.g->adoptSubgraph(expr->node);
-    // out.g->simplifyExpression();
     out.root = expr->node;
     return out;
 }
@@ -643,6 +626,7 @@ public:
         var_nodes = std::move(C.vars);
         seed.assign(arity, 0.0);
         g->initializeNodeVariables();
+        g->simplifyGraph();
     }
 
     void set_inputs_seq(const nb::object &x) {
@@ -1133,61 +1117,164 @@ public:
 // ============================================================================
 // Matrix-free HVP operator for LagHessFn + Eigen glue
 // ============================================================================
+#include <optional>
 
-class CompiledHvpOp {
+class CompiledWOp {
 public:
     using Vec = Eigen::VectorXd;
+    using Sp = Eigen::SparseMatrix<double, Eigen::ColMajor, int>;
 
-    explicit CompiledHvpOp(std::shared_ptr<LagHessFn> &L, double sigma = 0.0)
-        : L_(L), sigma_(sigma) {
+    CompiledWOp() = default;
+
+    // JI and Sigma_s are optional; if present, sizes must match: JI.rows() ==
+    // Sigma_s.size()
+    explicit CompiledWOp(
+        std::shared_ptr<LagHessFn> L,
+        Eigen::VectorXd Sigma_x,             // size n OR empty (size 0)
+        std::optional<Sp> JI = std::nullopt, // mI x n
+        std::optional<Eigen::VectorXd> Sigma_s = std::nullopt, // size mI
+        double sigma_isotropic = 0.0)
+        : L_(std::move(L)), sigma_(sigma_isotropic),
+          Sigma_x_(std::move(Sigma_x)), JI_(std::move(JI)),
+          Sigma_s_(std::move(Sigma_s)) {
         L_->build_permutations_once_();
         const std::size_t n = L_->x_nodes.size();
 
-        // Persistent scratch (no hot-path allocations):
-        Vcol_.assign(n, 0.0); // graph-order input vector (k=1, ld=1)
-        Ycol_.assign(n, 0.0); // graph-order output vector
-        y_x_.assign(n, 0.0);  // x-order output vector
+        // Hot-path scratch, fixed sizes
+        Vcol_.assign(n, 0.0);
+        Ycol_.assign(n, 0.0);
+        y_x_.assign(n, 0.0);
+
+        has_Sx_ = (Sigma_x_.size() == static_cast<Eigen::Index>(n));
+
+        // Validate & prep inequality part (optional)
+        if (JI_.has_value() || Sigma_s_.has_value()) {
+            if (!JI_.has_value() || !Sigma_s_.has_value())
+                throw std::invalid_argument(
+                    "CompiledWOp: JI and Sigma_s must be provided together or "
+                    "both omitted.");
+            if (static_cast<std::size_t>(JI_->cols()) != n)
+                throw std::invalid_argument(
+                    "CompiledWOp: JI.cols() must equal n.");
+            if (JI_->rows() != Sigma_s_->size())
+                throw std::invalid_argument(
+                    "CompiledWOp: JI.rows() must equal Sigma_s.size().");
+
+            has_JI_ = true;
+            t_.resize(JI_->rows());
+        } else {
+            has_JI_ = false;
+        }
     }
 
     inline Eigen::Index rows() const {
         return static_cast<Eigen::Index>(L_->x_nodes.size());
     }
-    inline Eigen::Index cols() const {
-        return static_cast<Eigen::Index>(L_->x_nodes.size());
+    inline Eigen::Index cols() const { return rows(); }
+
+    // ---- runtime tweaks (no realloc on hot path) ----
+    inline void set_sigma(double s) { sigma_ = s; }
+    inline double sigma() const { return sigma_; }
+
+    // Update Sigma_x (size must be n or 0 to disable)
+    inline void update_sigma_x(const Eigen::VectorXd &s) {
+        if (s.size() == 0) {
+            has_Sx_ = false;
+            Sigma_x_.resize(0);
+            return;
+        }
+        if (s.size() != rows())
+            throw std::invalid_argument(
+                "CompiledWOp::update_sigma_x: size mismatch.");
+        Sigma_x_ = s;
+        has_Sx_ = true;
+    }
+
+    // Update / (enable|disable) JI and Sigma_s together
+    inline void
+    update_JI_and_sigma_s(const std::optional<Sp> &JI,
+                          const std::optional<Eigen::VectorXd> &Sigma_s) {
+        if (JI.has_value() || Sigma_s.has_value()) {
+            if (!JI.has_value() || !Sigma_s.has_value())
+                throw std::invalid_argument(
+                    "CompiledWOp::update_JI_and_sigma_s: both JI and Sigma_s "
+                    "must be provided.");
+            if (JI->cols() != rows())
+                throw std::invalid_argument("CompiledWOp::update_JI_and_sigma_"
+                                            "s: JI.cols() must equal n.");
+            if (JI->rows() != Sigma_s->size())
+                throw std::invalid_argument(
+                    "CompiledWOp::update_JI_and_sigma_s: JI.rows() must equal "
+                    "Sigma_s.size().");
+
+            JI_ = JI;
+            Sigma_s_ = Sigma_s;
+            has_JI_ = true;
+            t_.resize(JI_->rows());
+        } else {
+            // disable inequality part
+            JI_.reset();
+            Sigma_s_.reset();
+            has_JI_ = false;
+            t_.resize(0);
+        }
+    }
+
+    // If only Sigma_s changes (same shape), fast in-place update
+    inline void update_sigma_s_only(const Eigen::VectorXd &s) {
+        if (!has_JI_)
+            throw std::logic_error(
+                "CompiledWOp::update_sigma_s_only: JI/Sigma_s not enabled.");
+        if (s.size() != Sigma_s_->size())
+            throw std::invalid_argument(
+                "CompiledWOp::update_sigma_s_only: size mismatch.");
+        *Sigma_s_ = s;
     }
 
     template <typename DerivedIn, typename DerivedOut>
     inline void perform_op(const Eigen::MatrixBase<DerivedIn> &x,
                            Eigen::MatrixBase<DerivedOut> &y) const {
         const std::size_t n = static_cast<std::size_t>(x.size());
+        if (rows() != static_cast<Eigen::Index>(n))
+            throw std::invalid_argument(
+                "CompiledWOp::perform_op: vector size mismatch.");
 
-        // 1) Map x (x-order) -> Vcol_ (graph-order)
+        // 1) x (x-order) -> Vcol_ (graph-order)
         for (std::size_t i = 0; i < n; ++i) {
             const std::size_t gi = static_cast<std::size_t>(L_->x2g_[i]);
             Vcol_[gi] = x[static_cast<Eigen::Index>(i)];
         }
 
-        // 2) Single-column HVP: Ycol_ = H * Vcol_
+        // 2) H * Vcol_  (single-column HVP)
         {
             nb::gil_scoped_release nogil;
-            // args: (root, V, ldV=1, Y, ldY=1, k=1)
             L_->g->hessianMultiVectorProduct(L_->L_root, Vcol_.data(), 1,
-                                            Ycol_.data(), 1, 1);
+                                             Ycol_.data(), 1, 1);
         }
 
-        // 3) Map back to x-order: y_x_ <- perm^-1(Ycol_)
+        // 3) graph-order -> x-order
         for (std::size_t gi = 0; gi < n; ++gi) {
             const std::size_t xi = static_cast<std::size_t>(L_->g2x_[gi]);
             y_x_[xi] = Ycol_[gi];
         }
 
-        // 4) Write to Eigen destination
-        Eigen::Map<Vec>(y.derived().data(), y.size()) = Eigen::Map<const Vec>(
-            y_x_.data(), static_cast<Eigen::Index>(y_x_.size()));
+        // 4) y = Hx (+ sigma * x)
+        Eigen::Map<Vec> ymap(y.derived().data(), y.size());
+        ymap = Eigen::Map<const Vec>(y_x_.data(),
+                                     static_cast<Eigen::Index>(y_x_.size()));
+        if (sigma_ != 0.0)
+            ymap.noalias() += sigma_ * x.derived();
 
-        // 5) Optional Tikhonov shift: y += sigma * x
-        if (sigma_ != 0.0) {
-            y.derived().noalias() += sigma_ * x.derived();
+        // 5) + diag(Sigma_x) * x
+        if (has_Sx_) {
+            ymap.noalias() += Sigma_x_.cwiseProduct(x.derived());
+        }
+
+        // 6) + JIᵀ [ diag(Sigma_s) (JI x) ]
+        if (has_JI_) {
+            t_.noalias() = (*JI_) * x.derived(); // mI
+            t_.array() *= Sigma_s_->array();     // diag(Sigma_s) (JI x)
+            ymap.noalias() += JI_->transpose() * t_;
         }
     }
 
@@ -1197,17 +1284,91 @@ public:
         return y;
     }
 
-    inline void set_sigma(double s) { sigma_ = s; }
-    inline double sigma() const { return sigma_; }
+    // In CompiledWOp (public):
+    template <typename MatIn, typename MatOut>
+    inline void perform_op_multi(const MatIn &X, MatOut &Y) const {
+        const std::size_t n = static_cast<std::size_t>(X.rows());
+        const std::size_t k = static_cast<std::size_t>(X.cols());
+        if (rows() != static_cast<Eigen::Index>(n))
+            throw std::invalid_argument(
+                "CompiledWOp::perform_op_multi: size mismatch.");
+
+        // 1) x-order -> graph-order (k lanes)
+        //    Vcol_: contiguous [n x k], column-major by our choice of ldV = n
+        Vmulti_.resize(n * k);
+        Ymulti_.resize(n * k);
+
+        // If you can precompute permutation vectors as ints, this loop is fast.
+        for (std::size_t c = 0; c < k; ++c) {
+            for (std::size_t i = 0; i < n; ++i) {
+                const std::size_t gi = static_cast<std::size_t>(L_->x2g_[i]);
+                Vmulti_[gi + c * n] = X(static_cast<Eigen::Index>(i),
+                                        static_cast<Eigen::Index>(c));
+            }
+        }
+
+        // 2) H * Vmulti_ (k lanes in one forward+reverse pass)
+        {
+            nb::gil_scoped_release nogil;
+            L_->g->hessianMultiVectorProduct(L_->L_root, Vmulti_.data(),
+                                             /*ldV=*/n, Ymulti_.data(),
+                                             /*ldY=*/n, k);
+        }
+
+        // 3) graph-order -> x-order, write into Y (x-order)
+        for (std::size_t c = 0; c < k; ++c) {
+            for (std::size_t gi = 0; gi < n; ++gi) {
+                const std::size_t xi = static_cast<std::size_t>(L_->g2x_[gi]);
+                Y(static_cast<Eigen::Index>(xi), static_cast<Eigen::Index>(c)) =
+                    Ymulti_[gi + c * n];
+            }
+        }
+
+        // 4) y += sigma * X
+        if (sigma_ != 0.0) {
+            Y.noalias() += sigma_ * X;
+        }
+
+        // 5) y += diag(Sigma_x) * X
+        if (has_Sx_) {
+            // Eigen broadcasts over columns; zero-alloc if Expr
+            Y.noalias() += Sigma_x_.asDiagonal() * X;
+        }
+
+        // 6) y += JIᵀ [ diag(Sigma_s) (JI X) ]
+        if (has_JI_) {
+            // Sparse-dense batched multiply: (mI x n) * (n x k)
+            tMulti_.resize(JI_->rows(), static_cast<Eigen::Index>(k)); // mI x k
+            tMulti_.noalias() = (*JI_) * X;
+            // scale rows by Sigma_s elementwise
+            tMulti_ = tMulti_.array().colwise() * Sigma_s_->array();
+            Y.noalias() += JI_->transpose() * tMulti_;
+        }
+    }
 
 private:
-    std::shared_ptr<LagHessFn> &L_;
-    double sigma_;
+    std::shared_ptr<LagHessFn> L_;
+    double sigma_ = 0.0;      // optional isotropic shift fused into HVP
+    Eigen::VectorXd Sigma_x_; // owned, size n or 0
 
-    // Persistent scratch
-    mutable std::vector<double> Vcol_; // n x 1 (graph order)
-    mutable std::vector<double> Ycol_; // n x 1 (graph order)
-    mutable std::vector<double> y_x_;  // n     (x order)
+    // Optional inequality block (owned)
+    std::optional<Sp> JI_;
+    std::optional<Eigen::VectorXd> Sigma_s_;
+
+    bool has_Sx_ = false;
+    bool has_JI_ = false;
+
+    // private:
+    mutable std::vector<double> Vmulti_, Ymulti_; // size n*k when used
+    mutable Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic,
+                          Eigen::ColMajor>
+        tMulti_;
+
+    // Scratch (fixed allocations)
+    mutable std::vector<double> Vcol_; // graph-order input
+    mutable std::vector<double> Ycol_; // graph-order output
+    mutable std::vector<double> y_x_;  // x-order output
+    mutable Eigen::VectorXd t_;        // mI scratch for JI path
 };
 
 // ---------- Caches ----------

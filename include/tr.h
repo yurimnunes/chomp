@@ -364,7 +364,7 @@ struct TRConfig {
 
     // filter
     bool use_filter = true;
-    trcpp::FilterConfig filter_cfg{};
+    FilterConfig filter_cfg{};
 
     // SOC / funnel
     double soc_theta_reduction = 0.9;
@@ -558,7 +558,7 @@ public:
 
 private:
     // ---------------- state ----------------
-    trcpp::Filter filter_;
+    Filter filter_;
     bool filter_enabled_;
     TRConfig cfg_;
     Metric metric_;
@@ -1139,6 +1139,8 @@ private:
         ret.info = std::move(info);
         ret.lam = std::move(lam);
         ret.nu = std::move(nu);
+        ret.zL = std::move(muL);
+        ret.zU = std::move(muU);
         return ret;
     }
 

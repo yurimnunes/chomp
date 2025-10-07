@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <optional>
 #include <tuple>
+#include <vector>
 
 namespace dopt {
 
@@ -45,80 +46,83 @@ class DOptStabilizer {
 public:
     explicit DOptStabilizer(DOptConfig cfg = {}) : cfg_(cfg) {}
 
-    // Inputs:
-    //  - JE, JI: (optional) pointers to Jacobians; pass nullptr if absent.
-    //  - cE, cI: (optional) pointers to residual vectors; pass nullptr if absent.
-    //  - lam   : (optional) inequality multipliers (same size as cI).
-    //  - nu    : (optional) equality multipliers (not used now, kept for symmetry).
+    // Inputs (pass empty matrices/vectors when absent):
+    //  - JE, JI: Jacobians (mE×n, mI×n), possibly 0×n
+    //  - cE, cI: residual vectors (length mE/mI), possibly length 0
+    //  - lam   : inequality multipliers (length mI), possibly length 0
+    //  - nu    : equality multipliers (length mE), currently unused
     //
     // Outputs:
-    //  - rE (opt): equality shift (same size as *cE)  or std::nullopt
-    //  - rI (opt): inequality shift (same size as *cI) or std::nullopt
+    //  - rE (opt): equality shift (same size as cE)  or std::nullopt if mE=0
+    //  - rI (opt): inequality shift (same size as cI) or std::nullopt if mI=0
     //  - meta     : diagnostics/scales used
     std::tuple<std::optional<dvec>, std::optional<dvec>, DOptMeta>
-    compute_shifts(const dmat* JE, const dmat* JI,
-                   const dvec* cE, const dvec* cI,
-                   const dvec* lam, const dvec* /*nu*/ = nullptr) const
+    compute_shifts(const dmat& JE,
+                   const dmat& JI,
+                   const dvec& cE,
+                   const dvec& cI,
+                   const dvec& lam,
+                   const dvec& /*nu*/) const
     {
         DOptMeta meta{};
         std::optional<dvec> rE, rI;
 
         // --- Equalities ---
-        if (cE && cE->size() > 0) {
+        if (cE.size() > 0) {
             double sE = 1.0;
-            if (cfg_.dopt_scaling == ScaleMode::Ruiz && JE && JE->size() > 0) {
-                sE = row_equilibrate_scale_(*JE);  // only the scale (median row-norm)
+            if (cfg_.dopt_scaling == ScaleMode::Ruiz && JE.size() > 0) {
+                sE = row_equilibrate_scale_(JE);  // median row-2-norm
             }
             meta.sE = sE;
 
-            const double ce_scale = (cfg_.dopt_scaling == ScaleMode::Ruiz && JE)
-                                        ? colnorms_median_((*JE) / sE)
-                                        : colnorms_median_(JE ? *JE : dmat());
+            const double ce_scale = (cfg_.dopt_scaling == ScaleMode::Ruiz && JE.size() > 0)
+                                        ? colnorms_median_(JE / sE)
+                                        : colnorms_median_(JE);
             meta.ce_scale = ce_scale;
 
             const double sigmaE = cfg_.dopt_sigma_E * std::max(1.0, ce_scale);
             meta.sigmaE = sigmaE;
 
-            dvec r = -sigmaE * (*cE);
+            dvec r = -sigmaE * cE;
             clip_inplace_(r, -cfg_.dopt_max_shift, cfg_.dopt_max_shift);
             rE = std::move(r);
         }
 
         // --- Inequalities ---
-        if (cI && cI->size() > 0) {
+        if (cI.size() > 0) {
             double sI = 1.0;
-            if (cfg_.dopt_scaling == ScaleMode::Ruiz && JI && JI->size() > 0) {
-                sI = row_equilibrate_scale_(*JI);
+            if (cfg_.dopt_scaling == ScaleMode::Ruiz && JI.size() > 0) {
+                sI = row_equilibrate_scale_(JI);
             }
             meta.sI = sI;
 
-            const double ci_scale = (cfg_.dopt_scaling == ScaleMode::Ruiz && JI)
-                                        ? colnorms_median_((*JI) / sI)
-                                        : colnorms_median_(JI ? *JI : dmat());
+            const double ci_scale = (cfg_.dopt_scaling == ScaleMode::Ruiz && JI.size() > 0)
+                                        ? colnorms_median_(JI / sI)
+                                        : colnorms_median_(JI);
             meta.ci_scale = ci_scale;
 
             const double sigmaI = cfg_.dopt_sigma_I * std::max(1.0, ci_scale);
             meta.sigmaI = sigmaI;
 
-            const auto n = static_cast<Eigen::Index>(cI->size());
-            dvec r_base = dvec::Zero(n);
-            dvec r_comp = dvec::Zero(n);
+            const Eigen::Index nI = cI.size();
+            dvec r_base = dvec::Zero(nI);
+            dvec r_comp = dvec::Zero(nI);
 
             // Active set: cI >= -active_tol
-            for (Eigen::Index i = 0; i < n; ++i) {
-                if ((*cI)(i) >= -cfg_.dopt_active_tol) {
-                    r_base(i) = -sigmaI * (*cI)(i);
+            for (Eigen::Index i = 0; i < nI; ++i) {
+                if (cI(i) >= -cfg_.dopt_active_tol) {
+                    r_base(i) = -sigmaI * cI(i);
                 }
             }
 
             // Complementarity-shaped term uses λ (inequality multipliers)
-            if (lam && lam->size() == cI->size()) {
+            if (lam.size() == nI) {
                 constexpr double tiny = 1e-12;
-                for (Eigen::Index i = 0; i < n; ++i) {
-                    if ((*cI)(i) >= -cfg_.dopt_active_tol) {
-                        const double li = std::max(std::abs((*lam)(i)), tiny);
+                for (Eigen::Index i = 0; i < nI; ++i) {
+                    if (cI(i) >= -cfg_.dopt_active_tol) {
+                        const double li = std::max(std::abs(lam(i)), tiny);
                         const double target = cfg_.dopt_mu_target / li;
-                        r_comp(i) = std::max(0.0, target - (*cI)(i));
+                        r_comp(i) = std::max(0.0, target - cI(i));
                     }
                 }
             }

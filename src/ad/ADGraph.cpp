@@ -5,6 +5,7 @@
 
 #include "../../include/ad/OpDispatch.h"
 #include "../../include/ad/OpTraits.h"
+#include "../../include/ad/egraph.h"
 
 #include <algorithm>
 #include <cassert>
@@ -711,9 +712,77 @@ std::vector<double> ADGraph::getGradientVector(const ADNodePtr &expr) {
 
 // ------------------------- Multi-RHS HVP (lanes)
 // -----------------------------
+// void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
+//                                         size_t ldV, double *Y, size_t ldY,
+//                                         size_t k) {
+//     if (!y || k == 0)
+//         return;
+//     if (cache_.dirty)
+//         rebuildCache_();
+//     initializeNodeVariables();
+//     const size_t n = nodeVariables.size();
+//     if (n == 0)
+//         return;
+
+//     set_num_lanes(k);
+//     ensureLaneBuffers_();
+
+//     // 1) zero lanes and load V into variable rows
+//     std::fill(lanes_.dot.begin(), lanes_.dot.end(), 0.0);
+//     std::fill(lanes_.gdot.begin(), lanes_.gdot.end(), 0.0);
+//     for (const auto &kv : nodeVariables) {
+//         const auto &var = kv.second;
+//         if (!var)
+//             continue;
+//         const int ord = var->order;
+//         if (ord < 0)
+//             continue;
+//         const size_t vbase = lanes_.base(var->id);
+//         for (size_t l = 0; l < k; ++l)
+//             lanes_.dot[vbase + l] = V[size_t(ord) * ldV + l];
+//     }
+
+//     // 2) fused scalar forward + lane forward
+//     resetForwardPass();
+//     computeForwardPassAndDotLanesTogether();
+
+//     // 3) scalar reverse to get w = ∂y/∂x
+//     resetGradients();
+//     set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_, 1.0);
+//     initiateBackwardPassFused();
+
+//     // 4) lane reverse using w and per-lane dots
+//     resetGradDotAll();
+//     initiateBackwardPassFusedLanes();
+
+//     // 5) gather Y
+//     for (const auto &kv : nodeVariables) {
+//         const auto &var = kv.second;
+//         if (!var)
+//             continue;
+//         const int ord = var->order;
+//         if (ord < 0)
+//             continue;
+//         const size_t gbase = lanes_.base(var->id);
+//         for (size_t l = 0; l < k; ++l)
+//             Y[size_t(ord) * ldY + l] = lanes_.gdot[gbase + l];
+//     }
+// }
+
+// --- (Optional) refit your existing method to call the reuse path safely ---
 void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
                                         size_t ldV, double *Y, size_t ldY,
                                         size_t k) {
+    // Keep the original behavior for first call,
+    // then all subsequent calls can use the reuseScalar API.
+    hessianMultiVectorProductReuseScalar(y, V, ldV, Y, ldY, k);
+}
+
+// --- New public convenience that reuses scalar state across calls ---
+void ADGraph::hessianMultiVectorProductReuseScalar(const ADNodePtr &y,
+                                                   const double *V, size_t ldV,
+                                                   double *Y, size_t ldY,
+                                                   size_t k) {
     if (!y || k == 0)
         return;
     if (cache_.dirty)
@@ -723,12 +792,15 @@ void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
     if (n == 0)
         return;
 
+    // 0) Ensure scalar forward/reverse are current for (x, y)
+    ensurePreparedForHVP_(y);
+
+    // 1) lanes: size/zero + load V into variable rows
     set_num_lanes(k);
     ensureLaneBuffers_();
-
-    // 1) zero lanes and load V into variable rows
     std::fill(lanes_.dot.begin(), lanes_.dot.end(), 0.0);
     std::fill(lanes_.gdot.begin(), lanes_.gdot.end(), 0.0);
+
     for (const auto &kv : nodeVariables) {
         const auto &var = kv.second;
         if (!var)
@@ -741,20 +813,14 @@ void ADGraph::hessianMultiVectorProduct(const ADNodePtr &y, const double *V,
             lanes_.dot[vbase + l] = V[size_t(ord) * ldV + l];
     }
 
-    // 2) fused scalar forward + lane forward
-    resetForwardPass();
-    computeForwardPassAndDotLanesTogether();
+    // 2) dot-only forward using cached primal values (no scalar forward)
+    computeForwardPassWithDotLanes();
 
-    // 3) scalar reverse to get w = ∂y/∂x
-    resetGradients();
-    set_epoch_value(y->gradient, y->grad_epoch, cur_grad_epoch_, 1.0);
-    initiateBackwardPassFused();
-
-    // 4) lane reverse using w and per-lane dots
+    // 3) lane reverse (uses already-computed scalar adjoints)
     resetGradDotAll();
     initiateBackwardPassFusedLanes();
 
-    // 5) gather Y
+    // 4) gather Y
     for (const auto &kv : nodeVariables) {
         const auto &var = kv.second;
         if (!var)
@@ -1027,15 +1093,20 @@ void ADGraph::simplifyGraph() {
     size_t initial_size = nodes.size();
     bool changed = true;
     int iterations = 0;
-    const int max_iterations = 10;
+    const int max_iterations = 3;
 
     buildUseListsOnce_(); // NEW: enables fast rewrites
+
+    // auto roots = findRootNodes(); // or however you gather outputs
 
     while (changed && iterations < max_iterations) {
         changed = false;
 
         constantFolding();
         algebraicSimplification();
+        // for (auto &n : nodes)
+        //     if (n)
+        //         canonicalizeOperands_(*n);
 
         if (peepholeSimplify())
             changed = true;
@@ -1043,6 +1114,9 @@ void ADGraph::simplifyGraph() {
         // NEW: non-destructive, AC-aware CSE
         if (cseByKey_())
             changed = true;
+
+        // if (egraphSimplify_(roots))
+        //     changed = true;
 
         size_t before_dce = nodes.size();
         eliminateDeadCode();
@@ -1195,13 +1269,23 @@ void ADGraph::constantFolding() {
 }
 
 void ADGraph::algebraicSimplification() {
+    std::vector<std::pair<ADNodePtr, ADNodePtr>> replacements;
+    replacements.reserve(nodes.size());
+
+    // Collect replacements without modifying the graph
     for (const auto &node : nodes) {
         if (!node)
             continue;
-
         auto simplified = applyAlgebraicRule(node);
         if (simplified && simplified != node) {
-            replaceNodeReferences(node, simplified);
+            replacements.emplace_back(node, simplified);
+        }
+    }
+
+    // Apply replacements after iteration
+    for (const auto &[oldNode, newNode] : replacements) {
+        if (oldNode && newNode && oldNode != newNode) {
+            replaceNodeReferences(oldNode, newNode);
         }
     }
 }
@@ -1211,7 +1295,7 @@ ADNodePtr ADGraph::applyAlgebraicRule(const ADNodePtr &node) {
         return nullptr;
 
     switch (node->type) {
-    case Operator::Add:
+    case Operator::Add: {
         if (node->inputs.size() >= 2) {
             // x + 0 = x
             if (isZero(node->inputs[1]))
@@ -1219,14 +1303,18 @@ ADNodePtr ADGraph::applyAlgebraicRule(const ADNodePtr &node) {
             if (isZero(node->inputs[0]))
                 return node->inputs[1];
 
-            // x + x = 2*x (if inputs are the same)
+            // x + x = 2 * x
             if (node->inputs[0] == node->inputs[1]) {
                 auto two = createConstantNode(2.0);
-                // Would need to create multiplication node here
-                // This requires access to node creation methods
+                // Assumes you have a factory for new nodes:
+                // createNode(Operator::Multiply, {lhs, rhs})
+                auto mul =
+                    createNode(Operator::Multiply, {two, node->inputs[0]});
+                return mul;
             }
         }
         break;
+    }
 
     case Operator::Subtract:
         if (node->inputs.size() >= 2) {
@@ -1484,56 +1572,108 @@ bool ADGraph::isZero(const ADNodePtr &node) const {
 bool ADGraph::isOne(const ADNodePtr &node) const {
     return isConstant(node) && std::abs(node->value - 1.0) < 1e-12;
 }
+// PATCHED: adjacency-safe, use-list-aware replacement (robin_map .value() fix)
 void ADGraph::replaceNodeReferences(const ADNodePtr &oldNode,
                                     const ADNodePtr &newNode) {
-    if (!oldNode || !newNode || oldNode == newNode)
+    if (!oldNode || !newNode || oldNode.get() == newNode.get())
         return;
 
-    // Try the fast path with use-lists
-    buildUseListsOnce_();
-    auto it = uses_.find(oldNode.get());
-    if (it != uses_.end()) {
-        auto &users = it->second; // vector<ADNode*>
+    // Ensure both have ids so we can safely rewire adj/radj/indeg
+    const int oldId = ensure_id_(oldNode.get());
+    const int newId = ensure_id_(newNode.get());
 
-        for (ADNode *u : users) {
-            for (auto &inp : u->inputs) {
-                if (inp.get() == oldNode.get()) {
-                    inp = newNode;
-                    markDirty_(u);
-                }
-            }
-            uses_[newNode.get()].push_back(u);
+    // --- 1) Collect all users robustly (works even if uses_ is stale) ----
+    std::vector<ADNode *> users;
+    users.reserve(
+        uses_valid_
+            ? (uses_.count(oldNode.get()) ? uses_.at(oldNode.get()).size() : 8)
+            : 16);
+
+    if (uses_valid_) {
+        auto it = uses_.find(oldNode.get());
+        if (it != uses_.end()) {
+            users.assign(it->second.begin(), it->second.end());
         }
-        users.clear();
     } else {
-        // Fallback: full scan if not found (keeps compatibility)
-        for (const auto &node : nodes) {
-            if (!node)
+        // Fallback scan
+        for (const auto &sp : nodes) {
+            if (!sp)
                 continue;
-            for (auto &input : node->inputs) {
-                if (input == oldNode) {
-                    input = newNode;
-                    markDirty_(node.get());
+            for (const auto &inp : sp->inputs) {
+                if (inp.get() == oldNode.get()) {
+                    users.push_back(sp.get());
+                    break;
                 }
             }
         }
-        // Also update uses_ map lazily (we’ll rebuild later anyway)
-        uses_valid_ = false;
     }
 
-    // Keep your name/index and variable bookkeeping exactly as before
+    // Quick exit if nothing uses oldNode
+    if (users.empty()) {
+        // Keep name/index bookkeeping
+        if (!oldNode->name.empty()) {
+            nodeIndex_[oldNode->name] = newNode;
+            newNode->name = oldNode->name;
+        }
+        // UPDATE via robin_map iterator .value()
+        for (auto it = nodeVariables.begin(); it != nodeVariables.end(); ++it) {
+            if (it.value().get() == oldNode.get())
+                it.value() = newNode;
+        }
+        markGraphMutated_();
+        return;
+    }
+
+    // --- 2) For each user, replace inputs and rewire edges ONCE per parent ---
+    for (ADNode *u : users) {
+        if (!u)
+            continue;
+
+        const int uid = (u->id >= 0) ? u->id : ensure_id_(u);
+
+        bool touched = false;
+        for (auto &inp : u->inputs) {
+            if (inp.get() == oldNode.get()) {
+                inp = newNode;
+                touched = true;
+            }
+        }
+        if (!touched)
+            continue;
+
+        // Rewire adjacency exactly once
+        unlink_edge_(uid, oldId);
+        link_edge_(uid, newId);
+
+        if (uses_valid_) {
+            uses_[newNode.get()].push_back(u);
+        }
+
+        markDirty_(u);
+    }
+
+    // --- 3) Clean/adjust uses_ entries for old/new --------------------------
+    if (uses_valid_) {
+        auto it_old = uses_.find(oldNode.get());
+        if (it_old != uses_.end())
+            it_old->second.clear();
+    }
+    uses_valid_ = false; // rebuild later to dedup & stay consistent
+
+    // --- 4) Move name and index/variables as before -------------------------
     if (!oldNode->name.empty()) {
         nodeIndex_[oldNode->name] = newNode;
         newNode->name = oldNode->name;
     }
-    std::vector<std::string> keys_to_update;
-    for (const auto &kv : nodeVariables)
-        if (kv.second == oldNode)
-            keys_to_update.push_back(kv.first);
-    for (const auto &key : keys_to_update)
-        nodeVariables[key] = newNode;
+    // UPDATE via robin_map iterator .value()
+    for (auto it = nodeVariables.begin(); it != nodeVariables.end(); ++it) {
+        if (it.value().get() == oldNode.get())
+            it.value() = newNode;
+    }
 
-    markGraphMutated_(); // maintains your existing flags
+    // --- 5) Final bookkeeping: mark graph mutated & dirty --------------------
+    markGraphMutated_();
+    markDirty_();
 }
 
 std::vector<ADNodePtr> ADGraph::findNodesWithoutForwardReferences() const {
@@ -1593,4 +1733,331 @@ bool ADGraph::cseByKey_() {
     }
 
     return changed;
+}
+
+inline int ECostModel::op_cost(Operator op) const {
+    // tune as you like
+    switch (op) {
+    case Operator::Add:
+    case Operator::Subtract:
+        return 1;
+    case Operator::Multiply:
+        return 1;
+    case Operator::Divide:
+        return 3;
+    case Operator::Pow:
+        return 4;
+    default:
+        return 2;
+    }
+}
+inline std::pair<int, int>
+ECostModel::best_of(int eclass, const EGraph &G,
+                    std::unordered_map<int, int> &memo) const {
+    auto it = memo.find(eclass);
+    if (it != memo.end())
+        return {it->second, -1}; // (abuse: store cost only)
+    int best_cost = std::numeric_limits<int>::max();
+    int best_idx = -1;
+    for (int idx : G.classes[eclass].nodes) {
+        const ENode &n = G.arena[idx];
+        int c = op_cost(n.op);
+        for (auto k : n.kids) {
+            auto sub = best_of(G.find(k.id), G, memo);
+            c += sub.first;
+        }
+        if (n.is_const || n.is_symbol)
+            c = std::min(c, 1); // terminals cheap
+        if (c < best_cost) {
+            best_cost = c;
+            best_idx = idx;
+        }
+    }
+    memo[eclass] = best_cost;
+    return {best_cost, best_idx};
+}
+
+// In ADGraph.cpp
+#include "../../include/ad/egraph.h"
+#include "../../include/ad/egraph_aux.h"
+
+bool ADGraph::egraphSimplify_(std::vector<ADNodePtr> &roots) {
+    if (!enable_egraph_ || roots.empty())
+        return false;
+
+    EGraph EG;
+    std::vector<int> rids;
+    rids.reserve(roots.size());
+    for (auto &r : roots)
+        rids.push_back(EGraphBridge::to_egraph(r, EG));
+
+    saturate(EG, egraph_budget_);
+
+    bool changed = false;
+    for (size_t i = 0; i < roots.size(); ++i) {
+        ADNodePtr best = EGraphBridge::extract_expr(rids[i], EG, *this);
+        if (best && best.get() != roots[i].get()) {
+            roots[i] = best;
+            changed = true;
+        }
+    }
+    if (changed) {
+        uses_valid_ = false;
+        markGraphMutated_();
+        makeNodesUnique(); // keep your invariant
+    }
+    return changed;
+}
+
+inline ADNodePtr AD_makeConst(ADGraph &G, double v) {
+    // assumes ADGraph::createConstantNode exists & is public
+    return G.createConstantNode(v);
+}
+
+inline ADNodePtr AD_makeNode(ADGraph &G, Operator op,
+                             const std::vector<ADNodePtr> &kids) {
+    // small normalization to avoid trivial n-ary nodes
+    if ((op == Operator::Add || op == Operator::Multiply) && kids.size() == 1)
+        return kids[0];
+    return G.createNode(op, kids);
+}
+
+// --- helpers (file-local) ----------------------------------------------------
+
+namespace {
+
+inline double qfp(double x, double s = 1e12) {
+    return std::nearbyint(x * s) / s;
+}
+
+// Quantize & normalize constants for hashing/equality
+inline uint64_t normalize_const_bits(double v) {
+    double q = qfp(v);
+    if (q == 0.0)
+        q = 0.0; // -0 -> +0
+    if (std::isnan(q))
+        return 0x7ff8000000000000ULL; // fixed qNaN
+    uint64_t bits;
+    std::memcpy(&bits, &q, sizeof(bits));
+    return bits;
+}
+
+inline bool is_small_integer(double e, int &ei_out) {
+    double r = std::round(e);
+    if (std::abs(e - r) < 1e-12 &&
+        std::abs(r) <= static_cast<double>(INT_MAX)) {
+        ei_out = static_cast<int>(r);
+        return true;
+    }
+    return false;
+}
+
+// Prefer stable node->id if available; fall back to pointer (const-safe)
+inline uint64_t key_id_of(const ADNode *n) {
+    if (!n)
+        return 0ULL;
+    if (n->id >= 0)
+        return static_cast<uint64_t>(n->id);
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(n));
+}
+
+inline void collectAddTerms_(const ADNode *n, int sgn,
+                             std::unordered_map<const ADNode *, int> &mult,
+                             double &csum) {
+    if (!n)
+        return;
+
+    switch (n->type) {
+    case Operator::Add:
+        for (const auto &in : n->inputs)
+            if (in)
+                collectAddTerms_(in.get(), sgn, mult, csum);
+        return;
+
+    case Operator::Subtract:
+        if (!n->inputs.empty() && n->inputs[0])
+            collectAddTerms_(n->inputs[0].get(), sgn, mult, csum);
+        for (size_t i = 1; i < n->inputs.size(); ++i)
+            if (n->inputs[i])
+                collectAddTerms_(n->inputs[i].get(), -sgn, mult, csum);
+        return;
+
+    case Operator::cte:
+        csum += sgn * n->value;
+        return;
+
+    default:
+        mult[n] += sgn;
+        return;
+    }
+}
+
+// Build canonical sum signature: items (id, coeff), cbits = sum constant
+inline void build_sum_signature(const ADNode &n,
+                                std::vector<uint64_t> &kids_ids,
+                                std::vector<int> &coeffs, uint64_t &cbits_out) {
+    std::unordered_map<const ADNode *, int> mult;
+    mult.reserve(16);
+    double csum = 0.0;
+    collectAddTerms_(&n, +1, mult, csum);
+
+    std::vector<std::pair<uint64_t, int>> pairs;
+    pairs.reserve(mult.size());
+    for (auto &kv : mult)
+        if (kv.second != 0)
+            pairs.emplace_back(key_id_of(kv.first), kv.second);
+
+    std::sort(pairs.begin(), pairs.end(),
+              [](auto &a, auto &b) { return a.first < b.first; });
+
+    kids_ids.clear();
+    kids_ids.reserve(pairs.size());
+    coeffs.clear();
+    coeffs.reserve(pairs.size());
+    for (auto &p : pairs) {
+        kids_ids.push_back(p.first);
+        coeffs.push_back(p.second);
+    }
+
+    if (std::abs(csum) < 1e-18)
+        csum = 0.0;
+    cbits_out = normalize_const_bits(csum);
+}
+
+// Enhanced product collector that absorbs constants and folds small-int powers
+inline void
+collectMulWithConst_(const ADNode *n, int exp,
+                     std::unordered_map<const ADNode *, int> &powmap,
+                     double &cconst) {
+    if (!n)
+        return;
+    switch (n->type) {
+    case Operator::Multiply:
+        for (auto &in : n->inputs)
+            collectMulWithConst_(in.get(), exp, powmap, cconst);
+        return;
+    case Operator::Divide:
+        if (!n->inputs.empty())
+            collectMulWithConst_(n->inputs[0].get(), exp, powmap, cconst);
+        for (size_t i = 1; i < n->inputs.size(); ++i)
+            collectMulWithConst_(n->inputs[i].get(), -exp, powmap, cconst);
+        return;
+    case Operator::Pow: {
+        if (n->inputs.size() == 2 && n->inputs[0] && n->inputs[1] &&
+            n->inputs[1]->type == Operator::cte) {
+            int ei = 0;
+            if (is_small_integer(n->inputs[1]->value, ei)) {
+                powmap[n->inputs[0].get()] += ei * exp;
+                return;
+            }
+        }
+        // non-integer exponent: treat whole Pow as opaque factor
+        powmap[n] += exp;
+        return;
+    }
+    case Operator::cte:
+        cconst *= std::pow(n->value, exp);
+        return;
+    default:
+        powmap[n] += exp;
+        return;
+    }
+}
+
+// Build canonical product signature: items (id, exponent), cbits = product
+// constant
+inline void build_prod_signature(const ADNode &n,
+                                 std::vector<uint64_t> &kids_ids,
+                                 std::vector<int> &exponents,
+                                 uint64_t &cbits_out) {
+    std::unordered_map<const ADNode *, int> powmap;
+    powmap.reserve(16);
+    double cconst = 1.0;
+    collectMulWithConst_(&n, +1, powmap, cconst);
+
+    std::vector<std::pair<uint64_t, int>> pairs;
+    pairs.reserve(powmap.size());
+    for (auto &kv : powmap)
+        if (kv.second != 0)
+            pairs.emplace_back(key_id_of(kv.first), kv.second);
+
+    std::sort(pairs.begin(), pairs.end(),
+              [](auto &a, auto &b) { return a.first < b.first; });
+
+    kids_ids.clear();
+    kids_ids.reserve(pairs.size());
+    exponents.clear();
+    exponents.reserve(pairs.size());
+    for (auto &p : pairs) {
+        kids_ids.push_back(p.first);
+        exponents.push_back(p.second);
+    }
+
+    if (std::abs(cconst - 1.0) < 1e-18)
+        cconst = 1.0;
+    cbits_out = normalize_const_bits(cconst);
+}
+
+} // namespace
+
+ADGraph::CSEKey ADGraph::makeCSEKey_(const ADNode &n) const {
+    CSEKey k;
+
+    // Constant node → fully determined by cbits
+    if (n.type == Operator::cte) {
+        k.op = Operator::cte;
+        k.is_cte = true;
+        k.cbits = normalize_const_bits(n.value);
+        return k;
+    }
+
+    switch (n.type) {
+    // --- AC-normalized sums: Add/Sub → canonical Add
+    case Operator::Add:
+    case Operator::Subtract: {
+        k.op = Operator::Add;
+        build_sum_signature(n, k.kids_ids, k.coeffs, k.cbits);
+        return k;
+    }
+
+    // --- AC-normalized products: Mul/Div → canonical Multiply
+    case Operator::Multiply:
+    case Operator::Divide: {
+        k.op = Operator::Multiply;
+        build_prod_signature(n, k.kids_ids, k.exponents, k.cbits);
+        return k;
+    }
+
+    // --- Pow: record small integer exponent in key; else (base, exp) ids
+    case Operator::Pow: {
+        k.op = Operator::Pow;
+        if (n.inputs.size() == 2 && n.inputs[0] && n.inputs[1]) {
+            // base id always present
+            k.kids_ids.push_back(key_id_of(n.inputs[0].get()));
+            if (n.inputs[1]->type == Operator::cte) {
+                int ei = 0;
+                if (is_small_integer(n.inputs[1]->value, ei)) {
+                    k.small_exp = ei; // distinguishes x^2, x^-1, etc.
+                    return k;         // no need to include exp id
+                }
+            }
+            // non-cte or non-integer exponent: include exp id
+            k.kids_ids.push_back(key_id_of(n.inputs[1].get()));
+        }
+        return k;
+    }
+
+    default: {
+        // Generic fallback: ordered child ids; sort if commutative
+        k.op = n.type;
+        k.kids_ids.reserve(n.inputs.size());
+        for (const auto &in : n.inputs)
+            k.kids_ids.push_back(key_id_of(in.get()));
+        if (is_commutative_node_(n.type)) {
+            std::sort(k.kids_ids.begin(), k.kids_ids.end());
+        }
+        // cbits/coeffs/exponents/small_exp remain defaults
+        return k;
+    }
+    }
 }

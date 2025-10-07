@@ -15,14 +15,13 @@ using ExpressionPtr = std::shared_ptr<Expression>;
 
 class Variable : public std::enable_shared_from_this<Variable> {
 public:
-    // Construct with optional value/bounds
     explicit Variable(const std::string& name,
                       double value = 0.0,
                       double lb    = -std::numeric_limits<double>::infinity(),
                       double ub    =  std::numeric_limits<double>::infinity())
-        : name_(name), value_(value), lb_(lb), ub_(ub) {
+        : std::enable_shared_from_this<Variable>()              // (ok)
+        , name_(name), value_(value), lb_(lb), ub_(ub) {
         if (lb_ > ub_) std::swap(lb_, ub_);
-        // If you want to enforce value within bounds, clamp here:
         if (value_ < lb_) value_ = lb_;
         if (value_ > ub_) value_ = ub_;
         order_ = nextOrder_.fetch_add(1, std::memory_order_relaxed);
@@ -30,15 +29,18 @@ public:
 
     // Copy keeps the same metadata; does NOT advance global order
     Variable(const Variable& other)
-        : name_(other.name_),
-          value_(other.value_),
-          lb_(other.lb_),
-          ub_(other.ub_),
-          gradient_(other.gradient_), // legacy field; not authoritative
-          order_(other.order_) {}
+        : std::enable_shared_from_this<Variable>(other)
+        , name_(other.name_)
+        , value_(other.value_)
+        , lb_(other.lb_)
+        , ub_(other.ub_)
+        , gradient_(other.gradient_)  // legacy field; not authoritative
+        , parents_()                  // do not copy parent links
+        , order_(other.order_) {}
 
     Variable& operator=(const Variable& other) {
         if (this == &other) return *this;
+        // NOTE: base part (enable_shared_from_this) cannot be reassigned; this is fine.
         name_     = other.name_;
         value_    = other.value_;
         lb_       = other.lb_;
@@ -61,7 +63,6 @@ public:
     double getValue() const { return value_; }
     void   setValue(double newValue) {
         value_ = newValue;
-        // Optional: enforce bounds strictly
         if (value_ < lb_) value_ = lb_;
         if (value_ > ub_) value_ = ub_;
     }
@@ -81,35 +82,25 @@ public:
     }
 
     // ---- Gradient (legacy) ----
-    // NOTE: Real gradients live on ADNode. Keep these only if your code reads them directly.
     double getGradient() const { return gradient_; }
     void   setGradient(double g) { gradient_ = g; }
 
     // ---- Expression interop ----
-    // Implicit lift to Expression is defined in Expression.cpp
     operator ExpressionPtr() const;
-
-    // Variable ⨉ Variable => Expression
     ExpressionPtr operator*(const Variable& other) const;
-
-    // Variable ⨉ scalar => Expression
     ExpressionPtr operator*(double lhs);
 
     // Parent tracking (weak to avoid cycles)
     void addParent(const ExpressionPtr& parent);
-    std::vector<ExpressionPtr> getParents() const; // returns locked copies (expired are skipped)
+    std::vector<ExpressionPtr> getParents() const;
 
 private:
     std::string name_;
     double      value_;
-
     double lb_ = -std::numeric_limits<double>::infinity();
     double ub_ =  std::numeric_limits<double>::infinity();
 
-    // Legacy scratch; prefer reading gradients from AD nodes
     double gradient_ = 0.0;
-
-    // Weak links to avoid shared_ptr cycles Variable<->Expression
     std::vector<std::weak_ptr<Expression>> parents_;
 
     int  order_ = -1;

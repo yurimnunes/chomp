@@ -635,7 +635,8 @@ print("x* =", x_star, info.status)</code></pre>
           <div class="relative">
             <button class="copy-btn absolute right-2 top-2 text-xs px-2 py-1 rounded-md bg-slate-800 text-white">Copy</button>
             <pre class="line-numbers text-sm leading-6 overflow-x-auto p-4 rounded-lg border border-slate-200 bg-slate-50"><code class="language-python">import numpy as np
-from chomp import NLPSolver, SQPConfig
+from chomp import NLPSolver
+from nlp.blocks.aux import SQPConfig
 
 Q = np.diag([1.0, 10.0]); q = np.array([-1.0, -2.0])
 A = np.array([[1.0, 1.0]]); b = np.array([1.0])  # equality: x1+x2=1
@@ -643,7 +644,7 @@ A = np.array([[1.0, 1.0]]); b = np.array([1.0])  # equality: x1+x2=1
 f = lambda x: 0.5*x@Q@x + q@x
 c_eq = [lambda x: A@x - b]
 
-solver = NLPSolver(f, c_eq=c_eq, x0=np.zeros(2), config=SQPConfig(tr_radius=1.0))
+solver = NLPSolver(f, c_eq=c_eq, x0=np.zeros(2), config=SQPConfig())
 x, lam, info = solver.solve(mode="sqp", verbose=True)
 print(x, info.status)</code></pre>
           </div>
@@ -659,7 +660,7 @@ print(x, info.status)</code></pre>
 f = lambda x: (x[0]-1)**2 + (x[1]+2)**2
 c_ineq = [lambda x: x[0] + x[1] - 1]  # <= 0
 
-solver = NLPSolver(f, c_ineq=c_ineq, x0=[3.0, -1.0], config=IPConfig(mu0=1e-1))
+solver = NLPSolver(f, c_ineq=c_ineq, x0=[3.0, -1.0], config=IPConfig())
 x, lam, info = solver.solve(mode="ip", verbose=True)
 print(x, info.status)</code></pre>
           </div>
